@@ -9,12 +9,14 @@ def _database_url() -> str:
         "DATABASE_URL",
         "postgresql+psycopg://tt:tt_dev@localhost:5432/tt_aufstellung",
     )
-    # Render may provide a plain PostgreSQL URL. We use psycopg 3 explicitly,
-    # which is the driver installed by the application requirements.
+    # Render may provide a plain PostgreSQL URL. SQLAlchemy 2.x must be told
+    # explicitly to use the psycopg 3 driver; otherwise it defaults to psycopg2.
     if url.startswith("postgres://"):
         url = "postgresql+psycopg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url[len("postgresql://") :]
+    elif url.startswith("postgresql+psycopg2://"):
+        url = "postgresql+psycopg://" + url[len("postgresql+psycopg2://") :]
     return url
 
 
