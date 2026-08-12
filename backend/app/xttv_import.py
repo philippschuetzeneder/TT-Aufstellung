@@ -125,8 +125,7 @@ def parse_match(html: str, meid: int) -> dict:
     home_is_numbers = bool(home_number_match)
     away_is_numbers = bool(away_number_match)
 
-    # XTTV also publishes 3-player reports (A-C / 1-3). They are not part of
-    # the four-player format required by this importer, so reject them early.
+    # 3-player reports (A-C / 1-3) are intentionally excluded.
     if home_letter_match and home_letter_match.group(1) == "A" and home_letter_match.group(2) == "C":
         raise ValueError("XTTV 3-player format (A-C) is not supported")
     if away_letter_match and away_letter_match.group(1) == "A" and away_letter_match.group(2) == "C":
@@ -193,6 +192,12 @@ def parse_match(html: str, meid: int) -> dict:
         raise ValueError(f"Unexpected player count: {len(players)} (expected 8)")
 
     games = []
+    row_positions = set("ABCD" if letters_side == "home" else "1234")
+    column_positions = list("1234" if letters_side == "home" else "ABCD")
+
+    # The first cell identifies the player on the table's vertical axis. The
+    # remaining cells are the opponent positions in fixed left-to-right order.
+    # This works for both orientations: home A-D / away 1-4 and home 1-4 / away A-D.
     for row in table1_rows[1:5]:
         if not row:
             continue
@@ -200,27 +205,30 @@ def parse_match(html: str, meid: int) -> dict:
         mpos = re.match(r"^([A-D1-4]):\s*PassNr", first)
         if not mpos:
             continue
-        opponent_pos = mpos.group(1)
-        opponent_side = letters_side if opponent_pos in "ABCD" else numbers_side
-        row_player_side = numbers_side if opponent_side == letters_side else letters_side
-        row_player_pos = next((p["position"] for p in players if p["side"] == row_player_side and p["name"] in first), None)
-        if row_player_pos is None:
-            row_player_pos = opponent_pos
+        row_pos = mpos.group(1)
+        expected_row_positions = "ABCD" if letters_side == "home" else "1234"
+        if row_pos not in expected_row_positions:
+            continue
+        row_side = letters_side if row_pos in "ABCD" else numbers_side
+        if row_side == "home":
+            home_pos = row_pos
+        else:
+            away_pos = row_pos
 
-        result_cells = row[1:5]
-        for col_index, cell in enumerate(result_cells):
-            if not cell:
+        for col_index, cell in enumerate(row[1:5]):
+            if not cell or col_index >= len(column_positions):
                 continue
+            col_pos = column_positions[col_index]
+            if row_side == "home":
+                home_pos, away_pos = row_pos, col_pos
+            else:
+                home_pos, away_pos = col_pos, row_pos
+
             for match in re.finditer(r"\((\d+)\)\s+(\d+):(\d+)\s+([A-Za-z0-9]+)", cell):
                 sequence = int(match.group(1))
                 result = f"{match.group(2)}:{match.group(3)}"
                 winner_code = match.group(4)
                 winner_side = "home" if winner_code == home_code else "away" if winner_code == away_code else None
-                col_pos = str(col_index + 1)
-                if letters_side == "home":
-                    home_pos, away_pos = row_player_pos, col_pos
-                else:
-                    away_pos, home_pos = row_player_pos, col_pos
                 home_player = player_by_position.get(("home", home_pos))
                 away_player = player_by_position.get(("away", away_pos))
                 if not home_player or not away_player:
@@ -238,8 +246,8 @@ def parse_match(html: str, meid: int) -> dict:
                     "raw_row": cell,
                 })
 
-    if len(games) != 12:
-        raise ValueError(f"Unexpected game count: singles={len(games)}, doubles=2")
+    if not 10 <= len(games) <= 12:
+        raise ValueError(f"Unexpected game count: singles={len(games)}, expected 10-12")
 
     doubles = []
     all_text = clean(" ".join(" ".join(r) for r in table1_rows))
@@ -278,7 +286,7 @@ def parse_match(html: str, meid: int) -> dict:
         "players": players,
         "games": games,
         "player_count": len(players),
-        "singles_count": 12,
+        "singles_count": len(games),
         "doubles_count": 2,
         "has_doubles": True,
         "raw_text": clean(soup.get_text(" ", strip=True)),
