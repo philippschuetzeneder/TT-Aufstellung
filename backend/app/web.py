@@ -9,7 +9,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .db import create_all, database_health
-from .xttv_import import MATCH_URL, fetch_match, import_one, inspect_html
+from .xttv_import import MATCH_URL, fetch_match, inspect_html
+from .xttv_db_import import import_one
 from .xttv_parser import parse_match
 
 ROOT = Path(__file__).resolve().parents[2]
