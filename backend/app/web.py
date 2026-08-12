@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .xttv_import import MATCH_URL, fetch_match, inspect_html, parse_match
+from .xttv_import import MATCH_URL, fetch_match, import_one, inspect_html, parse_match
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -56,7 +56,7 @@ def debug_xttv(meid: int) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self, payload: dict, status: int = 200):
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -66,7 +66,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        meid = int(query.get("meid", ["437757"])[0])
+        try:
+            meid = int(query.get("meid", ["437757"])[0])
+        except ValueError:
+            return self.send_json({"ok": False, "error": "meid must be an integer"}, 400)
+
         if parsed.path == "/health":
             return self.send_json({"ok": True})
         if parsed.path == "/api/xttv/debug":
@@ -77,10 +81,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 html, status, content_type, url = fetch_match(meid)
                 inspection = inspect_html(html)
-                inspection["meid"] = meid
-                inspection["status"] = status
-                inspection["content_type"] = content_type
-                inspection["url"] = url
+                inspection.update({"meid": meid, "status": status, "content_type": content_type, "url": url})
                 return self.send_json(inspection)
             except Exception as exc:
                 return self.send_json({"meid": meid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}, 502)
@@ -91,6 +92,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"meid": meid, "status": status, "content_type": content_type, "url": url, **parsed_match})
             except Exception as exc:
                 return self.send_json({"meid": meid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}, 502)
+        if parsed.path == "/api/xttv/import":
+            try:
+                result = import_one(meid)
+                return self.send_json({"meid": meid, **result})
+            except Exception as exc:
+                return self.send_json({"meid": meid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
 
         rel = "index.html" if parsed.path in ("", "/") else parsed.path.lstrip("/")
         target = (ROOT / rel).resolve()
