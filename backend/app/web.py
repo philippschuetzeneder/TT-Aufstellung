@@ -11,19 +11,14 @@ from urllib.parse import parse_qs, urlparse
 from .db import create_all, database_health
 from .db_routes import get_match
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
-from .xttv_db_import import import_one
+from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, TARGET_LEAGUE, import_one, scan_and_import
 from .xttv_parser import parse_match
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def http_fetch(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; TT-Aufstellung/0.1)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "de-AT,de;q=0.9,en;q=0.5",
-        "Referer": "https://oettv.xttv.at/ed/index.php",
-    })
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; TT-Aufstellung/0.1)", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "de-AT,de;q=0.9,en;q=0.5", "Referer": "https://oettv.xttv.at/ed/index.php"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
@@ -106,6 +101,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"meid": meid, **result})
             except Exception as exc:
                 return self.send_json({"meid": meid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+        if parsed.path == "/api/xttv/scan-import":
+            try:
+                start = int(query.get("start", [str(REFERENCE_MEID - DEFAULT_RADIUS)])[0])
+                end = int(query.get("end", [str(REFERENCE_MEID + DEFAULT_RADIUS)])[0])
+                limit = int(query.get("limit", [str(DEFAULT_LIMIT)])[0])
+                delay = float(query.get("delay", ["0.05"])[0])
+                result = scan_and_import(start, end, limit=limit, delay=delay)
+                return self.send_json(result)
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}", "target_league": TARGET_LEAGUE}, 500)
 
         rel = "index.html" if parsed.path in ("", "/") else parsed.path.lstrip("/")
         target = (ROOT / rel).resolve()
