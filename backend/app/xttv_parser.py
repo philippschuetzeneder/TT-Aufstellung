@@ -37,13 +37,19 @@ def _pairs(cell: str):
 
 
 def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code: str, away_code: str):
-    # XTTV prints the score from the winner's perspective. The team code after
-    # the score identifies the winner, so normalize every result to home:away.
+    """Normalize XTTV's displayed score to the fixed home:away orientation.
+
+    XTTV's score is displayed from the perspective of the player/team represented
+    by the row (and for the doubles result in the same winner-oriented convention).
+    The team code identifies the winner. In both cases the normalized home:away
+    score is the reverse of the displayed score. The winner code determines the
+    winner_side independently, which also protects us against contradictory data.
+    """
     if winner_code == home_code:
-        return f"{raw_left}:{raw_right}", "home"
+        return f"{raw_right}:{raw_left}", "home"
     if winner_code == away_code:
         return f"{raw_right}:{raw_left}", "away"
-    return f"{raw_left}:{raw_right}", None
+    raise ValueError(f"Unknown winner code {winner_code!r}; expected {home_code!r} or {away_code!r}")
 
 
 def parse_match(html: str, meid: int) -> dict:
