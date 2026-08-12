@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime
+
+from bs4 import BeautifulSoup
 
 from .db import SessionLocal, create_all
 from .models import MatchGame, MatchPlayer, RawSourceDocument, XttvMatch
@@ -10,8 +13,8 @@ from .xttv_parser import parse_match
 
 TARGET_LEAGUE = "411 RK Linz Umg. / MV Mitte 2025/2026"
 REFERENCE_MEID = 437757
-DEFAULT_RADIUS = 1000
-DEFAULT_LIMIT = 8
+DEFAULT_RADIUS = 150
+DEFAULT_LIMIT = 20
 
 
 def import_one(meid: int) -> dict:
@@ -60,24 +63,72 @@ def _already_imported(meid: int) -> bool:
         return session.query(XttvMatch).filter_by(external_id=str(meid)).one_or_none() is not None
 
 
+def _quick_report_info(html: str) -> dict:
+    """Extract enough metadata to classify a page before the strict 4-player parser."""
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    text = " ".join(soup.stripped_strings)
+    league = None
+    if len(tables) >= 2:
+        rows = tables[1].find_all("tr")
+        if rows:
+            cells = rows[0].find_all(["th", "td"])
+            if cells:
+                league = " ".join(cells[0].stripped_strings)
+    if not league:
+        m = re.search(r"(\d+\s+[^\d\n]+?\s+20\d{2}/20\d{2})", text)
+        league = m.group(1).strip() if m else None
+    three_player = bool(re.search(r"Heim-Mannschaft:\s*(?:A-C|1-3)|Gast-Mannschaft:\s*(?:A-C|1-3)", text, re.I))
+    return {"league": league, "is_three_player": three_player}
+
+
+def _scan_order(start: int, end: int, reference: int) -> list[int]:
+    """Search outward from the known good MEID instead of scanning the whole range linearly."""
+    if reference < start or reference > end:
+        reference = start
+    order = [reference]
+    distance = 1
+    while reference - distance >= start or reference + distance <= end:
+        if reference + distance <= end:
+            order.append(reference + distance)
+        if reference - distance >= start:
+            order.append(reference - distance)
+        distance += 1
+    return order
+
+
 def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: float = 0.05) -> dict:
-    """Scan a bounded MEID range and import only the exact target OÖTTV league."""
+    """Targeted XTTV scan: exact league, complete 4-player reports, outward from reference MEID."""
     create_all()
     if end < start:
         raise ValueError("end must be >= start")
     if limit < 1 or limit > 100:
         raise ValueError("limit must be between 1 and 100")
 
-    checked = candidates = imported = skipped_existing = errors = 0
+    checked = candidates = imported = skipped_existing = errors = three_player = non_target = 0
     hits: list[dict] = []
     error_samples: list[dict] = []
+    reference = REFERENCE_MEID if start <= REFERENCE_MEID <= end else (start + end) // 2
 
-    for meid in range(start, end + 1):
+    for meid in _scan_order(start, end, reference):
         if imported >= limit:
             break
         checked += 1
         try:
             html, _, _, _ = fetch_match(meid)
+            quick = _quick_report_info(html)
+            if quick["league"] != TARGET_LEAGUE:
+                non_target += 1
+                if delay:
+                    time.sleep(delay)
+                continue
+            candidates += 1
+            if quick["is_three_player"]:
+                three_player += 1
+                hits.append({"meid": meid, "saved": False, "reason": "three_player_report"})
+                if delay:
+                    time.sleep(delay)
+                continue
             parsed = parse_match(html, meid)
         except Exception as exc:
             errors += 1
@@ -87,14 +138,11 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
                 time.sleep(delay)
             continue
 
-        if parsed.get("league") != TARGET_LEAGUE:
-            if delay:
-                time.sleep(delay)
-            continue
-
-        candidates += 1
         complete = parsed.get("player_count") == 8 and parsed.get("singles_count") == 12 and parsed.get("doubles_count") == 2
         if not complete:
+            errors += 1
+            if len(error_samples) < 20:
+                error_samples.append({"meid": meid, "error": f"incomplete_report players={parsed.get('player_count')} singles={parsed.get('singles_count')} doubles={parsed.get('doubles_count')}"})
             continue
         if _already_imported(meid):
             skipped_existing += 1
@@ -111,4 +159,20 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
         if delay:
             time.sleep(delay)
 
-    return {"ok": True, "target_league": TARGET_LEAGUE, "range": {"start": start, "end": end}, "limit": limit, "checked": checked, "league_candidates": candidates, "imported": imported, "skipped_existing": skipped_existing, "errors": errors, "hits": hits, "error_samples": error_samples, "stopped_after_limit": imported >= limit}
+    return {
+        "ok": True,
+        "target_league": TARGET_LEAGUE,
+        "reference_meid": reference,
+        "range": {"start": start, "end": end},
+        "limit": limit,
+        "checked": checked,
+        "league_candidates": candidates,
+        "imported": imported,
+        "skipped_existing": skipped_existing,
+        "three_player_skipped": three_player,
+        "non_target": non_target,
+        "errors": errors,
+        "hits": hits,
+        "error_samples": error_samples,
+        "stopped_after_limit": imported >= limit,
+    }
