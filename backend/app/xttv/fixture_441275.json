@@ -1,0 +1,5 @@
+{
+  "meid": 441275,
+  "source": "xttv",
+  "notes": "Fixture based on the publicly indexed XTTV match report. Parser contract: preserve home/away separately and preserve A-D / 1-4 lineup positions. Replace fixture payload with captured raw response before production importing."
+}
