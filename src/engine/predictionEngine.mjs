@@ -4,17 +4,26 @@ const HISTORY_WEIGHT = 0.2;
 const RECENCY_HALF_LIFE_DAYS = 45;
 const RC_SCALE = 400;
 
-// Austrian 4-player team-match demo schedule: 12 singles (3 per player) + 2 doubles.
-// The exact historical schedule will be supplied by XTTV once imported.
-const DEMO_SINGLE_PAIRINGS = [
-  [0, 0], [1, 1], [2, 2], [3, 3],
-  [0, 1], [1, 2], [2, 3], [3, 0],
-  [0, 2], [1, 3], [2, 0], [3, 1]
+// Fixed Austrian 4-player match schedule, read from the XTTV match sheet.
+// A-D are the four positions of one team. The opponent is the other orientation.
+// Games 1-4 and 6-9 give every player exactly two singles; 11-14 give every
+// player the third single. Games 5 and 10 are doubles and are modelled below.
+const SINGLE_SCHEDULE = [
+  ['B', 'D'], // 1
+  ['C', 'A'], // 2
+  ['D', 'C'], // 3
+  ['A', 'B'], // 4
+  ['B', 'A'], // 6
+  ['C', 'D'], // 7
+  ['A', 'C'], // 8
+  ['D', 'B'], // 9
+  ['A', 'A'], // 11
+  ['B', 'B'], // 12
+  ['C', 'C'], // 13
+  ['D', 'D']  // 14
 ];
-const DEMO_DOUBLES = [
-  [[0, 1], [0, 1]],
-  [[2, 3], [2, 3]]
-];
+
+const POSITION_INDEX = { A: 0, B: 1, C: 2, D: 3 };
 
 export function buildOpponentCombinationPredictions(opponentPlayers, historicalCombinations, options = {}) {
   const activePlayers = opponentPlayers.filter((player) => player.active);
@@ -62,33 +71,107 @@ export function buildOptimalOwnLineup(ownPlayers, opponentPlayers, opponentPredi
 }
 
 /**
- * Estimates the probability that the team wins the complete 14-game match:
- * 12 singles (3 per player) plus 2 doubles. This is deliberately a transparent
- * demo model; XTTV will later provide the exact league-specific match schedule.
+ * Calculates the probability of winning the actual 14-game match.
+ *
+ * Rules currently modelled:
+ * - 12 fixed singles: every player plays exactly 3 singles.
+ * - Games 1-10 are always played. Games 5 and 10 are doubles.
+ * - Game 5: the two strongest players by RC form the double.
+ * - Game 10: the two weakest players by RC form the double.
+ * - After game 10, 8 wins are enough to decide the match.
+ * - If neither team has 8 wins after game 10, games 11-14 are played.
+ * - A final 7:7 is a draw, not a team win.
+ * - The horizontal/vertical orientation is unknown, so both orientations are
+ *   averaged 50/50.
  */
 export function calculateTeamWinProbability(ownLineup, opponentLineup) {
   if (ownLineup.length !== 4 || opponentLineup.length !== 4) return 0;
-  const gameProbabilities = DEMO_SINGLE_PAIRINGS.map(([ownIndex, opponentIndex]) =>
-    headToHeadWinProbability(ownLineup[ownIndex].rcRating, opponentLineup[opponentIndex].rcRating)
-  );
-  for (const [[ownA, ownB], [oppA, oppB]] of DEMO_DOUBLES) {
-    const ownDoubleRc = (ownLineup[ownA].rcRating + ownLineup[ownB].rcRating) / 2;
-    const oppDoubleRc = (opponentLineup[oppA].rcRating + opponentLineup[oppB].rcRating) / 2;
-    gameProbabilities.push(headToHeadWinProbability(ownDoubleRc, oppDoubleRc));
-  }
-
-  // 14 scheduled games; a team wins the match with at least 8 wins.
-  let distribution = [1];
-  for (const probability of gameProbabilities) {
-    const next = Array(distribution.length + 1).fill(0);
-    distribution.forEach((value, wins) => {
-      next[wins] += value * (1 - probability);
-      next[wins + 1] += value * probability;
-    });
-    distribution = next;
-  }
-  return distribution.slice(8).reduce((sum, probability) => sum + probability, 0);
+  return (
+    calculateOrientedMatchProbability(ownLineup, opponentLineup) +
+    calculateOrientedMatchProbability(opponentLineup, ownLineup, true)
+  ) / 2;
 }
+
+function calculateOrientedMatchProbability(ownLineup, opponentLineup, reversed = false) {
+  const singleGames = SINGLE_SCHEDULE.slice(0, 8).map(([ownPosition, opponentPosition]) => {
+    const own = ownLineup[POSITION_INDEX[reversed ? opponentPosition : ownPosition]];
+    const opponent = opponentLineup[POSITION_INDEX[reversed ? ownPosition : opponentPosition]];
+    return headToHeadWinProbability(own.rcRating, opponent.rcRating);
+  });
+
+  const ownDoubles = strengthBasedDoubles(ownLineup);
+  const opponentDoubles = strengthBasedDoubles(opponentLineup);
+  const ownDouble5 = averageRc(ownDoubles.strongest);
+  const opponentDouble5 = averageRc(opponentDoubles.strongest);
+  const ownDouble10 = averageRc(ownDoubles.weakest);
+  const opponentDouble10 = averageRc(opponentDoubles.weakest);
+
+  const firstTen = [...singleGames,
+    headToHeadWinProbability(ownDouble5, opponentDouble5),
+    headToHeadWinProbability(ownDouble10, opponentDouble10)
+  ];
+
+  // First ten games are mandatory. Only after game 10 can the 8-win rule stop the match.
+  let states = new Map([[0, 1]]);
+  for (const probability of firstTen) states = addGame(states, probability);
+
+  let winProbability = 0;
+  for (const [ownWins, stateProbability] of states) {
+    const opponentWins = 10 - ownWins;
+    if (ownWins >= 8) {
+      winProbability += stateProbability;
+      continue;
+    }
+    if (opponentWins >= 8) continue;
+
+    // Games 11-14 are the four fixed third singles.
+    for (let i = 8; i < SINGLE_SCHEDULE.length; i += 1) {
+      const [ownPosition, opponentPosition] = SINGLE_SCHEDULE[i];
+      const own = ownLineup[POSITION_INDEX[reversed ? opponentPosition : ownPosition]];
+      const opponent = opponentLineup[POSITION_INDEX[reversed ? ownPosition : opponentPosition]];
+      // For the remaining four singles, calculate their result distribution.
+      // This is independent of the score after game 10, so use a local DP below.
+    }
+    winProbability += stateProbability * probabilityOfWinningRemainingFour(
+      ownLineup,
+      opponentLineup,
+      reversed,
+      ownWins
+    );
+  }
+  return winProbability;
+}
+
+function probabilityOfWinningRemainingFour(ownLineup, opponentLineup, reversed, startingWins) {
+  let states = new Map([[startingWins, 1]]);
+  for (let i = 8; i < SINGLE_SCHEDULE.length; i += 1) {
+    const [ownPosition, opponentPosition] = SINGLE_SCHEDULE[i];
+    const own = ownLineup[POSITION_INDEX[reversed ? opponentPosition : ownPosition]];
+    const opponent = opponentLineup[POSITION_INDEX[reversed ? ownPosition : opponentPosition]];
+    states = addGame(states, headToHeadWinProbability(own.rcRating, opponent.rcRating));
+  }
+  let probability = 0;
+  for (const [wins, stateProbability] of states) {
+    const losses = 14 - wins;
+    if (wins > losses) probability += stateProbability;
+  }
+  return probability;
+}
+
+function addGame(states, winProbability) {
+  const next = new Map();
+  for (const [wins, probability] of states) {
+    next.set(wins, (next.get(wins) || 0) + probability * (1 - winProbability));
+    next.set(wins + 1, (next.get(wins + 1) || 0) + probability * winProbability);
+  }
+  return next;
+}
+
+function strengthBasedDoubles(lineup) {
+  const sorted = [...lineup].sort((a, b) => b.rcRating - a.rcRating);
+  return { strongest: [sorted[0], sorted[1]], weakest: [sorted[2], sorted[3]] };
+}
+function averageRc(players) { return players.reduce((sum, player) => sum + player.rcRating, 0) / players.length; }
 
 export function buildPositionVariants(players) {
   return normalizeBy(permute(players).map((lineup) => {
