@@ -115,10 +115,26 @@ def parse_match(html: str, meid: int) -> dict:
 
     home_header = rows[0][1]
     away_header = rows[1][1]
-    home_is_letters = bool(re.search(r"[A-D]\s*-\s*[A-D]", home_header))
-    away_is_letters = bool(re.search(r"[A-D]\s*-\s*[A-D]", away_header))
-    home_is_numbers = bool(re.search(r"1\s*-\s*4", home_header))
-    away_is_numbers = bool(re.search(r"1\s*-\s*4", away_header))
+    home_letter_match = re.search(r"([A-D])\s*-\s*([A-D])", home_header)
+    away_letter_match = re.search(r"([A-D])\s*-\s*([A-D])", away_header)
+    home_number_match = re.search(r"(\d+)\s*-\s*(\d+)", home_header)
+    away_number_match = re.search(r"(\d+)\s*-\s*(\d+)", away_header)
+
+    home_is_letters = bool(home_letter_match)
+    away_is_letters = bool(away_letter_match)
+    home_is_numbers = bool(home_number_match)
+    away_is_numbers = bool(away_number_match)
+
+    # XTTV also publishes 3-player reports (A-C / 1-3). They are not part of
+    # the four-player format required by this importer, so reject them early.
+    if home_letter_match and home_letter_match.group(1) == "A" and home_letter_match.group(2) == "C":
+        raise ValueError("XTTV 3-player format (A-C) is not supported")
+    if away_letter_match and away_letter_match.group(1) == "A" and away_letter_match.group(2) == "C":
+        raise ValueError("XTTV 3-player format (A-C) is not supported")
+    if home_number_match and home_number_match.group(1) == "1" and home_number_match.group(2) == "3":
+        raise ValueError("XTTV 3-player format (1-3) is not supported")
+    if away_number_match and away_number_match.group(1) == "1" and away_number_match.group(2) == "3":
+        raise ValueError("XTTV 3-player format (1-3) is not supported")
 
     if home_is_letters and away_is_numbers:
         letters_side, numbers_side = "home", "away"
@@ -154,7 +170,6 @@ def parse_match(html: str, meid: int) -> dict:
         if pid:
             pass_to_player[pid] = p
 
-    # Determine which table row represents which side from the actual position labels.
     for cell in table1_rows[0]:
         if re.match(r"^[A-D]:\s*PassNr", cell):
             add_player(cell, letters_side)
@@ -162,9 +177,8 @@ def parse_match(html: str, meid: int) -> dict:
             add_player(cell, numbers_side)
         elif "Doppel" in cell:
             for pair in _extract_doubles(cell):
-                doubles_info[pair["sequence"]] = {letters_side: pair}
+                doubles_info[pair["sequence"]] = pair
 
-    # Remaining lineup rows normally contain the other side's four players.
     for row in table1_rows[1:5]:
         if not row:
             continue
@@ -193,7 +207,8 @@ def parse_match(html: str, meid: int) -> dict:
         if row_player_pos is None:
             row_player_pos = opponent_pos
 
-        for cell in row[1:5]:
+        result_cells = row[1:5]
+        for col_index, cell in enumerate(result_cells):
             if not cell:
                 continue
             for match in re.finditer(r"\((\d+)\)\s+(\d+):(\d+)\s+([A-Za-z0-9]+)", cell):
@@ -201,8 +216,7 @@ def parse_match(html: str, meid: int) -> dict:
                 result = f"{match.group(2)}:{match.group(3)}"
                 winner_code = match.group(4)
                 winner_side = "home" if winner_code == home_code else "away" if winner_code == away_code else None
-                col_pos = str(row[1:5].index(cell) + 1)
-                # Column position is not sufficient when the layout is transposed, so derive the opponent position from the result column.
+                col_pos = str(col_index + 1)
                 if letters_side == "home":
                     home_pos, away_pos = row_player_pos, col_pos
                 else:
@@ -224,12 +238,9 @@ def parse_match(html: str, meid: int) -> dict:
                     "raw_row": cell,
                 })
 
-    # XTTV's normal 4-player system has exactly 12 singles and 2 doubles.
-    # Anything else belongs to another competition format and is intentionally skipped by the caller.
     if len(games) != 12:
         raise ValueError(f"Unexpected game count: singles={len(games)}, doubles=2")
 
-    # Doubles are represented in the final result cell(s). Preserve the two standard sequences.
     doubles = []
     all_text = clean(" ".join(" ".join(r) for r in table1_rows))
     for m in re.finditer(r"\((5|10)\)\s+(\d+):(\d+)\s+([A-Za-z0-9]+)", all_text):
