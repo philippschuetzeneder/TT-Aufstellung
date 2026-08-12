@@ -8,6 +8,9 @@
   </head>
   <body>
     <main class="app-shell">
+      <section id="xttv-debug" class="card" style="margin-bottom:16px; padding:12px; font-family:monospace; font-size:12px;">
+        XTTV-Debug: wird geprüft …
+      </section>
       <section class="hero card">
         <div>
           <span class="pill">Demo-Daten – XTTV-Import noch nicht aktiviert</span>
@@ -17,6 +20,19 @@
       </section>
       <div id="app"></div>
     </main>
+    <script>
+      fetch('/api/xttv/debug?meid=437757')
+        .then(r => r.json())
+        .then(d => {
+          const ok = d.direct_success;
+          const checks = d.checks || [];
+          const successful = checks.filter(c => c.ok).map(c => c.method).join(', ');
+          document.getElementById('xttv-debug').textContent = ok
+            ? 'XTTV-Debug: ✓ Zugriff auf meid=437757 funktioniert. Erfolgreich: ' + successful
+            : 'XTTV-Debug: ✗ Direkter Zugriff auf meid=437757 fehlgeschlagen. Details: ' + checks.map(c => c.method + '=' + (c.ok ? 'OK' : c.error)).join(' | ');
+        })
+        .catch(e => document.getElementById('xttv-debug').textContent = 'XTTV-Debug: ✗ Backend nicht erreichbar: ' + e);
+    </script>
     <script type="module" src="/src/ui/app.mjs"></script>
   </body>
 </html>
