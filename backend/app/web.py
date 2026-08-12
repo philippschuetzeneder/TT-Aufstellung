@@ -8,7 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .xttv_import import MATCH_URL, fetch_match, import_one, inspect_html, parse_match
+from .xttv_import import MATCH_URL, fetch_match, import_one, inspect_html
+from .xttv_parser import parse_match
 
 ROOT = Path(__file__).resolve().parents[2]
 
