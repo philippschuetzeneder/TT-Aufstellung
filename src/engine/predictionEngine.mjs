@@ -2,6 +2,15 @@ const RC_WEIGHT = 0.42;
 const AVAILABILITY_WEIGHT = 0.38;
 const HISTORY_WEIGHT = 0.2;
 const RECENCY_HALF_LIFE_DAYS = 45;
+const RC_SCALE = 400;
+
+// Demo-only schedule. The real league-specific schedule will later come from XTTV.
+const DEMO_SINGLE_PAIRINGS = [
+  [0, 0], [0, 1], [0, 2],
+  [1, 0], [1, 1], [1, 3],
+  [2, 0], [2, 2], [2, 3],
+  [3, 1], [3, 2], [3, 3]
+];
 
 export function buildOpponentCombinationPredictions(opponentPlayers, historicalCombinations, options = {}) {
   const activePlayers = opponentPlayers.filter((player) => player.active);
@@ -22,6 +31,51 @@ export function buildOpponentCombinationPredictions(opponentPlayers, historicalC
   return normalize(scored).sort((a, b) => b.probability - a.probability).slice(0, options.maxCombinations ?? scored.length);
 }
 
+/** Uses hidden opponent scenarios to find the own four-player order with the highest expected team win probability. */
+export function buildOptimalOwnLineup(ownPlayers, opponentPlayers, opponentPredictions) {
+  if (ownPlayers.length !== 4 || !opponentPlayers?.length || !opponentPredictions?.length) return null;
+  const opponentById = new Map(opponentPlayers.map((player) => [player.id, player]));
+  const scenarios = opponentPredictions.map((prediction) => {
+    const players = prediction.playerIds.map((id) => opponentById.get(id)).filter(Boolean);
+    return players.length === 4 ? { probability: prediction.probability, variants: buildPositionVariants(players) } : null;
+  }).filter(Boolean);
+  if (!scenarios.length) return null;
+  const scenarioTotal = scenarios.reduce((sum, scenario) => sum + scenario.probability, 0) || 1;
+
+  const candidates = permute(ownPlayers).map((lineup) => {
+    let teamWinProbability = 0;
+    for (const scenario of scenarios) {
+      const scenarioWeight = scenario.probability / scenarioTotal;
+      for (const variant of scenario.variants) {
+        const opponents = variant.playerIds.map((id) => opponentById.get(id));
+        teamWinProbability += scenarioWeight * variant.probability * calculateTeamWinProbability(lineup, opponents);
+      }
+    }
+    return { playerIds: lineup.map((player) => player.id), teamWinProbability };
+  }).sort((a, b) => b.teamWinProbability - a.teamWinProbability);
+
+  return { best: candidates[0], alternatives: candidates.slice(1, 3), scenariosUsed: scenarios.length };
+}
+
+export function calculateTeamWinProbability(ownLineup, opponentLineup) {
+  if (ownLineup.length !== 4 || opponentLineup.length !== 4) return 0;
+  const gameProbabilities = DEMO_SINGLE_PAIRINGS.map(([ownIndex, opponentIndex]) =>
+    headToHeadWinProbability(ownLineup[ownIndex].rcRating, opponentLineup[opponentIndex].rcRating)
+  );
+
+  // Demo approximation: probability of winning at least 7 of 12 singles.
+  let distribution = [1];
+  for (const probability of gameProbabilities) {
+    const next = Array(distribution.length + 1).fill(0);
+    distribution.forEach((value, wins) => {
+      next[wins] += value * (1 - probability);
+      next[wins + 1] += value * probability;
+    });
+    distribution = next;
+  }
+  return distribution.slice(7).reduce((sum, probability) => sum + probability, 0);
+}
+
 export function buildPositionVariants(players) {
   return normalizeBy(permute(players).map((lineup) => {
     const expectedStrength = lineup.reduce((sum, player, index) => sum + player.rcRating * (4 - index), 0) / 10_000;
@@ -29,6 +83,7 @@ export function buildPositionVariants(players) {
   }), (variant) => Math.exp(variant.expectedStrength / 3)).sort((a, b) => b.probability - a.probability);
 }
 
+function headToHeadWinProbability(ownRc, opponentRc) { return 1 / (1 + Math.pow(10, (opponentRc - ownRc) / RC_SCALE)); }
 function normalize(items) {
   const total = items.reduce((sum, item) => sum + item.score, 0);
   return items.map((item) => ({ ...item, probability: total === 0 ? 0 : item.score / total }));
