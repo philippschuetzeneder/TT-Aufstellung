@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: tt-aufstellung
+    runtime: python
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: PYTHONPATH=backend python -m app.web
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
