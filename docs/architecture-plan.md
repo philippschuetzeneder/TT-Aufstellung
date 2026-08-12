@@ -19,7 +19,7 @@ Die folgenden Punkte wurden anhand öffentlich auffindbarer Seiten geprüft:
 - Öffentliche RC-/Ranglisteninformationen sind mindestens über Verbandsseiten verfügbar. Beispiel: die NÖTTV-Rangliste enthält Rang, Name, Punkte mit Unsicherheit, Verein und Datum `zuletzt gespielt`.
 - Die Google-Play-Beschreibung der offiziellen XTTV-Mobile-App bestätigt, dass XTTV Mobile Zugriff auf Daten von Ligen und Vereinen bietet, die im XTTV-Ergebnisdienst verwaltet werden. Eine App kann auf nicht-dokumentierte Endpunkte hindeuten; deren Nutzung muss rechtlich/technisch geprüft werden.
 
-Konsequenz: Der Importer darf nicht auf Vermutungen über eine stabile HTML-Struktur bauen. Phase 3 beginnt daher mit einem XTTV-Struktur-Spike, der aktuelle Seiten, Parameter, Cookies, Sprache, Tabellen, Links und mögliche JSON-/XHR-Endpunkte aufzeichnet, bevor Parser produktiv gebaut werden.
+Konsequenz: Der Importer darf nicht auf Vermutungen über eine stabile HTML-Struktur bauen. Phase 3 beginnt daher mit einem XTTV-Struktur-Spike, der aktuelle Seiten, Parameter, Cookies, Sprache, Tabellen, Links und mögliche JSON-/XHR-Endpunkte aufzeichnet, bevor Parser produktiv gebaut werden. Die detaillierten Ergebnisse dieses Struktur-Spikes sind in [`docs/xttv-data-structure.md`](xttv-data-structure.md) dokumentiert.
 
 ## 3. Gesamtarchitektur
 
