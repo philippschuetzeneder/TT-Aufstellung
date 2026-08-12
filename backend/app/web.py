@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .db import create_all, database_health
+from .db_routes import get_match
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import import_one
 from .xttv_parser import parse_match
@@ -78,6 +79,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
         if parsed.path == "/api/db/health":
             return self.send_json(database_health())
+        if parsed.path == "/api/db/match":
+            return self.send_json(get_match(meid))
         if parsed.path == "/api/xttv/debug":
             return self.send_json(debug_xttv(meid))
         if parsed.path == "/api/xttv/fetch":
