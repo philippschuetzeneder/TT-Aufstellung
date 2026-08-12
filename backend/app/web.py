@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .db import create_all, database_health
 from .xttv_import import MATCH_URL, fetch_match, import_one, inspect_html
 from .xttv_parser import parse_match
 
@@ -74,6 +75,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/health":
             return self.send_json({"ok": True})
+        if parsed.path == "/api/db/health":
+            return self.send_json(database_health())
         if parsed.path == "/api/xttv/debug":
             return self.send_json(debug_xttv(meid))
         if parsed.path == "/api/xttv/fetch":
