@@ -4,12 +4,16 @@ const HISTORY_WEIGHT = 0.2;
 const RECENCY_HALF_LIFE_DAYS = 45;
 const RC_SCALE = 400;
 
-// Demo-only schedule. The real league-specific schedule will later come from XTTV.
+// Austrian 4-player team-match demo schedule: 12 singles (3 per player) + 2 doubles.
+// The exact historical schedule will be supplied by XTTV once imported.
 const DEMO_SINGLE_PAIRINGS = [
-  [0, 0], [0, 1], [0, 2],
-  [1, 0], [1, 1], [1, 3],
-  [2, 0], [2, 2], [2, 3],
-  [3, 1], [3, 2], [3, 3]
+  [0, 0], [1, 1], [2, 2], [3, 3],
+  [0, 1], [1, 2], [2, 3], [3, 0],
+  [0, 2], [1, 3], [2, 0], [3, 1]
+];
+const DEMO_DOUBLES = [
+  [[0, 1], [0, 1]],
+  [[2, 3], [2, 3]]
 ];
 
 export function buildOpponentCombinationPredictions(opponentPlayers, historicalCombinations, options = {}) {
@@ -57,13 +61,23 @@ export function buildOptimalOwnLineup(ownPlayers, opponentPlayers, opponentPredi
   return { best: candidates[0], alternatives: candidates.slice(1, 3), scenariosUsed: scenarios.length };
 }
 
+/**
+ * Estimates the probability that the team wins the complete 14-game match:
+ * 12 singles (3 per player) plus 2 doubles. This is deliberately a transparent
+ * demo model; XTTV will later provide the exact league-specific match schedule.
+ */
 export function calculateTeamWinProbability(ownLineup, opponentLineup) {
   if (ownLineup.length !== 4 || opponentLineup.length !== 4) return 0;
   const gameProbabilities = DEMO_SINGLE_PAIRINGS.map(([ownIndex, opponentIndex]) =>
     headToHeadWinProbability(ownLineup[ownIndex].rcRating, opponentLineup[opponentIndex].rcRating)
   );
+  for (const [[ownA, ownB], [oppA, oppB]] of DEMO_DOUBLES) {
+    const ownDoubleRc = (ownLineup[ownA].rcRating + ownLineup[ownB].rcRating) / 2;
+    const oppDoubleRc = (opponentLineup[oppA].rcRating + opponentLineup[oppB].rcRating) / 2;
+    gameProbabilities.push(headToHeadWinProbability(ownDoubleRc, oppDoubleRc));
+  }
 
-  // Demo approximation: probability of winning at least 7 of 12 singles.
+  // 14 scheduled games; a team wins the match with at least 8 wins.
   let distribution = [1];
   for (const probability of gameProbabilities) {
     const next = Array(distribution.length + 1).fill(0);
@@ -73,7 +87,7 @@ export function calculateTeamWinProbability(ownLineup, opponentLineup) {
     });
     distribution = next;
   }
-  return distribution.slice(7).reduce((sum, probability) => sum + probability, 0);
+  return distribution.slice(8).reduce((sum, probability) => sum + probability, 0);
 }
 
 export function buildPositionVariants(players) {
