@@ -11,8 +11,7 @@ def clean(value: str) -> str:
 
 
 def _cells(table):
-    return [[clean(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
-            for tr in table.find_all("tr") if tr.find_all(["th", "td"])]
+    return [[clean(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])] for tr in table.find_all("tr") if tr.find_all(["th", "td"])]
 
 
 def _team(cell: str):
@@ -31,15 +30,20 @@ def _player(cell: str):
 
 def _pairs(cell: str):
     result = {}
-    # XTTV puts both doubles pair definitions into one cell.
     pattern = re.compile(r"Doppel\s*\((\d+)\):\s*(\d+)\s*/\s*(\d+)\s+(.+?)(?=\s+Doppel\s*\(|$)", re.I)
     for m in pattern.finditer(cell):
-        result[int(m.group(1))] = {
-            "sequence": int(m.group(1)),
-            "pass_numbers": [m.group(2), m.group(3)],
-            "players": clean(m.group(4)),
-        }
+        result[int(m.group(1))] = {"sequence": int(m.group(1)), "pass_numbers": [m.group(2), m.group(3)], "players": clean(m.group(4))}
     return result
+
+
+def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code: str, away_code: str):
+    # XTTV prints the score from the winner's perspective. The team code after
+    # the score identifies the winner, so normalize every result to home:away.
+    if winner_code == home_code:
+        return f"{raw_left}:{raw_right}", "home"
+    if winner_code == away_code:
+        return f"{raw_right}:{raw_left}", "away"
+    return f"{raw_left}:{raw_right}", None
 
 
 def parse_match(html: str, meid: int) -> dict:
@@ -52,64 +56,39 @@ def parse_match(html: str, meid: int) -> dict:
     if len(header) < 2 or len(header[0]) < 5 or len(header[1]) < 5:
         raise ValueError("XTTV header layout is not recognized")
 
-    home_label = header[0][1]
-    away_label = header[1][1]
-    home_is_letters = "A-D" in home_label
-    home_is_numbers = "1-4" in home_label
-    away_is_letters = "A-D" in away_label
-    away_is_numbers = "1-4" in away_label
-
-    # Exactly one side must be A-D and the other 1-4.
-    if (home_is_letters == home_is_numbers or away_is_letters == away_is_numbers
-            or home_is_letters == away_is_letters):
-        raise ValueError(
-            f"Could not determine the A-D / 1-4 assignment from XTTV header: "
-            f"home={home_label!r}, away={away_label!r}"
-        )
+    home_label, away_label = header[0][1], header[1][1]
+    home_is_letters, home_is_numbers = "A-D" in home_label, "1-4" in home_label
+    away_is_letters, away_is_numbers = "A-D" in away_label, "1-4" in away_label
+    if (home_is_letters == home_is_numbers or away_is_letters == away_is_numbers or home_is_letters == away_is_letters):
+        raise ValueError(f"Could not determine the A-D / 1-4 assignment from XTTV header: home={home_label!r}, away={away_label!r}")
 
     home_scheme = "letters" if home_is_letters else "numbers"
     away_scheme = "letters" if away_is_letters else "numbers"
     home_positions = list("ABCD") if home_scheme == "letters" else list("1234")
-    away_positions = list("ABCD") if away_scheme == "letters" else list("1234")
-
     home_team, home_code = _team(header[0][2])
     away_team, away_code = _team(header[1][2])
     team_result = header[0][4]
-
     date_match = re.search(r"Datum:\s*(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})", header[1][0])
     round_match = re.search(r"Runde:\s*(\d+)\s*\(Durchgang\s*(\d+)\)", header[1][0])
 
     grid = _cells(tables[1])
     if len(grid) < 6:
         raise ValueError(f"Expected at least 6 rows in XTTV match table, got {len(grid)}")
-
     competition = grid[0][0]
-    players = []
-    by_pos = {}
-
-    # First row contains the home lineup. The remaining four player rows contain
-    # the away lineup. This remains true regardless of which side is A-D.
+    players, by_pos = [], {}
     for cell in grid[0]:
         if re.match(r"^[A-D1-4]:\s*PassNr\s+\d+\s+", cell):
             pos, name, pid = _player(cell)
             p = {"name": name, "external_player_id": pid, "side": "home", "position": pos}
-            players.append(p)
-            by_pos[("home", pos)] = p
-
+            players.append(p); by_pos[("home", pos)] = p
     if len([p for p in players if p["side"] == "home"]) != 4:
         raise ValueError("XTTV home lineup does not contain exactly four players")
 
     games = []
-    away_rows = grid[1:5]
-    for row in away_rows:
-        if not row:
-            continue
+    for row in grid[1:5]:
         pos, name, pid = _player(row[0])
         p = {"name": name, "external_player_id": pid, "side": "away", "position": pos}
-        players.append(p)
-        by_pos[("away", pos)] = p
-
-        # Columns 1..4 correspond to the four home positions in the header.
+        players.append(p); by_pos[("away", pos)] = p
         for idx, cell in enumerate(row[1:5]):
             if not cell or idx >= 4:
                 continue
@@ -117,88 +96,51 @@ def parse_match(html: str, meid: int) -> dict:
             m = re.search(r"\((\d+)\)\s+(\d+):(\d+)\s+([A-Za-z0-9]+)", cell)
             if not m:
                 continue
-            seq = int(m.group(1))
-            result = f"{m.group(2)}:{m.group(3)}"
-            winner_code = m.group(4)
-            winner_side = "home" if winner_code == home_code else "away" if winner_code == away_code else None
-            games.append({
-                "sequence": seq,
-                "game_type": "singles",
-                "home_position": home_pos,
-                "away_position": pos,
-                "home_player": by_pos[("home", home_pos)]["name"],
-                "away_player": p["name"],
-                "result": result,
-                "sets": result,
-                "winner_side": winner_side,
-                "raw_row": cell,
-            })
+            seq = int(m.group(1)); raw_left, raw_right = int(m.group(2)), int(m.group(3)); winner_code = m.group(4)
+            result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code)
+            games.append({"sequence": seq, "game_type": "singles", "home_position": home_pos, "away_position": pos,
+                          "home_player": by_pos[("home", home_pos)]["name"], "away_player": p["name"],
+                          "result": result, "sets": result, "winner_side": winner_side, "raw_row": cell})
 
     if len([p for p in players if p["side"] == "away"]) != 4:
         raise ValueError("XTTV away lineup does not contain exactly four players")
 
-    # Doubles are defined once for the home side in row 0 and once for the away
-    # side in the final row. Their result cells are in that final row as well.
     home_pairs = {}
     for cell in grid[0]:
         if "Doppel" in cell:
             home_pairs.update(_pairs(cell))
-
     away_pairs = {}
     final = grid[5]
     for cell in final:
         if "Doppel" in cell:
             away_pairs.update(_pairs(cell))
-
     for cell in final:
         for m in re.finditer(r"\((5|10)\)\s+(\d+):(\d+)\s+([A-Za-z0-9]+)", cell):
-            seq = int(m.group(1))
-            result = f"{m.group(2)}:{m.group(3)}"
-            winner_code = m.group(4)
-            winner_side = "home" if winner_code == home_code else "away" if winner_code == away_code else None
-            hp = home_pairs.get(seq)
-            ap = away_pairs.get(seq)
-            games.append({
-                "sequence": seq,
-                "game_type": "doubles",
-                "home_position": None,
-                "away_position": None,
-                "home_player": hp["players"] if hp else None,
-                "away_player": ap["players"] if ap else None,
-                "result": result,
-                "sets": result,
-                "winner_side": winner_side,
-                "raw_row": cell,
-            })
+            seq = int(m.group(1)); raw_left, raw_right = int(m.group(2)), int(m.group(3)); winner_code = m.group(4)
+            result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code)
+            hp, ap = home_pairs.get(seq), away_pairs.get(seq)
+            games.append({"sequence": seq, "game_type": "doubles", "home_position": None, "away_position": None,
+                          "home_player": hp["players"] if hp else None, "away_player": ap["players"] if ap else None,
+                          "result": result, "sets": result, "winner_side": winner_side, "raw_row": cell})
 
     games.sort(key=lambda g: g["sequence"])
     singles = [g for g in games if g["game_type"] == "singles"]
     doubles = [g for g in games if g["game_type"] == "doubles"]
     if len(singles) != 12 or len(doubles) != 2:
         raise ValueError(f"Unexpected game count: singles={len(singles)}, doubles={len(doubles)}")
+    home_wins = sum(g["winner_side"] == "home" for g in games)
+    away_wins = sum(g["winner_side"] == "away" for g in games)
+    score_match = re.fullmatch(r"(\d+)\s*:\s*(\d+)", team_result)
+    if score_match and (home_wins, away_wins) != (int(score_match.group(1)), int(score_match.group(2))):
+        raise ValueError(f"Parsed game results do not match XTTV team result {team_result}: parsed {home_wins}:{away_wins}")
 
     season = re.search(r"\b(20\d{2}/20\d{2})\b", competition)
-    return {
-        "external_id": str(meid),
-        "source_url": MATCH_URL.format(meid=meid),
-        "title": clean(soup.title.get_text(" ", strip=True)) if soup.title else None,
-        "league": competition,
-        "season": season.group(1) if season else None,
-        "round": int(round_match.group(1)) if round_match else None,
-        "leg": int(round_match.group(2)) if round_match else None,
-        "match_date": date_match.group(1) if date_match else None,
-        "home_team": home_team,
-        "away_team": away_team,
-        "home_code": home_code,
-        "away_code": away_code,
-        "home_scheme": home_scheme,
-        "away_scheme": away_scheme,
-        "team_result": team_result,
-        "players": players,
-        "games": games,
-        "player_count": len(players),
-        "singles_count": len(singles),
-        "doubles_count": len(doubles),
-        "has_doubles": True,
-        "raw_text": clean(soup.get_text(" ", strip=True)),
-    }
+    return {"external_id": str(meid), "source_url": MATCH_URL.format(meid=meid),
+            "title": clean(soup.title.get_text(" ", strip=True)) if soup.title else None,
+            "league": competition, "season": season.group(1) if season else None,
+            "round": int(round_match.group(1)) if round_match else None, "leg": int(round_match.group(2)) if round_match else None,
+            "match_date": date_match.group(1) if date_match else None, "home_team": home_team, "away_team": away_team,
+            "home_code": home_code, "away_code": away_code, "home_scheme": home_scheme, "away_scheme": away_scheme,
+            "team_result": team_result, "players": players, "games": games, "player_count": len(players),
+            "singles_count": len(singles), "doubles_count": len(doubles), "has_doubles": True,
+            "raw_text": clean(soup.get_text(" ", strip=True))}
