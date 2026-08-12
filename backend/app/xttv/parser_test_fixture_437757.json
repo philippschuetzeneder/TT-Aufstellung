@@ -1,0 +1,18 @@
+{
+  "meid": 437757,
+  "expected": {
+    "league": "411 RK Linz Umg. / MV Mitte",
+    "season": "2025/2026",
+    "round": 1,
+    "home_team": "Hirschbach 1",
+    "away_team": "Lasberg 1",
+    "home_scheme": "letters",
+    "away_scheme": "numbers",
+    "home_players": {"A": 17245, "B": 20837, "C": 19987, "D": 18958},
+    "away_players": {"1": 14374, "2": 13308, "3": 16703, "4": 8539},
+    "home_score": 8,
+    "away_score": 6,
+    "singles_count": 12,
+    "doubles_count": 2
+  }
+}
