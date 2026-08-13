@@ -132,8 +132,8 @@ def parse_match(html: str, meid: int) -> dict:
     games.sort(key=lambda g: g["sequence"])
     singles = [g for g in games if g["game_type"] == "singles"]
     doubles = [g for g in games if g["game_type"] == "doubles"]
-    if len(singles) != 12 or len(doubles) != 2:
-        raise ValueError(f"Unexpected game count: singles={len(singles)}, doubles={len(doubles)}")
+    if not 8 <= len(singles) <= 12 or len(doubles) != 2:
+        raise ValueError(f"Unexpected game count: singles={len(singles)}, doubles={len(doubles)}; expected 8-12 singles and 2 doubles")
     home_wins = sum(g["winner_side"] == "home" for g in games)
     away_wins = sum(g["winner_side"] == "away" for g in games)
     score_match = re.fullmatch(r"(\d+)\s*:\s*(\d+)", team_result)
