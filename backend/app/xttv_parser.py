@@ -59,12 +59,7 @@ def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code
 
 
 def _expected_singles_count(home_wins: int, away_wins: int) -> int:
-    """Return the required number of singles for the fixed 4-player format.
-
-    There are always exactly two doubles and at least eight singles. The match
-    ends as soon as a team reaches eight wins. Consequently the only valid
-    final scores are 10:0, 9:1, 8:2, 8:3, 8:4, 8:5, 8:6 and 7:7.
-    """
+    """Return the required number of singles for the fixed 4-player format."""
     score = (home_wins, away_wins)
     if score in {(10, 0), (9, 1), (8, 2)}:
         return 8
@@ -76,6 +71,31 @@ def _expected_singles_count(home_wins: int, away_wins: int) -> int:
         f"Invalid XTTV team result {home_wins}:{away_wins}; "
         "expected one of 10:0, 9:1, 8:2, 8:3, 8:4, 8:5, 8:6 or 7:7"
     )
+
+
+def _validate_game_structure(games: list[dict], home_wins: int, away_wins: int) -> None:
+    """Validate the structural rules of a complete XTTV 4-player report."""
+    singles = [g for g in games if g.get("game_type") == "singles"]
+    doubles = [g for g in games if g.get("game_type") == "doubles"]
+    expected_singles = _expected_singles_count(home_wins, away_wins)
+
+    if len(doubles) != 2:
+        raise ValueError(f"Unexpected double count: doubles={len(doubles)}; exactly two doubles are required")
+    if len(singles) != expected_singles:
+        raise ValueError(
+            f"Unexpected game count for result {home_wins}:{away_wins}: "
+            f"singles={len(singles)}, expected={expected_singles}, doubles={len(doubles)}"
+        )
+
+    sequences = [g.get("sequence") for g in games]
+    if len(sequences) != len(set(sequences)):
+        raise ValueError(f"Duplicate game sequence numbers in XTTV report: {sequences}")
+    if set(g.get("sequence") for g in doubles) != {5, 10}:
+        raise ValueError("XTTV doubles must be games 5 and 10")
+    if any(g.get("sequence") in {5, 10} for g in singles):
+        raise ValueError("XTTV doubles sequences 5 and 10 must not also occur as singles")
+    if any(g.get("winner_side") not in {"home", "away"} for g in games):
+        raise ValueError("XTTV report contains a game without a recognized winner")
 
 
 def parse_match(html: str, meid: int) -> dict:
@@ -94,7 +114,6 @@ def parse_match(html: str, meid: int) -> dict:
     away_is_letters = bool(re.search(r"A-D", away_label))
     away_is_numbers = bool(re.search(r"1-4", away_label))
 
-    # 3-player formats are intentionally not imported.
     if re.search(r"A-C", home_label) or re.search(r"A-C", away_label):
         raise ValueError("XTTV 3-player format (A-C) is not supported")
     if re.search(r"1-3", home_label) or re.search(r"1-3", away_label):
@@ -115,8 +134,9 @@ def parse_match(html: str, meid: int) -> dict:
     home_team, home_code = _team(header[0][2])
     away_team, away_code = _team(header[1][2])
     team_result = header[0][4]
-    date_match = re.search(r"Datum:\s*(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})", clean(" ".join(" ".join(r) for r in header[:2])))
-    round_match = re.search(r"Runde:\s*(\d+)\s*\(Durchgang\s*(\d+)\)", clean(" ".join(" ".join(r) for r in header[:2])))
+    header_text = clean(" ".join(" ".join(r) for r in header[:2]))
+    date_match = re.search(r"Datum:\s*(\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})", header_text)
+    round_match = re.search(r"Runde:\s*(\d+)\s*\(Durchgang\s*(\d+)\)", header_text)
 
     grid = _cells(tables[1])
     if len(grid) < 6:
@@ -126,8 +146,6 @@ def parse_match(html: str, meid: int) -> dict:
     players = []
     by_pos = {}
 
-    # XTTV always places the horizontal (A-D) lineup in grid[0]
-    # and the vertical (1-4) lineup in rows 1-4.
     for cell in grid[0]:
         if re.match(r"^[A-D]:\s*PassNr\s+\d+\s+", cell):
             pos, name, pid = _player(cell)
@@ -138,7 +156,6 @@ def parse_match(html: str, meid: int) -> dict:
     if len([p for p in players if p["side"] == horizontal_side]) != 4:
         raise ValueError(f"XTTV horizontal lineup does not contain exactly four players: {players!r}")
 
-    games = []
     for row in grid[1:5]:
         if not row:
             continue
@@ -147,6 +164,16 @@ def parse_match(html: str, meid: int) -> dict:
         players.append(p)
         by_pos[(vertical_side, pos)] = p
 
+    if len([p for p in players if p["side"] == vertical_side]) != 4:
+        raise ValueError("XTTV vertical lineup does not contain exactly four players")
+    if len({(p["side"], p["position"]) for p in players}) != 8:
+        raise ValueError("XTTV report contains duplicate player positions")
+    if len({p["external_player_id"] for p in players}) != 8:
+        raise ValueError("XTTV report contains duplicate player IDs")
+
+    games = []
+    for row in grid[1:5]:
+        pos = row[0].split(":", 1)[0].strip()
         for idx, cell in enumerate(row[1:5]):
             if not cell or idx >= 4:
                 continue
@@ -158,17 +185,8 @@ def parse_match(html: str, meid: int) -> dict:
             raw_left, raw_right = int(m.group(2)), int(m.group(3))
             winner_code = m.group(4)
             result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code, vertical_side)
-
-            horizontal_player = by_pos.get((horizontal_side, horizontal_pos))
-            vertical_player = by_pos.get((vertical_side, pos))
-            if not horizontal_player or not vertical_player:
-                raise ValueError(
-                    f"XTTV position mapping failed: meid={meid}, sequence={seq}, "
-                    f"horizontal_side={horizontal_side}, horizontal_pos={horizontal_pos}, "
-                    f"vertical_side={vertical_side}, vertical_pos={pos}, "
-                    f"known_positions={sorted(by_pos.keys())}"
-                )
-
+            horizontal_player = by_pos[(horizontal_side, horizontal_pos)]
+            vertical_player = by_pos[(vertical_side, pos)]
             home_player = horizontal_player if horizontal_side == "home" else vertical_player
             away_player = vertical_player if vertical_side == "away" else horizontal_player
             games.append({
@@ -183,9 +201,6 @@ def parse_match(html: str, meid: int) -> dict:
                 "winner_side": winner_side,
                 "raw_row": cell,
             })
-
-    if len([p for p in players if p["side"] == vertical_side]) != 4:
-        raise ValueError("XTTV vertical lineup does not contain exactly four players")
 
     horizontal_pairs = {}
     for cell in grid[0]:
@@ -220,25 +235,18 @@ def parse_match(html: str, meid: int) -> dict:
             })
 
     games.sort(key=lambda g: g["sequence"])
-    singles = [g for g in games if g["game_type"] == "singles"]
-    doubles = [g for g in games if g["game_type"] == "doubles"]
-
-    if len(doubles) != 2:
-        raise ValueError(f"Unexpected double count: doubles={len(doubles)}; exactly two doubles are required")
-
     home_wins = sum(g["winner_side"] == "home" for g in games)
     away_wins = sum(g["winner_side"] == "away" for g in games)
-    expected_singles = _expected_singles_count(home_wins, away_wins)
-    if len(singles) != expected_singles:
-        raise ValueError(
-            f"Unexpected game count for result {home_wins}:{away_wins}: "
-            f"singles={len(singles)}, expected={expected_singles}, doubles={len(doubles)}"
-        )
+    _validate_game_structure(games, home_wins, away_wins)
 
     score_match = re.fullmatch(r"(\d+)\s*:\s*(\d+)", team_result)
-    if score_match and (home_wins, away_wins) != (int(score_match.group(1)), int(score_match.group(2))):
+    if not score_match:
+        raise ValueError(f"Could not parse XTTV team result: {team_result!r}")
+    if (home_wins, away_wins) != (int(score_match.group(1)), int(score_match.group(2))):
         raise ValueError(f"Parsed game results do not match XTTV team result {team_result}: parsed {home_wins}:{away_wins}")
 
+    singles = [g for g in games if g["game_type"] == "singles"]
+    doubles = [g for g in games if g["game_type"] == "doubles"]
     season = re.search(r"\b(20\d{2}/20\d{2})\b", competition)
     return {
         "external_id": str(meid),
