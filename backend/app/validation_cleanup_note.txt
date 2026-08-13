@@ -1,0 +1,1 @@
+Temporary files created during implementation should be removed from main.
