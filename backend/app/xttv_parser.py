@@ -203,10 +203,10 @@ def parse_match(html: str, meid: int) -> dict:
     singles = [g for g in games if g["game_type"] == "singles"]
     doubles = [g for g in games if g["game_type"] == "doubles"]
 
-    # XTTV uses several valid match formats in this league. We require four
-    # players per team and both doubles, but do not reject a match solely
-    # because it ended after a different number of singles.
-    if len(singles) not in (8, 10, 12) or len(doubles) != 2:
+    # XTTV has valid 4-player formats with 8, 9, 10, 11 or 12 singles,
+    # always accompanied by the two doubles. Shorter reports are normal when
+    # the match is already decided; they must not be rejected as incomplete.
+    if len(singles) not in (8, 9, 10, 11, 12) or len(doubles) != 2:
         raise ValueError(f"Unexpected game count: singles={len(singles)}, doubles={len(doubles)}")
 
     home_wins = sum(g["winner_side"] == "home" for g in games)
