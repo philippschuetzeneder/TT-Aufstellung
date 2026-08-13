@@ -43,11 +43,18 @@ def _pairs(cell: str):
     return result
 
 
-def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code: str, away_code: str):
+def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code: str, away_code: str, vertical_side: str):
+    # XTTV prints the score from the vertical lineup's perspective. Therefore
+    # the score must be reversed only when the vertical lineup is the away team.
+    if vertical_side == "home":
+        result = f"{raw_left}:{raw_right}"
+    else:
+        result = f"{raw_right}:{raw_left}"
+
     if winner_code == home_code:
-        return f"{raw_right}:{raw_left}", "home"
+        return result, "home"
     if winner_code == away_code:
-        return f"{raw_right}:{raw_left}", "away"
+        return result, "away"
     raise ValueError(f"Unknown winner code {winner_code!r}; expected {home_code!r} or {away_code!r}")
 
 
@@ -99,8 +106,8 @@ def parse_match(html: str, meid: int) -> dict:
     players = []
     by_pos = {}
 
-    # The XTTV HTML always places the horizontal (A-D) lineup in grid[0]
-    # and the vertical (1-4) lineup in rows 1-4, regardless of home/away.
+    # XTTV always places the horizontal (A-D) lineup in grid[0]
+    # and the vertical (1-4) lineup in rows 1-4.
     for cell in grid[0]:
         if re.match(r"^[A-D]:\s*PassNr\s+\d+\s+", cell):
             pos, name, pid = _player(cell)
@@ -130,7 +137,7 @@ def parse_match(html: str, meid: int) -> dict:
             seq = int(m.group(1))
             raw_left, raw_right = int(m.group(2)), int(m.group(3))
             winner_code = m.group(4)
-            result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code)
+            result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code, vertical_side)
 
             horizontal_player = by_pos.get((horizontal_side, horizontal_pos))
             vertical_player = by_pos.get((vertical_side, pos))
@@ -174,7 +181,7 @@ def parse_match(html: str, meid: int) -> dict:
             seq = int(m.group(1))
             raw_left, raw_right = int(m.group(2)), int(m.group(3))
             winner_code = m.group(4)
-            result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code)
+            result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code, vertical_side)
             hp = horizontal_pairs.get(seq)
             vp = vertical_pairs.get(seq)
             home_pair = hp["players"] if horizontal_side == "home" and hp else vp["players"] if vertical_side == "home" and vp else None
@@ -195,7 +202,11 @@ def parse_match(html: str, meid: int) -> dict:
     games.sort(key=lambda g: g["sequence"])
     singles = [g for g in games if g["game_type"] == "singles"]
     doubles = [g for g in games if g["game_type"] == "doubles"]
-    if len(singles) != 12 or len(doubles) != 2:
+
+    # Both formats occur in this league:
+    #   8 singles + 2 doubles (match ends after 10 games)
+    #   12 singles + 2 doubles (full 14-game schedule)
+    if len(singles) not in (8, 12) or len(doubles) != 2:
         raise ValueError(f"Unexpected game count: singles={len(singles)}, doubles={len(doubles)}")
 
     home_wins = sum(g["winner_side"] == "home" for g in games)
