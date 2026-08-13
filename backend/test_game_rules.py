@@ -1,37 +1,30 @@
-import pytest
+import unittest
 
 from app.xttv_parser import _expected_singles_count
 
 
-@pytest.mark.parametrize(
-    ("home_wins", "away_wins", "expected_singles"),
-    [
-        (10, 0, 8),
-        (9, 1, 8),
-        (8, 2, 8),
-        (8, 3, 9),
-        (8, 4, 10),
-        (8, 5, 11),
-        (8, 6, 12),
-        (7, 7, 12),
-    ],
-)
-def test_valid_tt_match_results(home_wins, away_wins, expected_singles):
-    assert _expected_singles_count(home_wins, away_wins) == expected_singles
+class TestGameRules(unittest.TestCase):
+    def test_valid_results_and_expected_single_counts(self):
+        expected = {
+            (10, 0): 8,
+            (9, 1): 8,
+            (8, 2): 8,
+            (8, 3): 9,
+            (8, 4): 10,
+            (8, 5): 11,
+            (8, 6): 12,
+            (7, 7): 12,
+        }
+        for score, singles in expected.items():
+            with self.subTest(score=score):
+                self.assertEqual(_expected_singles_count(*score), singles)
+
+    def test_impossible_results_are_rejected(self):
+        for score in ((10, 1), (10, 2), (9, 2), (8, 0), (8, 1), (8, 7), (7, 8)):
+            with self.subTest(score=score):
+                with self.assertRaises(ValueError):
+                    _expected_singles_count(*score)
 
 
-@pytest.mark.parametrize(
-    ("home_wins", "away_wins"),
-    [
-        (10, 1),
-        (10, 2),
-        (9, 2),
-        (10, 0),  # sanity check is valid and covered above
-    ],
-)
-def test_invalid_results_are_rejected_except_known_10_0(home_wins, away_wins):
-    if (home_wins, away_wins) == (10, 0):
-        assert _expected_singles_count(home_wins, away_wins) == 8
-    else:
-        with pytest.raises(ValueError):
-            _expected_singles_count(home_wins, away_wins)
+if __name__ == "__main__":
+    unittest.main()
