@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
+from .analytics_validation_service import validate_analytics
 from .db import create_all, database_health
 from .db_routes import get_match
 from .validation_service import validate_database
@@ -79,6 +80,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(database_health())
             if parsed.path == "/api/db/validate":
                 return self.send_json(validate_database())
+            if parsed.path == "/api/analytics/validate":
+                return self.send_json(validate_analytics())
             if parsed.path == "/api/db/match":
                 return self.send_json(get_match(meid))
             if parsed.path == "/api/analytics/players":
