@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .db import create_all, database_health
 from .db_routes import get_match
 from .validation_service import validate_database
@@ -71,52 +72,46 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self.send_json({"ok": False, "error": "meid must be an integer"}, 400)
 
-        if parsed.path == "/health":
-            return self.send_json({"ok": True})
-        if parsed.path == "/api/db/health":
-            return self.send_json(database_health())
-        if parsed.path == "/api/db/validate":
-            try:
+        try:
+            if parsed.path == "/health":
+                return self.send_json({"ok": True})
+            if parsed.path == "/api/db/health":
+                return self.send_json(database_health())
+            if parsed.path == "/api/db/validate":
                 return self.send_json(validate_database())
-            except Exception as exc:
-                return self.send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
-        if parsed.path == "/api/db/match":
-            return self.send_json(get_match(meid))
-        if parsed.path == "/api/xttv/debug":
-            return self.send_json(debug_xttv(meid))
-        if parsed.path == "/api/xttv/fetch":
-            return self.send_json({"meid": meid, **http_fetch(MATCH_URL.format(meid=meid))})
-        if parsed.path == "/api/xttv/inspect":
-            try:
+            if parsed.path == "/api/db/match":
+                return self.send_json(get_match(meid))
+            if parsed.path == "/api/analytics/players":
+                return self.send_json(player_stats())
+            if parsed.path == "/api/analytics/lineups":
+                return self.send_json(lineup_stats(query.get("team", [None])[0]))
+            if parsed.path == "/api/analytics/matchups":
+                return self.send_json(matchup_stats(query.get("player_id", [None])[0], query.get("opponent_id", [None])[0]))
+            if parsed.path == "/api/analytics/matchup-matrix":
+                return self.send_json(matchup_matrix())
+            if parsed.path == "/api/xttv/debug":
+                return self.send_json(debug_xttv(meid))
+            if parsed.path == "/api/xttv/fetch":
+                return self.send_json({"meid": meid, **http_fetch(MATCH_URL.format(meid=meid))})
+            if parsed.path == "/api/xttv/inspect":
                 html, status, content_type, url = fetch_match(meid)
                 inspection = inspect_html(html)
                 inspection.update({"meid": meid, "status": status, "content_type": content_type, "url": url})
                 return self.send_json(inspection)
-            except Exception as exc:
-                return self.send_json({"meid": meid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}, 502)
-        if parsed.path == "/api/xttv/parse":
-            try:
+            if parsed.path == "/api/xttv/parse":
                 html, status, content_type, url = fetch_match(meid)
                 parsed_match = parse_match(html, meid)
                 return self.send_json({"meid": meid, "status": status, "content_type": content_type, "url": url, **parsed_match})
-            except Exception as exc:
-                return self.send_json({"meid": meid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}, 502)
-        if parsed.path == "/api/xttv/import":
-            try:
-                result = import_one(meid)
-                return self.send_json({"meid": meid, **result})
-            except Exception as exc:
-                return self.send_json({"meid": meid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
-        if parsed.path == "/api/xttv/scan-import":
-            try:
+            if parsed.path == "/api/xttv/import":
+                return self.send_json({"meid": meid, **import_one(meid)})
+            if parsed.path == "/api/xttv/scan-import":
                 start = int(query.get("start", [str(REFERENCE_MEID - DEFAULT_RADIUS)])[0])
                 end = int(query.get("end", [str(REFERENCE_MEID + DEFAULT_RADIUS)])[0])
                 limit = int(query.get("limit", [str(DEFAULT_LIMIT)])[0])
                 delay = float(query.get("delay", ["0.05"])[0])
-                result = scan_and_import(start, end, limit=limit, delay=delay)
-                return self.send_json(result)
-            except Exception as exc:
-                return self.send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}", "target_league": TARGET_LEAGUE}, 500)
+                return self.send_json(scan_and_import(start, end, limit=limit, delay=delay))
+        except Exception as exc:
+            return self.send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
 
         rel = "index.html" if parsed.path in ("", "/") else parsed.path.lstrip("/")
         target = (ROOT / rel).resolve()
