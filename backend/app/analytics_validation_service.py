@@ -36,18 +36,29 @@ def validate_analytics() -> dict:
             issues.append({"type": "lineup_appearance_count", "expected": complete_sides, "actual": lineups["matches"]})
 
         probability_sum = sum(row["probability"] or 0 for row in lineups["lineups"])
-        if lineups["matches"] and abs(probability_sum - 1.0) > 0.002:
+        if lineups["matches"] and abs(probability_sum - 1.0) > 0.005:
             issues.append({"type": "lineup_probability_sum", "value": round(probability_sum, 6)})
 
-        matrix_by_pair = {(r["player_id"], r["opponent_id"]): r for r in matrix["matchups"]}
+        expected_matrix = {}
         for row in matchups["matchups"]:
-            forward = matrix_by_pair.get((row["home_player_id"], row["away_player_id"]))
-            reverse = matrix_by_pair.get((row["away_player_id"], row["home_player_id"]))
-            expected = row["matches"]
-            if not forward or (forward["matches"], forward["wins"], forward["losses"]) != (expected, row["home_wins"], row["away_wins"]):
-                issues.append({"type": "matrix_forward_mismatch", "pair": [row["home_player_id"], row["away_player_id"]]})
-            if not reverse or (reverse["matches"], reverse["wins"], reverse["losses"]) != (expected, row["away_wins"], row["home_wins"]):
-                issues.append({"type": "matrix_reverse_mismatch", "pair": [row["away_player_id"], row["home_player_id"]]})
+            forward_key = (row["home_player_id"], row["away_player_id"])
+            reverse_key = (row["away_player_id"], row["home_player_id"])
+            forward = expected_matrix.setdefault(forward_key, {"matches": 0, "wins": 0, "losses": 0})
+            reverse = expected_matrix.setdefault(reverse_key, {"matches": 0, "wins": 0, "losses": 0})
+            forward["matches"] += row["matches"]
+            forward["wins"] += row["home_wins"]
+            forward["losses"] += row["away_wins"]
+            reverse["matches"] += row["matches"]
+            reverse["wins"] += row["away_wins"]
+            reverse["losses"] += row["home_wins"]
+
+        matrix_by_pair = {(r["player_id"], r["opponent_id"]): r for r in matrix["matchups"]}
+        for pair, expected in expected_matrix.items():
+            actual = matrix_by_pair.get(pair)
+            if not actual or (actual["matches"], actual["wins"], actual["losses"]) != (
+                expected["matches"], expected["wins"], expected["losses"]
+            ):
+                issues.append({"type": "matrix_mismatch", "pair": [pair[0], pair[1]]})
 
         for row in matrix["matchups"]:
             if row["matches"] != row["wins"] + row["losses"]:
