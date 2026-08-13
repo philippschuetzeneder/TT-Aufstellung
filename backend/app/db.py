@@ -40,13 +40,21 @@ def create_all() -> None:
     if engine.dialect.name == "postgresql":
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE match_players DROP CONSTRAINT IF EXISTS uq_match_player"))
-            connection.execute(
+            exists = connection.execute(
                 text(
-                    "ALTER TABLE match_players "
-                    "ADD CONSTRAINT uq_match_player "
-                    "UNIQUE (match_id, external_player_id, side)"
+                    "SELECT 1 FROM pg_constraint "
+                    "WHERE conname = 'uq_match_player' "
+                    "AND conrelid = 'match_players'::regclass"
                 )
-            )
+            ).scalar()
+            if not exists:
+                connection.execute(
+                    text(
+                        "ALTER TABLE match_players "
+                        "ADD CONSTRAINT uq_match_player "
+                        "UNIQUE (match_id, external_player_id, side)"
+                    )
+                )
 
 
 def database_health() -> dict:
