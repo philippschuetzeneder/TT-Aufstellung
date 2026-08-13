@@ -33,6 +33,21 @@ def create_all() -> None:
     from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
+    # The original constraint used the player name as part of the identity.
+    # XTTV names are not unique, so two different players with the same name
+    # can occur in one match. Migrate existing PostgreSQL databases to use the
+    # stable XTTV external_player_id instead.
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE match_players DROP CONSTRAINT IF EXISTS uq_match_player"))
+            connection.execute(
+                text(
+                    "ALTER TABLE match_players "
+                    "ADD CONSTRAINT uq_match_player "
+                    "UNIQUE (match_id, external_player_id, side)"
+                )
+            )
+
 
 def database_health() -> dict:
     try:
