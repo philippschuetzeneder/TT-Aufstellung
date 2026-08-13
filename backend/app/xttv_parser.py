@@ -59,17 +59,27 @@ def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code
 
 
 def _expected_singles_count(home_wins: int, away_wins: int) -> int:
-    """Return the required number of singles for the fixed 4-player format."""
-    score = (home_wins, away_wins)
-    if score in {(10, 0), (9, 1), (8, 2)}:
+    """Return the required number of singles for the fixed 4-player format.
+
+    There are always exactly two doubles. Singles stop as soon as one team
+    reaches eight singles wins, so the valid final team scores are the
+    mirrored 8:2..8:6 results, 9:1, 10:0 and 7:7.
+    """
+    high = max(home_wins, away_wins)
+    low = min(home_wins, away_wins)
+
+    if high == 8 and low in (2, 3, 4, 5, 6):
+        return low + 6
+    if high == 9 and low == 1:
         return 8
-    if score in {(8, 3), (8, 4), (8, 5), (8, 6)}:
-        return away_wins + 6
-    if score == (7, 7):
+    if high == 10 and low == 0:
+        return 8
+    if (home_wins, away_wins) == (7, 7):
         return 12
     raise ValueError(
         f"Invalid XTTV team result {home_wins}:{away_wins}; "
-        "expected one of 10:0, 9:1, 8:2, 8:3, 8:4, 8:5, 8:6 or 7:7"
+        "expected one of 10:0, 9:1, 8:2, 8:3, 8:4, 8:5, 8:6 or 7:7, "
+        "including mirrored results"
     )
 
 
