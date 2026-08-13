@@ -125,7 +125,6 @@ def parse_match(html: str, meid: int) -> dict:
     home_is_numbers = bool(home_number_match)
     away_is_numbers = bool(away_number_match)
 
-    # 3-player reports (A-C / 1-3) are intentionally excluded.
     if home_letter_match and home_letter_match.group(1) == "A" and home_letter_match.group(2) == "C":
         raise ValueError("XTTV 3-player format (A-C) is not supported")
     if away_letter_match and away_letter_match.group(1) == "A" and away_letter_match.group(2) == "C":
@@ -192,13 +191,10 @@ def parse_match(html: str, meid: int) -> dict:
         raise ValueError(f"Unexpected player count: {len(players)} (expected 8)")
 
     games = []
-    row_positions = set("ABCD" if letters_side == "home" else "1234")
     column_positions = list("1234" if letters_side == "home" else "ABCD")
+    expected_row_positions = "ABCD" if letters_side == "home" else "1234"
 
-    # The first cell identifies the player on the table's vertical axis. The
-    # remaining cells are the opponent positions in fixed left-to-right order.
-    # This works for both orientations: home A-D / away 1-4 and home 1-4 / away A-D.
-    for row in table1_rows[1:5]:
+    for row_index, row in enumerate(table1_rows[1:5], start=1):
         if not row:
             continue
         first = row[0]
@@ -206,14 +202,9 @@ def parse_match(html: str, meid: int) -> dict:
         if not mpos:
             continue
         row_pos = mpos.group(1)
-        expected_row_positions = "ABCD" if letters_side == "home" else "1234"
         if row_pos not in expected_row_positions:
             continue
         row_side = letters_side if row_pos in "ABCD" else numbers_side
-        if row_side == "home":
-            home_pos = row_pos
-        else:
-            away_pos = row_pos
 
         for col_index, cell in enumerate(row[1:5]):
             if not cell or col_index >= len(column_positions):
@@ -224,7 +215,8 @@ def parse_match(html: str, meid: int) -> dict:
             else:
                 home_pos, away_pos = col_pos, row_pos
 
-            for match in re.finditer(r"\((\d+)\)\s+(\d+):(\d+)\s+([A-Za-z0-9]+)", cell):
+            matches = list(re.finditer(r"\((\d+)\)\s+(\d+):(\d+)\s+([A-Za-z0-9]+)", cell))
+            for match in matches:
                 sequence = int(match.group(1))
                 result = f"{match.group(2)}:{match.group(3)}"
                 winner_code = match.group(4)
@@ -232,7 +224,15 @@ def parse_match(html: str, meid: int) -> dict:
                 home_player = player_by_position.get(("home", home_pos))
                 away_player = player_by_position.get(("away", away_pos))
                 if not home_player or not away_player:
-                    raise ValueError(f"Could not map game {sequence}: home={home_pos}, away={away_pos}")
+                    known_positions = sorted(f"{side}:{pos}" for side, pos in player_by_position)
+                    raise ValueError(
+                        f"XTTV position mapping failed for game {sequence}: "
+                        f"meid={meid}, row={row_index}, row_pos={row_pos}, row_side={row_side}, "
+                        f"col_index={col_index}, col_pos={col_pos}, home_pos={home_pos}, away_pos={away_pos}, "
+                        f"letters_side={letters_side}, numbers_side={numbers_side}, "
+                        f"home_header={home_header!r}, away_header={away_header!r}, "
+                        f"known_positions={known_positions}, cell={cell!r}"
+                    )
                 games.append({
                     "sequence": sequence,
                     "game_type": "singles",
@@ -286,7 +286,7 @@ def parse_match(html: str, meid: int) -> dict:
         "players": players,
         "games": games,
         "player_count": len(players),
-        "singles_count": len(games),
+        "singles_count": len([g for g in games if g["game_type"] == "singles"]),
         "doubles_count": 2,
         "has_doubles": True,
         "raw_text": clean(soup.get_text(" ", strip=True)),
