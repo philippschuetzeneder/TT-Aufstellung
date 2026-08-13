@@ -58,6 +58,26 @@ def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code
     raise ValueError(f"Unknown winner code {winner_code!r}; expected {home_code!r} or {away_code!r}")
 
 
+def _expected_singles_count(home_wins: int, away_wins: int) -> int:
+    """Return the required number of singles for the fixed 4-player format.
+
+    There are always exactly two doubles and at least eight singles. The match
+    ends as soon as a team reaches eight wins. Consequently the only valid
+    final scores are 10:0, 9:1, 8:2, 8:3, 8:4, 8:5, 8:6 and 7:7.
+    """
+    score = (home_wins, away_wins)
+    if score in {(10, 0), (9, 1), (8, 2)}:
+        return 8
+    if score in {(8, 3), (8, 4), (8, 5), (8, 6)}:
+        return away_wins + 6
+    if score == (7, 7):
+        return 12
+    raise ValueError(
+        f"Invalid XTTV team result {home_wins}:{away_wins}; "
+        "expected one of 10:0, 9:1, 8:2, 8:3, 8:4, 8:5, 8:6 or 7:7"
+    )
+
+
 def parse_match(html: str, meid: int) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     tables = soup.find_all("table")
@@ -203,14 +223,18 @@ def parse_match(html: str, meid: int) -> dict:
     singles = [g for g in games if g["game_type"] == "singles"]
     doubles = [g for g in games if g["game_type"] == "doubles"]
 
-    # XTTV has valid 4-player formats with 8, 9, 10, 11 or 12 singles,
-    # always accompanied by the two doubles. Shorter reports are normal when
-    # the match is already decided; they must not be rejected as incomplete.
-    if len(singles) not in (8, 9, 10, 11, 12) or len(doubles) != 2:
-        raise ValueError(f"Unexpected game count: singles={len(singles)}, doubles={len(doubles)}")
+    if len(doubles) != 2:
+        raise ValueError(f"Unexpected double count: doubles={len(doubles)}; exactly two doubles are required")
 
     home_wins = sum(g["winner_side"] == "home" for g in games)
     away_wins = sum(g["winner_side"] == "away" for g in games)
+    expected_singles = _expected_singles_count(home_wins, away_wins)
+    if len(singles) != expected_singles:
+        raise ValueError(
+            f"Unexpected game count for result {home_wins}:{away_wins}: "
+            f"singles={len(singles)}, expected={expected_singles}, doubles={len(doubles)}"
+        )
+
     score_match = re.fullmatch(r"(\d+)\s*:\s*(\d+)", team_result)
     if score_match and (home_wins, away_wins) != (int(score_match.group(1)), int(score_match.group(2))):
         raise ValueError(f"Parsed game results do not match XTTV team result {team_result}: parsed {home_wins}:{away_wins}")
