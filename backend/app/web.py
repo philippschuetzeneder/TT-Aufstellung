@@ -2,7 +2,7 @@ from __future__ import annotations
 import json, os, socket, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
@@ -50,6 +50,12 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/analytics/matchup-matrix": return self.send_json(matchup_matrix())
             if parsed.path=="/api/teams": return self.send_json(list_teams())
             if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0]))
+            # Canonical REST-style alias: /api/teams/{team}/players
+            # Keep the query-parameter route above for backwards compatibility.
+            team_prefix="/api/teams/"
+            if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
+                team_name=unquote(parsed.path[len(team_prefix):-len("/players")])
+                return self.send_json(list_players(team_name))
             if parsed.path=="/api/analysis":
                 own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]
                 opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
