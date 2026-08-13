@@ -10,11 +10,12 @@ from urllib.parse import parse_qs, urlparse
 
 from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .analytics_validation_service import validate_analytics
-from .db import create_all, database_health
+from .analysis_service import analyze_lineup
+from .db import database_health
 from .db_routes import get_match
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
-from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, TARGET_LEAGUE, import_one, scan_and_import
+from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
 from .xttv_parser import parse_match
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -92,6 +93,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(matchup_stats(query.get("player_id", [None])[0], query.get("opponent_id", [None])[0]))
             if parsed.path == "/api/analytics/matchup-matrix":
                 return self.send_json(matchup_matrix())
+            if parsed.path == "/api/analysis":
+                own_ids = [value.strip() for value in query.get("own_player_ids", [""])[0].split(",") if value.strip()]
+                opponent_team = query.get("opponent_team", [""])[0].strip()
+                actual_raw = query.get("actual_opponent_ids", [""])[0]
+                actual_ids = [value.strip() for value in actual_raw.split(",") if value.strip()] if actual_raw else None
+                opponent_limit = int(query.get("opponent_limit", ["25"])[0])
+                return self.send_json(analyze_lineup(own_ids, opponent_team, actual_ids, opponent_limit))
             if parsed.path == "/api/xttv/debug":
                 return self.send_json(debug_xttv(meid))
             if parsed.path == "/api/xttv/fetch":
