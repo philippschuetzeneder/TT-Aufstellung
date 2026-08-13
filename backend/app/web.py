@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .db import create_all, database_health
 from .db_routes import get_match
+from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, TARGET_LEAGUE, import_one, scan_and_import
 from .xttv_parser import parse_match
@@ -74,6 +75,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
         if parsed.path == "/api/db/health":
             return self.send_json(database_health())
+        if parsed.path == "/api/db/validate":
+            try:
+                return self.send_json(validate_database())
+            except Exception as exc:
+                return self.send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
         if parsed.path == "/api/db/match":
             return self.send_json(get_match(meid))
         if parsed.path == "/api/xttv/debug":
