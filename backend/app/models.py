@@ -49,7 +49,11 @@ class MatchPlayer(Base):
     side: Mapped[str] = mapped_column(String(10))
     position: Mapped[str | None] = mapped_column(String(2))
     match: Mapped[XttvMatch] = relationship(back_populates="players")
-    __table_args__ = (UniqueConstraint("match_id", "name", "side", name="uq_match_player"),)
+    # XTTV player IDs are the stable identity. Names are not unique: two
+    # different players can legitimately have the same name in one match.
+    __table_args__ = (
+        UniqueConstraint("match_id", "external_player_id", "side", name="uq_match_player"),
+    )
 
 
 class MatchGame(Base):
