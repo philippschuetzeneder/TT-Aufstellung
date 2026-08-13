@@ -27,9 +27,12 @@ class TestGameRules(unittest.TestCase):
 
     def test_game_structure_accepts_8_2(self):
         games = [
-            {"sequence": i, "game_type": "singles", "winner_side": "home" if i <= 7 else "away"}
+            {"sequence": i, "game_type": "singles", "winner_side": "home" if i <= 8 else "away"}
             for i in (1, 2, 3, 4, 6, 7, 8, 9)
         ]
+        # 6 singles home + 2 singles away, then both doubles home = 8:2.
+        games[6]["winner_side"] = "away"
+        games[7]["winner_side"] = "away"
         games += [
             {"sequence": 5, "game_type": "doubles", "winner_side": "home"},
             {"sequence": 10, "game_type": "doubles", "winner_side": "home"},
