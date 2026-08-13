@@ -17,12 +17,28 @@ DEFAULT_RADIUS = 150
 DEFAULT_LIMIT = 20
 
 
+def _is_valid_4_player_report(parsed: dict) -> bool:
+    """A valid 4-player report has both doubles and 8-12 singles.
+
+    XTTV can end the singles portion early once the team result is decided,
+    so 8, 9, 10, 11 and 12 singles are all valid formats for this league.
+    """
+    return (
+        parsed.get("player_count") == 8
+        and parsed.get("singles_count") in (8, 9, 10, 11, 12)
+        and parsed.get("doubles_count") == 2
+    )
+
+
 def import_one(meid: int) -> dict:
     create_all()
     html, status, content_type, url = fetch_match(meid)
     parsed = parse_match(html, meid)
-    if parsed["player_count"] != 8 or parsed["singles_count"] != 12 or parsed["doubles_count"] != 2:
-        raise ValueError(f"Not a complete 4-player report: players={parsed['player_count']}, singles={parsed['singles_count']}, doubles={parsed['doubles_count']}")
+    if not _is_valid_4_player_report(parsed):
+        raise ValueError(
+            f"Not a valid 4-player report: players={parsed['player_count']}, "
+            f"singles={parsed['singles_count']}, doubles={parsed['doubles_count']}"
+        )
 
     with SessionLocal.begin() as session:
         raw = session.query(RawSourceDocument).filter_by(source="xttv", external_id=str(meid)).one_or_none()
@@ -138,11 +154,16 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
                 time.sleep(delay)
             continue
 
-        complete = parsed.get("player_count") == 8 and parsed.get("singles_count") == 12 and parsed.get("doubles_count") == 2
-        if not complete:
+        if not _is_valid_4_player_report(parsed):
             errors += 1
             if len(error_samples) < 20:
-                error_samples.append({"meid": meid, "error": f"incomplete_report players={parsed.get('player_count')} singles={parsed.get('singles_count')} doubles={parsed.get('doubles_count')}"})
+                error_samples.append({
+                    "meid": meid,
+                    "error": (
+                        f"invalid_4_player_report players={parsed.get('player_count')} "
+                        f"singles={parsed.get('singles_count')} doubles={parsed.get('doubles_count')}"
+                    ),
+                })
             continue
         if _already_imported(meid):
             skipped_existing += 1
