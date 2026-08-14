@@ -13,7 +13,7 @@ from .db import SessionLocal
 MAX_SINGLE_GAMES = 12
 DOUBLES_GAMES = 2
 WIN_TARGET = 8
-CALCULATION_BUDGET_SECONDS = 4.8
+CALCULATION_BUDGET_SECONDS = 19.8
 RECENCY_HALF_LIFE_DAYS = 45.0
 LINEUP_SMOOTHING = 0.25
 
@@ -206,18 +206,24 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     for s in scenarios: relevant_ids.update(s["player_ids"])
     matchup={(a,b):_matchup_probability(a,b,overall,h2h) for a in relevant_ids for b in relevant_ids if a!=b}
 
-    # Precompute the complete opponent scenario set ONCE. The old implementation
-    # recalculated/scanned all historical matches from inside every own permutation.
+    # Precompute the complete opponent scenario set ONCE and cache position variants.
     scenario_rows=[]
+    position_cache={}
     for s in scenarios:
+        key=tuple(sorted(s["player_ids"]))
+        variants=position_cache.get(key)
+        if variants is None:
+            variants=_position_variants(matches,key)
+            position_cache[key]=variants
         set_p=float(s["probability"])
-        for opponent_order,pos_p in _position_variants(matches,tuple(s["player_ids"])):
+        for opponent_order,pos_p in variants:
             scenario_rows.append((set_p*pos_p,opponent_order))
 
-    # Cache doubles for each own order/opponent order pair. This keeps the hot
-    # loop to simple dictionary lookups plus one small 14-game DP.
+    # Cache matchup-derived values for the hot loop.
     double_cache={}
-    evaluated=[]; scenario_counter=0
+    single_cache={}
+    evaluated=[]
+    scenario_counter=0
     for own_order in permutations(own):
         weighted=0.0
         for scenario_p,opponent_order in scenario_rows:
@@ -226,18 +232,21 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             if doubles is None:
                 doubles=(_pair_probability(own_order[0],own_order[1],opponent_order[0],opponent_order[1],overall), _pair_probability(own_order[2],own_order[3],opponent_order[2],opponent_order[3],overall))
                 double_cache[pair_key]=doubles
-            singles=[matchup.get((own_order[h],opponent_order[a]),0.5) for h,a in schedule]
+            singles=single_cache.get(pair_key)
+            if singles is None:
+                singles=[matchup.get((own_order[h],opponent_order[a]),0.5) for h,a in schedule]
+                single_cache[pair_key]=singles
             weighted += scenario_p*_team_win_probability(singles,doubles)
             scenario_counter+=1
         evaluated.append({"own_player_ids":list(own_order),"players":[names[pid] for pid in own_order],"team_win_probability":weighted})
 
         if time.monotonic()-started > CALCULATION_BUDGET_SECONDS:
-            return {"ok":False,"error":"analysis_timeout","message":"Die Berechnung konnte innerhalb des 5-Sekunden-Limits nicht abgeschlossen werden.","elapsed_seconds":round(time.monotonic()-started,3)}
+            return {"ok":False,"error":"analysis_timeout","message":"Die Berechnung konnte innerhalb des 20-Sekunden-Limits nicht abgeschlossen werden.","elapsed_seconds":round(time.monotonic()-started,3)}
 
     evaluated.sort(key=lambda x:(-x["team_win_probability"],x["own_player_ids"]))
     for rank,item in enumerate(evaluated,1):
         item["rank"]=rank; item["team_win_probability"]=round(item["team_win_probability"],6)
     elapsed=time.monotonic()-started
     if elapsed>CALCULATION_BUDGET_SECONDS:
-        return {"ok":False,"error":"analysis_timeout","message":"Die Berechnung konnte innerhalb des 5-Sekunden-Limits nicht abgeschlossen werden.","elapsed_seconds":round(elapsed,3)}
+        return {"ok":False,"error":"analysis_timeout","message":"Die Berechnung konnte innerhalb des 20-Sekunden-Limits nicht abgeschlossen werden.","elapsed_seconds":round(elapsed,3)}
     return {"ok":True,"phase":"B" if actual is not None else "A","opponent_team":opponent_team,"own_player_ids":own,"opponent_set_source":source,"recommendation":evaluated[0],"recommendations":evaluated,"opponent_predictions":scenarios,"model":{"version":"strength-h2h-doubles-v4-single-query-precomputed","win_target":WIN_TARGET,"single_games":MAX_SINGLE_GAMES,"doubles_games":DOUBLES_GAMES,"unseen_h2h":"overall-strength baseline","doubles":"individual-strength pair model"},"data_quality":{"historical_matches":len(matches),"historical_matchup_pairs":len(h2h),"scenarios_evaluated":scenario_counter,"database_queries":1,"elapsed_seconds":round(elapsed,3)}}
