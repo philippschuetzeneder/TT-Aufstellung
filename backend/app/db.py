@@ -9,8 +9,6 @@ def _database_url() -> str:
         "DATABASE_URL",
         "postgresql+psycopg://tt:tt_dev@localhost:5432/tt_aufstellung",
     )
-    # Render may provide a plain PostgreSQL URL. SQLAlchemy 2.x must be told
-    # explicitly to use the psycopg 3 driver; otherwise it defaults to psycopg2.
     if url.startswith("postgres://"):
         url = "postgresql+psycopg://" + url[len("postgres://") :]
     elif url.startswith("postgresql://"):
@@ -33,10 +31,6 @@ def create_all() -> None:
     from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
-    # The original constraint used the player name as part of the identity.
-    # XTTV names are not unique, so two different players with the same name
-    # can occur in one match. Migrate existing PostgreSQL databases to use the
-    # stable XTTV external_player_id instead.
     if engine.dialect.name == "postgresql":
         with engine.begin() as connection:
             connection.execute(text("ALTER TABLE match_players DROP CONSTRAINT IF EXISTS uq_match_player"))
@@ -55,6 +49,30 @@ def create_all() -> None:
                         "UNIQUE (match_id, external_player_id, side)"
                     )
                 )
+
+            # Analysis queries are filtered primarily by team, player ID and
+            # match/side/position. Existing databases need these indexes too;
+            # CREATE INDEX IF NOT EXISTS makes this safe on every startup.
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_xttv_matches_home_team "
+                "ON xttv_matches (home_team)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_xttv_matches_away_team "
+                "ON xttv_matches (away_team)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_match_players_external_id "
+                "ON match_players (external_player_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_match_players_match_side_position "
+                "ON match_players (match_id, side, position)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_match_games_match_id "
+                "ON match_games (match_id)"
+            ))
 
 
 def database_health() -> dict:
