@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import threading
 from sqlalchemy import text
 from .db import engine
@@ -14,6 +12,9 @@ _SCHEMA_SQL = [
     "CREATE TABLE IF NOT EXISTS analysis_lineup_orders (team text NOT NULL, lineup_key text NOT NULL, order_key text NOT NULL, p1 text NOT NULL, p2 text NOT NULL, p3 text NOT NULL, p4 text NOT NULL, appearances bigint NOT NULL, PRIMARY KEY (team, lineup_key, order_key))",
     "CREATE INDEX IF NOT EXISTS ix_analysis_lineup_team ON analysis_lineup_orders(team)",
     "CREATE INDEX IF NOT EXISTS ix_analysis_lineup_key ON analysis_lineup_orders(lineup_key)",
+    "CREATE INDEX IF NOT EXISTS ix_match_players_external_player_id ON match_players(external_player_id)",
+    "CREATE INDEX IF NOT EXISTS ix_match_players_match_side_position ON match_players(match_id, side, position)",
+    "CREATE INDEX IF NOT EXISTS ix_match_games_match_type_positions ON match_games(match_id, game_type, home_position, away_position)",
 ]
 
 
@@ -81,23 +82,17 @@ def refresh_analysis_cache() -> dict:
 
 def ensure_analysis_cache() -> bool:
     global _READY
-    if _READY:
-        return True
+    if _READY: return True
     try:
         ensure_analysis_schema()
         with engine.connect() as db:
             row = db.execute(text("SELECT source_match_count FROM analysis_cache_meta WHERE cache_name='main'")).first()
-            if row is None:
-                return False
-            _READY = True
-            return True
-    except Exception:
-        return False
+            if row is None: return False
+            _READY = True; return True
+    except Exception: return False
 
 
 def start_background_refresh() -> None:
-    try:
-        ensure_analysis_schema()
-    except Exception:
-        pass
+    try: ensure_analysis_schema()
+    except Exception: pass
     threading.Thread(target=refresh_analysis_cache, name="analysis-cache-refresh", daemon=True).start()
