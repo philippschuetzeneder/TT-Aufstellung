@@ -7,15 +7,27 @@ from .db import engine
 _LOCK = threading.Lock()
 _READY = False
 
+_SCHEMA_SQL = [
+    "CREATE TABLE IF NOT EXISTS analysis_cache_meta (cache_name text PRIMARY KEY, source_match_count bigint NOT NULL DEFAULT 0, refreshed_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    "CREATE TABLE IF NOT EXISTS analysis_player_stats (player_id text PRIMARY KEY, player_name text NOT NULL, singles_wins bigint NOT NULL, singles_games bigint NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS analysis_matchups (player_id text NOT NULL, opponent_id text NOT NULL, player_name text NOT NULL, opponent_name text NOT NULL, wins bigint NOT NULL, games bigint NOT NULL, PRIMARY KEY (player_id, opponent_id))",
+    "CREATE TABLE IF NOT EXISTS analysis_lineup_orders (team text NOT NULL, lineup_key text NOT NULL, order_key text NOT NULL, p1 text NOT NULL, p2 text NOT NULL, p3 text NOT NULL, p4 text NOT NULL, appearances bigint NOT NULL, PRIMARY KEY (team, lineup_key, order_key))",
+    "CREATE INDEX IF NOT EXISTS ix_analysis_lineup_team ON analysis_lineup_orders(team)",
+    "CREATE INDEX IF NOT EXISTS ix_analysis_lineup_key ON analysis_lineup_orders(lineup_key)",
+]
+
+
+def ensure_analysis_schema() -> None:
+    with engine.begin() as db:
+        for sql in _SCHEMA_SQL:
+            db.execute(text(sql))
+
 
 def refresh_analysis_cache() -> dict:
     global _READY
     with _LOCK:
+        ensure_analysis_schema()
         with engine.begin() as db:
-            db.execute(text("CREATE TABLE IF NOT EXISTS analysis_cache_meta (cache_name text PRIMARY KEY, source_match_count bigint NOT NULL DEFAULT 0, refreshed_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP)"))
-            db.execute(text("CREATE TABLE IF NOT EXISTS analysis_player_stats (player_id text PRIMARY KEY, player_name text NOT NULL, singles_wins bigint NOT NULL, singles_games bigint NOT NULL)"))
-            db.execute(text("CREATE TABLE IF NOT EXISTS analysis_matchups (player_id text NOT NULL, opponent_id text NOT NULL, player_name text NOT NULL, opponent_name text NOT NULL, wins bigint NOT NULL, games bigint NOT NULL, PRIMARY KEY (player_id, opponent_id))"))
-            db.execute(text("CREATE TABLE IF NOT EXISTS analysis_lineup_orders (team text NOT NULL, lineup_key text NOT NULL, order_key text NOT NULL, p1 text NOT NULL, p2 text NOT NULL, p3 text NOT NULL, p4 text NOT NULL, appearances bigint NOT NULL, PRIMARY KEY (team, lineup_key, order_key))"))
             source_count = int(db.execute(text("SELECT COUNT(*) FROM xttv_matches")).scalar() or 0)
             cached_count = db.execute(text("SELECT source_match_count FROM analysis_cache_meta WHERE cache_name='main'")).scalar()
             if cached_count is not None and int(cached_count) == source_count:
@@ -62,32 +74,19 @@ def refresh_analysis_cache() -> dict:
                     HAVING count(*)=4 AND count(DISTINCT player_id)=4 AND count(DISTINCT position)=4
                 ) SELECT team,lineup_key,concat(p1,',',p2,',',p3,',',p4),p1,p2,p3,p4,count(*) FROM four GROUP BY team,lineup_key,p1,p2,p3,p4
             """))
-            db.execute(text("CREATE INDEX IF NOT EXISTS ix_analysis_lineup_team ON analysis_lineup_orders(team)"))
-            db.execute(text("CREATE INDEX IF NOT EXISTS ix_analysis_lineup_key ON analysis_lineup_orders(lineup_key)"))
             db.execute(text("INSERT INTO analysis_cache_meta(cache_name,source_match_count,refreshed_at) VALUES ('main',:n,CURRENT_TIMESTAMP) ON CONFLICT (cache_name) DO UPDATE SET source_match_count=EXCLUDED.source_match_count,refreshed_at=EXCLUDED.refreshed_at"), {"n": source_count})
         _READY = True
         return {"ok": True, "refreshed": True, "source_matches": source_count}
 
 
 def ensure_analysis_cache() -> bool:
-    """Never build the cache synchronously from an analysis HTTP request.
-
-    A missing/stale cache is a deployment/import problem, not a reason to make a
-    user wait. The caller must fail fast and the background refresh can populate it.
-    """
     global _READY
     if _READY:
         return True
     try:
+        ensure_analysis_schema()
         with engine.connect() as db:
-            tables = db.execute(text("""
-                SELECT count(*) FROM information_schema.tables
-                WHERE table_schema='public' AND table_name IN
-                ('analysis_player_stats','analysis_matchups','analysis_lineup_orders')
-            """)).scalar()
-            if int(tables or 0) != 3:
-                return False
-            row = db.execute(text("SELECT source_match_count FROM analysis_cache_meta WHERE cache_name='main'" )).first()
+            row = db.execute(text("SELECT source_match_count FROM analysis_cache_meta WHERE cache_name='main'")).first()
             if row is None:
                 return False
             _READY = True
@@ -97,4 +96,8 @@ def ensure_analysis_cache() -> bool:
 
 
 def start_background_refresh() -> None:
+    try:
+        ensure_analysis_schema()
+    except Exception:
+        pass
     threading.Thread(target=refresh_analysis_cache, name="analysis-cache-refresh", daemon=True).start()
