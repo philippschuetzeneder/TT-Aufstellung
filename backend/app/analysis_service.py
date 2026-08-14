@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+from collections import Counter, defaultdict
 from itertools import permutations
 import math
 import time
@@ -42,39 +44,78 @@ def _team_win_probability(probs):
     return sum(distribution[WIN_TARGET:])
 
 
-def _raw_four_player_lineup(db, team):
-    """Small fallback: find one recent four-player lineup for the opponent.
+def _position_index(position):
+    value = str(position or '').strip().upper()
+    return {'A': 0, 'B': 1, 'C': 2, 'D': 3, '1': 0, '2': 1, '3': 2, '4': 3}.get(value)
 
-    This is intentionally scoped to the requested team. It prevents a missing
-    background cache from turning a valid 4-player opponent into a failed
-    analysis request.
+
+def _raw_team_lineup_scenarios(db, team, required_ids=None):
+    """Build position-order probabilities from only this team's raw matches.
+
+    This is deliberately small.  It is also the important fallback when the
+    precomputed cache has no lineup rows.  We never replace real historical
+    position frequencies with 24 equally weighted permutations unless there
+    is genuinely no historical four-player position order available.
     """
-    rows = list(db.execute(text("""
-        SELECT mp.external_player_id AS player_id, mp.name AS player_name, mp.position,
-               m.match_date
+    rows = db.execute(text("""
+        SELECT m.id AS match_id, m.match_date, mp.external_player_id AS player_id,
+               mp.name AS player_name, mp.position
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id=m.id
-        WHERE (m.home_team=:team AND mp.side='home')
-           OR (m.away_team=:team AND mp.side='away')
+        WHERE ((m.home_team=:team AND mp.side='home') OR (m.away_team=:team AND mp.side='away'))
+          AND mp.external_player_id IS NOT NULL
         ORDER BY m.match_date DESC NULLS LAST, m.id DESC
-    """), {"team": team}).mappings())
-    grouped = {}
-    for r in rows:
-        pid = r["player_id"]
-        if not pid:
+    """), {'team': team}).mappings()
+
+    matches = defaultdict(list)
+    for row in rows:
+        matches[row['match_id']].append(row)
+
+    counts = Counter()
+    names = {}
+    required = set(str(x) for x in required_ids) if required_ids is not None else None
+
+    for players in matches.values():
+        by_id = {}
+        for r in players:
+            pid = str(r['player_id'])
+            by_id.setdefault(pid, r)
+            names.setdefault(pid, r['player_name'])
+        ids = set(by_id)
+        if required is not None:
+            if ids != required:
+                continue
+        elif len(ids) != 4:
             continue
-        # Keep the first occurrence from the newest matches.
-        grouped.setdefault(str(pid), {"name": r["player_name"], "position": r["position"]})
-    if len(grouped) < 4:
-        return []
-    players = list(grouped.items())[:4]
-    ids = [pid for pid, _ in players]
-    names = {pid: data["name"] for pid, data in players}
-    return [(1.0 / 24.0, tuple(order)) for order in permutations(ids)], names
+
+        order = [None] * 4
+        valid = True
+        for pid in ids:
+            idx = _position_index(by_id[pid]['position'])
+            if idx is None or order[idx] is not None:
+                valid = False
+                break
+            order[idx] = pid
+        if valid and all(order):
+            counts[tuple(order)] += 1
+
+    total = sum(counts.values())
+    if not total:
+        return [], names
+
+    ordered = counts.most_common(24)
+    scenarios = [(count / total, order) for order, count in ordered]
+    return scenarios, names
+
+
+def _raw_four_player_lineup(db, team):
+    scenarios, names = _raw_team_lineup_scenarios(db, team)
+    if scenarios:
+        return scenarios, names
+    return [], names
 
 
 def _load_analysis_data(own, opponent_team, actual):
-    """Load compact cache data with a tightly scoped raw-data fallback."""
     db = SessionLocal()
     try:
         db.execute(text("SET statement_timeout = '5000ms'"))
@@ -84,20 +125,22 @@ def _load_analysis_data(own, opponent_team, actual):
         fallback_names = {}
 
         if actual is not None:
-            lineup_key = ",".join(sorted(actual))
+            lineup_key = ','.join(sorted(actual))
             rows = list(db.execute(text("""
                 SELECT p1,p2,p3,p4,appearances
                 FROM analysis_lineup_orders
                 WHERE lineup_key=:key
                 ORDER BY appearances DESC
                 LIMIT 24
-            """), {"key": lineup_key}).mappings())
-            total = sum(int(r["appearances"] or 0) for r in rows)
+            """), {'key': lineup_key}).mappings())
+            total = sum(int(r['appearances'] or 0) for r in rows)
             if total:
-                scenarios = [(int(r["appearances"]) / total, tuple(str(r[k]) for k in ("p1","p2","p3","p4"))) for r in rows]
+                scenarios = [(int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1','p2','p3','p4'))) for r in rows]
             else:
-                scenarios = [(1.0 / 24.0, tuple(order)) for order in permutations(actual)]
-            source = "actual-historical-or-all-24"
+                scenarios, fallback_names = _raw_team_lineup_scenarios(db, opponent_team, actual)
+                if not scenarios:
+                    scenarios = [(1.0 / 24.0, tuple(order)) for order in permutations(actual)]
+            source = 'actual-historical-cache-or-raw'
         else:
             rows = list(db.execute(text("""
                 SELECT p1,p2,p3,p4,appearances
@@ -105,15 +148,16 @@ def _load_analysis_data(own, opponent_team, actual):
                 WHERE team=:team
                 ORDER BY appearances DESC
                 LIMIT 24
-            """), {"team": opponent_team}).mappings())
-            total = sum(int(r["appearances"] or 0) for r in rows)
-            scenarios = [(int(r["appearances"]) / total, tuple(str(r[k]) for k in ("p1","p2","p3","p4"))) for r in rows] if total else []
-            source = "predicted-historical"
-            if not scenarios:
-                fallback = _raw_four_player_lineup(db, opponent_team)
-                if fallback:
-                    scenarios, fallback_names = fallback
-                    source = "raw-team-fallback-all-24"
+            """), {'team': opponent_team}).mappings())
+            total = sum(int(r['appearances'] or 0) for r in rows)
+            if total:
+                scenarios = [(int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1','p2','p3','p4'))) for r in rows]
+                source = 'predicted-historical-cache'
+            else:
+                scenarios, fallback_names = _raw_four_player_lineup(db, opponent_team)
+                source = 'predicted-historical-raw'
+                if not scenarios:
+                    return {}, {}, {}, [], source
 
         if not scenarios:
             return {}, {}, {}, [], source
@@ -125,32 +169,44 @@ def _load_analysis_data(own, opponent_team, actual):
 
         stats = {}
         names = dict(fallback_names)
+
         stats_stmt = text("""
             SELECT player_id::text AS player_id, player_name, singles_wins, singles_games
             FROM analysis_player_stats
             WHERE player_id::text IN :ids
-        """).bindparams(bindparam("ids", expanding=True))
-        for r in db.execute(stats_stmt, {"ids": ids}).mappings():
-            pid = str(r["player_id"])
-            names[pid] = r["player_name"]
-            stats[pid] = (int(r["singles_wins"] or 0), int(r["singles_games"] or 0))
+        """).bindparams(bindparam('ids', expanding=True))
+        for r in db.execute(stats_stmt, {'ids': ids}).mappings():
+            pid = str(r['player_id'])
+            names[pid] = r['player_name']
+            stats[pid] = (int(r['singles_wins'] or 0), int(r['singles_games'] or 0))
+
+        # Always resolve display names from the raw match table as a final,
+        # cheap lookup.  IDs are for computation; users should never see IDs.
+        name_stmt = text("""
+            SELECT external_player_id::text AS player_id, max(name) AS player_name
+            FROM match_players
+            WHERE external_player_id::text IN :ids
+            GROUP BY external_player_id
+        """).bindparams(bindparam('ids', expanding=True))
+        for r in db.execute(name_stmt, {'ids': ids}).mappings():
+            names[str(r['player_id'])] = r['player_name']
 
         matchup_stmt = text("""
             SELECT player_id::text AS player_id, opponent_id::text AS opponent_id, wins, games
             FROM analysis_matchups
             WHERE player_id::text IN :ids
               AND opponent_id::text IN :ids
-        """).bindparams(bindparam("ids", expanding=True))
+        """).bindparams(bindparam('ids', expanding=True))
         matchups = {}
-        for r in db.execute(matchup_stmt, {"ids": ids}).mappings():
-            matchups[(str(r["player_id"]), str(r["opponent_id"]))] = (int(r["wins"] or 0), int(r["games"] or 0))
+        for r in db.execute(matchup_stmt, {'ids': ids}).mappings():
+            matchups[(str(r['player_id']), str(r['opponent_id']))] = (int(r['wins'] or 0), int(r['games'] or 0))
 
         for pid in ids:
             stats.setdefault(pid, (0, 0))
             names.setdefault(pid, pid)
         return names, stats, matchups, scenarios, source
     except Exception as exc:
-        raise RuntimeError(f"Analyse-Daten konnten nicht geladen werden: {type(exc).__name__}: {exc}") from exc
+        raise RuntimeError(f'Analyse-Daten konnten nicht geladen werden: {type(exc).__name__}: {exc}') from exc
     finally:
         db.close()
 
@@ -159,16 +215,16 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     started = time.monotonic()
     own = [str(x) for x in own_player_ids]
     if len(own) != 4 or len(set(own)) != 4:
-        raise ValueError("exactly four different own_player_ids are required")
+        raise ValueError('exactly four different own_player_ids are required')
     if not opponent_team:
-        raise ValueError("opponent_team is required")
+        raise ValueError('opponent_team is required')
     actual = None if actual_opponent_ids is None else [str(x) for x in actual_opponent_ids]
     if actual is not None and (len(actual) != 4 or len(set(actual)) != 4):
-        raise ValueError("exactly four different actual_opponent_ids are required")
+        raise ValueError('exactly four different actual_opponent_ids are required')
 
     names, stats, matchups, scenarios, source = _load_analysis_data(own, opponent_team, actual)
     if not scenarios:
-        return {"ok": True, "phase": "B" if actual is not None else "A", "recommendations": [], "warnings": [f"Keine 4-Spieler-Aufstellung für {opponent_team} gefunden."]}
+        return {'ok': True, 'phase': 'B' if actual is not None else 'A', 'recommendations': [], 'warnings': [f'Keine historische 4-Spieler-Aufstellung für {opponent_team} gefunden.']}
 
     schedule = ((0,0),(1,1),(2,2),(3,3),(0,1),(1,0),(2,3),(3,2),(0,2),(2,0),(1,3),(3,1))
     relevant = set(own)
@@ -186,23 +242,29 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
                 _pair_probability(own_order[2], own_order[3], opp_order[2], opp_order[3], stats),
             ]
             expected += scenario_probability * _team_win_probability(singles + doubles)
-        evaluated.append({"own_player_ids": list(own_order), "players": [names.get(pid, pid) for pid in own_order], "team_win_probability": round(expected, 6)})
+        evaluated.append({'own_player_ids': list(own_order), 'players': [names.get(pid, pid) for pid in own_order], 'team_win_probability': round(expected, 6)})
         if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-            raise RuntimeError("Analysis exceeded the internal 5-second safety budget")
+            raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
 
-    evaluated.sort(key=lambda x: (-x["team_win_probability"], x["own_player_ids"]))
+    evaluated.sort(key=lambda x: (-x['team_win_probability'], x['own_player_ids']))
     for rank, item in enumerate(evaluated, 1):
-        item["rank"] = rank
+        item['rank'] = rank
+
+    opponent_predictions = [
+        {'player_ids': list(order), 'players': [{'id': p, 'name': names.get(p, p)} for p in order], 'probability': round(probability, 6)}
+        for probability, order in scenarios
+    ]
     elapsed = time.monotonic() - started
     return {
-        "ok": True,
-        "phase": "B" if actual else "A",
-        "opponent_team": opponent_team,
-        "own_player_ids": own,
-        "opponent_set_source": source,
-        "recommendation": evaluated[0],
-        "recommendations": evaluated,
-        "opponent_predictions": [{"player_ids": list(o), "players": [{"id": p, "name": names.get(p,p)} for p in o], "probability": p} for p,o in scenarios],
-        "model": {"version": "strength-h2h-doubles-v18", "win_target": WIN_TARGET, "single_games": SINGLE_GAMES, "doubles_games": 2, "opponent_lineups": "observed historical position orders with scoped raw fallback", "actual_opponent_positions": "historical distribution; all 24 permutations if unseen"},
-        "data_quality": {"scenario_variants": len(scenarios), "own_orders_evaluated": 24, "runtime_seconds": round(elapsed,4), "runtime_data_source": "analysis-cache-with-scoped-raw-fallback", "missing_player_stats_use_neutral_prior": True},
+        'ok': True,
+        'phase': 'B' if actual else 'A',
+        'opponent_team': opponent_team,
+        'own_player_ids': own,
+        'opponent_set_source': source,
+        'recommendation': evaluated[0],
+        'recommendations': evaluated,
+        'opponent_predictions': opponent_predictions,
+        'most_likely_opponent': opponent_predictions[0] if opponent_predictions else None,
+        'model': {'version': 'strength-h2h-doubles-v19', 'win_target': WIN_TARGET, 'single_games': SINGLE_GAMES, 'doubles_games': 2, 'opponent_lineups': 'historical four-player position orders; scoped raw fallback', 'actual_opponent_positions': 'historical distribution; all 24 permutations only when no historical order exists'},
+        'data_quality': {'scenario_variants': len(scenarios), 'own_orders_evaluated': 24, 'runtime_seconds': round(elapsed,4), 'runtime_data_source': 'analysis-cache-with-scoped-raw-fallback', 'missing_player_stats_use_neutral_prior': True, 'position_probabilities_observed': source != 'all-24-uniform-fallback'},
     }
