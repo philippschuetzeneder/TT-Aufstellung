@@ -2,7 +2,7 @@ from __future__ import annotations
 from itertools import permutations
 import math
 import time
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 from .db import SessionLocal
 
 WIN_TARGET = 8
@@ -43,12 +43,7 @@ def _team_win_probability(probs):
 
 
 def _load_analysis_data(own, opponent_team, actual):
-    """Load only the compact analysis cache.
-
-    UI player IDs are treated as opaque XTTV IDs. We deliberately do not
-    resolve them through match_players during an analysis request. Missing
-    statistics use the neutral prior instead of aborting the calculation.
-    """
+    """Load only compact analysis-cache data; player IDs remain opaque UI IDs."""
     db = SessionLocal()
     try:
         db.execute(text("SET statement_timeout = '5000ms'"))
@@ -93,27 +88,25 @@ def _load_analysis_data(own, opponent_team, actual):
 
         stats = {}
         names = {}
-        rows = db.execute(text("""
+        stats_stmt = text("""
             SELECT player_id::text AS player_id, player_name, singles_wins, singles_games
             FROM analysis_player_stats
-            WHERE player_id::text = ANY(:ids)
-        """), {"ids": ids}).mappings()
-        for r in rows:
+            WHERE player_id::text IN :ids
+        """).bindparams(bindparam("ids", expanding=True))
+        for r in db.execute(stats_stmt, {"ids": ids}).mappings():
             pid = str(r["player_id"])
             names[pid] = r["player_name"]
             stats[pid] = (int(r["singles_wins"] or 0), int(r["singles_games"] or 0))
 
-        rows = db.execute(text("""
+        matchup_stmt = text("""
             SELECT player_id::text AS player_id, opponent_id::text AS opponent_id, wins, games
             FROM analysis_matchups
-            WHERE player_id::text = ANY(:ids)
-              AND opponent_id::text = ANY(:ids)
-        """), {"ids": ids}).mappings()
-        matchups = {
-            (str(r["player_id"]), str(r["opponent_id"])):
-            (int(r["wins"] or 0), int(r["games"] or 0))
-            for r in rows
-        }
+            WHERE player_id::text IN :ids
+              AND opponent_id::text IN :ids
+        """).bindparams(bindparam("ids", expanding=True))
+        matchups = {}
+        for r in db.execute(matchup_stmt, {"ids": ids}).mappings():
+            matchups[(str(r["player_id"]), str(r["opponent_id"]))] = (int(r["wins"] or 0), int(r["games"] or 0))
 
         for pid in ids:
             stats.setdefault(pid, (0, 0))
@@ -173,6 +166,6 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         "recommendation": evaluated[0],
         "recommendations": evaluated,
         "opponent_predictions": [{"player_ids": list(o), "players": [{"id": p, "name": names.get(p,p)} for p in o], "probability": p} for p,o in scenarios],
-        "model": {"version": "strength-h2h-doubles-v16-opaque-ui-ids", "win_target": WIN_TARGET, "single_games": SINGLE_GAMES, "doubles_games": 2, "opponent_lineups": "observed historical position orders", "actual_opponent_positions": "historical distribution; all 24 permutations if unseen"},
+        "model": {"version": "strength-h2h-doubles-v17", "win_target": WIN_TARGET, "single_games": SINGLE_GAMES, "doubles_games": 2, "opponent_lineups": "observed historical position orders", "actual_opponent_positions": "historical distribution; all 24 permutations if unseen"},
         "data_quality": {"scenario_variants": len(scenarios), "own_orders_evaluated": 24, "runtime_seconds": round(elapsed,4), "runtime_data_source": "analysis-cache-only", "missing_player_stats_use_neutral_prior": True},
     }
