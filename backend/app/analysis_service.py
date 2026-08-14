@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from itertools import permutations
 import math
 import time
@@ -10,10 +9,8 @@ WIN_TARGET = 8
 SINGLE_GAMES = 12
 MAX_ANALYSIS_SECONDS = 3.0
 
-
 def _strength(wins, games):
     return (wins + 5.0) / (games + 10.0)
-
 
 def _matchup_probability(a, b, stats, matchups):
     aw, ag = stats.get(a, (0, 0)); bw, bg = stats.get(b, (0, 0))
@@ -24,12 +21,10 @@ def _matchup_probability(a, b, stats, matchups):
     weight = min(0.55, games / 12.0)
     return (1.0 - weight) * base + weight * direct
 
-
 def _pair_probability(a, b, c, d, stats):
     left = (_strength(*stats.get(a, (0, 0))) + _strength(*stats.get(b, (0, 0)))) / 2.0
     right = (_strength(*stats.get(c, (0, 0))) + _strength(*stats.get(d, (0, 0)))) / 2.0
     return 1.0 / (1.0 + math.exp(-7.0 * (left - right)))
-
 
 def _team_win_probability(probs):
     distribution = [1.0]
@@ -41,134 +36,107 @@ def _team_win_probability(probs):
         distribution = nxt
     return sum(distribution[WIN_TARGET:])
 
-
 def _load_targeted_raw_stats(db, ids, stats, names, matchups):
-    """Fallback for a cold/incomplete analysis cache.
-
-    Only the selected 4 players and the relevant opponent players are queried.
-    This is deliberately a small, indexed query and never rebuilds the cache.
-    """
-    missing_ids = [str(x) for x in ids if str(x) not in stats]
-    if not missing_ids:
-        return
-
+    ids = [str(x) for x in ids]
+    # Resolve player identity independently of game statistics. This fixes the
+    # bug where a valid selected player vanished because the cache had no row.
     rows = db.execute(text("""
-        SELECT p.external_player_id AS player_id, max(p.name) AS player_name,
-               count(g.id) FILTER (WHERE g.id IS NOT NULL) AS games,
-               count(g.id) FILTER (
-                   WHERE (p.side='home' AND split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int)
-                      OR (p.side='away' AND split_part(trim(g.result),':',2)::int > split_part(trim(g.result),':',1)::int)
-               ) AS wins
-        FROM match_players p
-        JOIN match_games g ON g.match_id=p.match_id
-             AND g.game_type='singles'
-             AND ((p.side='home' AND p.position=g.home_position) OR (p.side='away' AND p.position=g.away_position))
-        WHERE p.external_player_id::text = ANY(:ids)
-          AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
-        GROUP BY p.external_player_id
-    """), {"ids": missing_ids}).mappings()
+        SELECT external_player_id::text AS player_id, max(name) AS player_name
+        FROM match_players
+        WHERE external_player_id::text = ANY(:ids)
+        GROUP BY external_player_id
+    """), {"ids": ids}).mappings()
     for r in rows:
         pid = str(r["player_id"])
         names[pid] = r["player_name"]
-        stats[pid] = (int(r["wins"] or 0), int(r["games"] or 0))
+        stats.setdefault(pid, (0, 0))
 
-    # Only direct matchups among the relevant players are needed.
+    rows = db.execute(text("""
+        SELECT p.external_player_id::text AS player_id, count(g.id) AS games,
+               count(g.id) FILTER (WHERE
+                   (p.side='home' AND split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int)
+                   OR (p.side='away' AND split_part(trim(g.result),':',2)::int > split_part(trim(g.result),':',1)::int)
+               ) AS wins
+        FROM match_players p
+        JOIN match_games g ON g.match_id=p.match_id AND g.game_type='singles'
+          AND ((p.side='home' AND p.position=g.home_position) OR (p.side='away' AND p.position=g.away_position))
+        WHERE p.external_player_id::text = ANY(:ids)
+          AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+        GROUP BY p.external_player_id
+    """), {"ids": ids}).mappings()
+    for r in rows:
+        stats[str(r["player_id"])] = (int(r["wins"] or 0), int(r["games"] or 0))
+
     rows = db.execute(text("""
         WITH games AS (
-            SELECT hp.external_player_id::text AS home_id, hp.name AS home_name,
-                   ap.external_player_id::text AS away_id, ap.name AS away_name,
+            SELECT hp.external_player_id::text AS home_id, ap.external_player_id::text AS away_id,
                    CASE WHEN split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int THEN 1 ELSE 0 END AS home_win
             FROM match_games g
             JOIN match_players hp ON hp.match_id=g.match_id AND hp.side='home' AND hp.position=g.home_position
             JOIN match_players ap ON ap.match_id=g.match_id AND ap.side='away' AND ap.position=g.away_position
-            WHERE g.game_type='singles'
-              AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
-              AND hp.external_player_id::text = ANY(:ids)
-              AND ap.external_player_id::text = ANY(:ids)
+            WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+              AND hp.external_player_id::text = ANY(:ids) AND ap.external_player_id::text = ANY(:ids)
         )
-        SELECT home_id AS player_id, away_id AS opponent_id, sum(home_win) AS wins, count(*) AS games FROM games GROUP BY home_id,away_id
+        SELECT home_id AS player_id, away_id AS opponent_id, sum(home_win) AS wins, count(*) AS games
+        FROM games GROUP BY home_id,away_id
         UNION ALL
         SELECT away_id, home_id, sum(1-home_win), count(*) FROM games GROUP BY away_id,home_id
-    """), {"ids": [str(x) for x in ids]}).mappings()
+    """), {"ids": ids}).mappings()
     for r in rows:
         matchups[(str(r["player_id"]), str(r["opponent_id"]))] = (int(r["wins"] or 0), int(r["games"] or 0))
 
-
 def _load_cache(own, opponent_team, actual):
-    """One connection and only tiny targeted cache queries; never rebuilds the cache."""
     db = SessionLocal()
     try:
         db.execute(text("SET statement_timeout = '1000ms'"))
         db.execute(text("SET lock_timeout = '250ms'"))
-        try:
-            if actual is not None:
-                lineup_key = ",".join(sorted(actual))
-                rows = list(db.execute(text("""
-                    SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders
-                    WHERE lineup_key=:key ORDER BY appearances DESC LIMIT 24
-                """), {"key": lineup_key}).mappings())
-                scenarios=[]
-                total=sum(int(r["appearances"]) for r in rows)
-                if total:
-                    scenarios=[(int(r["appearances"])/total,(str(r["p1"]),str(r["p2"]),str(r["p3"]),str(r["p4"]))) for r in rows]
-                if not scenarios:
-                    scenarios=[(1.0/24.0,tuple(o)) for o in permutations(actual)]
-                relevant=set(own)|set(actual)
-                source="actual"
-            else:
-                rows=list(db.execute(text("""
-                    SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders
-                    WHERE team=:team ORDER BY appearances DESC LIMIT 24
-                """), {"team": opponent_team}).mappings())
-                total=sum(int(r["appearances"]) for r in rows)
-                scenarios=[(int(r["appearances"])/total,(str(r["p1"]),str(r["p2"]),str(r["p3"]),str(r["p4"]))) for r in rows] if total else []
-                relevant=set(own)
-                for _,order in scenarios: relevant.update(order)
-                source="predicted"
-                if not scenarios: return {},{}, {}, [], source
+        if actual is not None:
+            lineup_key = ",".join(sorted(actual))
+            rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE lineup_key=:key ORDER BY appearances DESC LIMIT 24"), {"key": lineup_key}).mappings())
+            total = sum(int(r["appearances"]) for r in rows)
+            scenarios = [(int(r["appearances"])/total,(str(r["p1"]),str(r["p2"]),str(r["p3"]),str(r["p4"]))) for r in rows] if total else [(1.0/24.0,tuple(o)) for o in permutations(actual)]
+            relevant = set(own) | set(actual)
+            source = "actual"
+        else:
+            rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE team=:team ORDER BY appearances DESC LIMIT 24"), {"team": opponent_team}).mappings())
+            total = sum(int(r["appearances"]) for r in rows)
+            scenarios = [(int(r["appearances"])/total,(str(r["p1"]),str(r["p2"]),str(r["p3"]),str(r["p4"]))) for r in rows] if total else []
+            relevant = set(own)
+            for _, order in scenarios: relevant.update(order)
+            source = "predicted"
+            if not scenarios: return {}, {}, {}, [], source
 
-            ids=list(relevant)
-            stat_rows=db.execute(text("""
-                SELECT player_id,player_name,singles_wins,singles_games
-                FROM analysis_player_stats WHERE player_id::text = ANY(:ids)
-            """), {"ids":ids}).mappings()
-            stats={}; names={}
-            for r in stat_rows:
-                pid=str(r["player_id"]); names[pid]=r["player_name"]; stats[pid]=(int(r["singles_wins"]),int(r["singles_games"]))
+        ids = list(relevant)
+        rows = db.execute(text("SELECT player_id::text AS player_id,player_name,singles_wins,singles_games FROM analysis_player_stats WHERE player_id::text = ANY(:ids)"), {"ids": ids}).mappings()
+        stats = {}; names = {}
+        for r in rows:
+            pid = str(r["player_id"]); names[pid] = r["player_name"]; stats[pid] = (int(r["singles_wins"] or 0), int(r["singles_games"] or 0))
+        rows = db.execute(text("SELECT player_id::text AS player_id,opponent_id::text AS opponent_id,wins,games FROM analysis_matchups WHERE player_id::text = ANY(:ids) AND opponent_id::text = ANY(:ids)"), {"ids": ids}).mappings()
+        matchups = {(str(r["player_id"]),str(r["opponent_id"])):(int(r["wins"]),int(r["games"])) for r in rows}
 
-            matchup_rows=db.execute(text("""
-                SELECT player_id,opponent_id,wins,games FROM analysis_matchups
-                WHERE player_id::text = ANY(:ids) AND opponent_id::text = ANY(:ids)
-            """), {"ids":ids}).mappings()
-            matchups={(str(r["player_id"]),str(r["opponent_id"])):(int(r["wins"]),int(r["games"])) for r in matchup_rows}
-
-            # A partially built/old cache must never make a valid player fail.
-            # Fill only missing relevant players directly from the indexed raw data.
-            _load_targeted_raw_stats(db, ids, stats, names, matchups)
-            return names,stats,matchups,scenarios,source
-        except Exception as exc:
-            raise RuntimeError(f"Analysis-Cache nicht verfügbar: {type(exc).__name__}: {exc}") from exc
+        missing = [pid for pid in ids if pid not in names or pid not in stats]
+        if missing:
+            _load_targeted_raw_stats(db, missing, stats, names, matchups)
+        return names, stats, matchups, scenarios, source
+    except Exception as exc:
+        raise RuntimeError(f"Analysis-Cache nicht verfügbar: {type(exc).__name__}: {exc}") from exc
     finally:
         db.close()
 
-
 def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, opponent_limit=24):
-    started=time.monotonic()
-    own=[str(x) for x in own_player_ids]
+    started = time.monotonic()
+    own = [str(x) for x in own_player_ids]
     if len(own)!=4 or len(set(own))!=4: raise ValueError("exactly four different own_player_ids are required")
     if not opponent_team: raise ValueError("opponent_team is required")
-    actual=None if actual_opponent_ids is None else [str(x) for x in actual_opponent_ids]
+    actual = None if actual_opponent_ids is None else [str(x) for x in actual_opponent_ids]
     if actual is not None and (len(actual)!=4 or len(set(actual))!=4): raise ValueError("exactly four different actual_opponent_ids are required")
-
-    names,stats,matchups,scenarios,source=_load_cache(own,opponent_team,actual)
-    missing=[p for p in own if p not in names]
-    if missing: raise ValueError(f"Spielerstatistik fehlt für XTTV-IDs: {', '.join(missing)}.")
-    if not scenarios:
-        return {"ok":True,"phase":"B" if actual is not None else "A","recommendations":[],"warnings":["Keine historische Viereraufstellung für diesen Gegner gefunden."]}
-
+    names,stats,matchups,scenarios,source = _load_cache(own,opponent_team,actual)
+    missing = [p for p in own if p not in names]
+    if missing: raise ValueError(f"Spieler nicht in XTTV-Daten gefunden: {', '.join(missing)}")
+    if not scenarios: return {"ok":True,"phase":"B" if actual is not None else "A","recommendations":[],"warnings":["Keine historische Viereraufstellung für diesen Gegner gefunden."]}
     schedule=((0,0),(1,1),(2,2),(3,3),(0,1),(1,0),(2,3),(3,2),(0,2),(2,0),(1,3),(3,1))
     relevant=set(own)
-    for _,o in scenarios: relevant.update(o)
+    for _,order in scenarios: relevant.update(order)
     matchup_p={(a,b):_matchup_probability(a,b,stats,matchups) for a in relevant for b in relevant if a!=b}
     evaluated=[]
     for own_order in permutations(own):
@@ -179,8 +147,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             expected += scenario_probability*_team_win_probability(singles+doubles)
         evaluated.append({"own_player_ids":list(own_order),"players":[names.get(pid,pid) for pid in own_order],"team_win_probability":round(expected,6)})
         if time.monotonic()-started>MAX_ANALYSIS_SECONDS: raise RuntimeError("Analysis exceeded the internal 3-second safety budget")
-
     evaluated.sort(key=lambda x:(-x["team_win_probability"],x["own_player_ids"]))
     for rank,item in enumerate(evaluated,1): item["rank"]=rank
     elapsed=time.monotonic()-started
-    return {"ok":True,"phase":"B" if actual is not None else "A","opponent_team":opponent_team,"own_player_ids":own,"opponent_set_source":source,"recommendation":evaluated[0],"recommendations":evaluated,"opponent_predictions":[{"player_ids":list(o),"players":[{"id":p,"name":names.get(p,p)} for p in o],"probability":p} for p,o in scenarios],"model":{"version":"strength-h2h-doubles-v12-targeted-fallback","win_target":WIN_TARGET,"single_games":SINGLE_GAMES,"doubles_games":2,"opponent_lineups":"observed historical position orders","actual_opponent_positions":"historical distribution; all 24 permutations if unseen"},"data_quality":{"scenario_variants":len(scenarios),"own_orders_evaluated":24,"runtime_seconds":round(elapsed,4),"runtime_data_source":"targeted-analysis-cache-with-raw-fallback"}}
+    return {"ok":True,"phase":"B" if actual is not None else "A","opponent_team":opponent_team,"own_player_ids":own,"opponent_set_source":source,"recommendation":evaluated[0],"recommendations":evaluated,"opponent_predictions":[{"player_ids":list(o),"players":[{"id":p,"name":names.get(p,p)} for p in o],"probability":p} for p,o in scenarios],"model":{"version":"strength-h2h-doubles-v13-robust-player-fallback","win_target":WIN_TARGET,"single_games":SINGLE_GAMES,"doubles_games":2,"opponent_lineups":"observed historical position orders","actual_opponent_positions":"historical distribution; all 24 permutations if unseen"},"data_quality":{"scenario_variants":len(scenarios),"own_orders_evaluated":24,"runtime_seconds":round(elapsed,4),"runtime_data_source":"targeted-analysis-cache-with-raw-fallback"}}
