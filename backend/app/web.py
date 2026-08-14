@@ -7,7 +7,7 @@ from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, play
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
 from .analysis_cache import start_background_refresh, refresh_analysis_cache
-from .player_analysis_service import analyze, list_players, list_teams
+from .player_analysis_service import list_players, list_teams
 from .db import database_health
 from .db_routes import get_match
 from .validation_service import validate_database
@@ -58,7 +58,12 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/analysis":
                 own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]
                 opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
-                return self.send_json(analyze(own,opponent,actual,int(query.get("opponent_limit",["24"])[0])))
+                # IMPORTANT: use the dedicated fast analysis service. The old
+                # player_analysis_service.analyze() loads every XTTV match and
+                # recalculates every player's statistics on every request.
+                # For a 4-vs-4 analysis that is unnecessary and was the source
+                # of the repeated 20-second timeouts.
+                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0])))
             if parsed.path=="/api/xttv/debug": return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch": return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
             if parsed.path=="/api/xttv/inspect":
