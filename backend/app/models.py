@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Float, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
@@ -17,6 +17,52 @@ class RawSourceDocument(Base):
     http_status: Mapped[int | None] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text)
     __table_args__ = (UniqueConstraint("source", "external_id", name="uq_raw_source_external"),)
+
+
+class XttvPlayer(Base):
+    """Canonical player identity.
+
+    XTTV external_player_id is the stable identity; the display name is kept
+    here as the current/canonical name, while MatchPlayer continues to retain
+    the historical name that was shown in each match.
+    """
+    __tablename__ = "xttv_players"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    external_player_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    club: Mapped[str | None] = mapped_column(String(200))
+    birth_year: Mapped[int | None] = mapped_column(Integer)
+    source: Mapped[str] = mapped_column(String(50), default="xttv")
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    rating_snapshots: Mapped[list[PlayerRatingSnapshot]] = relationship(
+        back_populates="player", cascade="all, delete-orphan"
+    )
+
+
+class PlayerRatingSnapshot(Base):
+    """Point-in-time RC rating observation.
+
+    We deliberately store observations instead of only the current RC. This
+    prevents future leakage when evaluating historical matches and lets the
+    analysis derive 30/90/180-day trends from information available at that
+    point in time.
+    """
+    __tablename__ = "player_rating_snapshots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    player_id: Mapped[int] = mapped_column(ForeignKey("xttv_players.id", ondelete="CASCADE"))
+    observed_at: Mapped[datetime] = mapped_column(DateTime)
+    rc_rating: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(50), default="xttv")
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("raw_source_documents.id", ondelete="SET NULL"))
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    player: Mapped[XttvPlayer] = relationship(back_populates="rating_snapshots")
+    __table_args__ = (
+        UniqueConstraint("player_id", "observed_at", "source", name="uq_player_rating_observation"),
+        Index("ix_player_rating_player_observed", "player_id", "observed_at"),
+    )
 
 
 class XttvMatch(Base):
@@ -49,8 +95,6 @@ class MatchPlayer(Base):
     side: Mapped[str] = mapped_column(String(10))
     position: Mapped[str | None] = mapped_column(String(2))
     match: Mapped[XttvMatch] = relationship(back_populates="players")
-    # XTTV player IDs are the stable identity. Names are not unique: two
-    # different players can legitimately have the same name in one match.
     __table_args__ = (
         UniqueConstraint("match_id", "external_player_id", "side", name="uq_match_player"),
     )
