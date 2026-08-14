@@ -70,8 +70,28 @@ def refresh_analysis_cache() -> dict:
 
 
 def ensure_analysis_cache() -> None:
-    if not _READY:
-        refresh_analysis_cache()
+    """Do not rebuild the cache on an analysis request.
+
+    A warm cache is immediately usable even while a background refresh is running.
+    Only a completely missing cache is built synchronously (first installation).
+    """
+    global _READY
+    if _READY:
+        return
+    try:
+        with engine.connect() as db:
+            tables = db.execute(text("""
+                SELECT count(*) FROM information_schema.tables
+                WHERE table_schema='public' AND table_name IN
+                ('analysis_player_stats','analysis_matchups','analysis_lineup_orders')
+            """)).scalar()
+            cached = db.execute(text("SELECT count(*) FROM analysis_cache_meta WHERE cache_name='main'")) if int(tables or 0) == 3 else None
+            if cached is not None and int(cached.scalar() or 0) > 0:
+                _READY = True
+                return
+    except Exception:
+        pass
+    refresh_analysis_cache()
 
 
 def start_background_refresh() -> None:
