@@ -7,9 +7,20 @@ import time
 from sqlalchemy import text, bindparam
 from .db import SessionLocal
 
-WIN_TARGET = 8
-SINGLE_GAMES = 12
+# A team match always consists of exactly 10 games:
+#   8 singles: every player plays exactly twice
+#   2 doubles
+# Therefore 8:0 and 8:1 are impossible; 10:0 and 9:1 are possible.
+SINGLE_GAMES = 8
+TOTAL_GAMES = 10
+WIN_TARGET = 6  # team wins iff it wins at least 6 of the 10 games; 5:5 is a draw
 MAX_ANALYSIS_SECONDS = 5.0
+
+# Fixed singles order.  Every player appears exactly twice:
+# 1) 1-v-1, 2) 2-v-2, 3) 3-v-3, 4) 4-v-4,
+# 5) 1-v-2, 6) 2-v-1, 7) 3-v-4, 8) 4-v-3.
+SINGLES_SCHEDULE = ((0, 0), (1, 1), (2, 2), (3, 3),
+                    (0, 1), (1, 0), (2, 3), (3, 2))
 
 
 def _strength(wins, games):
@@ -33,7 +44,16 @@ def _pair_probability(a, b, c, d, stats):
     return 1.0 / (1.0 + math.exp(-7.0 * (left - right)))
 
 
-def _team_win_probability(probs):
+def _doubles_pairs(order, stats):
+    """Return the assumed doubles pairing: two strongest together, two weakest together."""
+    ranked = sorted(order, key=lambda pid: _strength(*stats.get(pid, (0, 0))), reverse=True)
+    return (ranked[0], ranked[1]), (ranked[2], ranked[3])
+
+
+def _team_result_probabilities(probs):
+    """Return P(win), P(draw), P(loss) for exactly ten independent game probabilities."""
+    if len(probs) != TOTAL_GAMES:
+        raise ValueError(f'expected {TOTAL_GAMES} game probabilities, got {len(probs)}')
     distribution = [1.0]
     for p in probs:
         nxt = [0.0] * (len(distribution) + 1)
@@ -41,7 +61,10 @@ def _team_win_probability(probs):
             nxt[wins] += mass * (1.0 - p)
             nxt[wins + 1] += mass * p
         distribution = nxt
-    return sum(distribution[WIN_TARGET:])
+    draw = distribution[5]
+    win = sum(distribution[WIN_TARGET:])
+    loss = sum(distribution[:5])
+    return win, draw, loss
 
 
 def _position_index(position):
@@ -86,12 +109,7 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None):
 
 
 def _load_raw_player_data(db, ids):
-    """Load only the requested players' names/stats from raw XTTV rows.
-
-    This is intentionally scoped to the 8 relevant players.  It avoids a
-    cache-ID mismatch making all own players fall back to the neutral prior,
-    which would make every lineup look identical.
-    """
+    """Load only the requested players' names/stats from raw XTTV rows."""
     ids = [str(x) for x in ids]
     if not ids:
         return {}, {}, {}
@@ -177,11 +195,6 @@ def _load_analysis_data(own, opponent_team, actual):
         relevant = set(own)
         for _, order in scenarios: relevant.update(order)
         ids = list(relevant)
-
-        # Raw targeted data is authoritative for this request.  The cache is
-        # still used for lineup positions, but player stats/names/H2H are read
-        # directly for exactly these relevant IDs so IDs cannot silently fall
-        # back to neutral values.
         names, stats, matchups = _load_raw_player_data(db, ids)
         names.update({k: v for k, v in fallback_names.items() if v})
         for pid in ids:
@@ -200,23 +213,71 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     actual = None if actual_opponent_ids is None else [str(x) for x in actual_opponent_ids]
     if actual is not None and (len(actual) != 4 or len(set(actual)) != 4): raise ValueError('exactly four different actual_opponent_ids are required')
     names, stats, matchups, scenarios, source = _load_analysis_data(own, opponent_team, actual)
-    if not scenarios: return {'ok': True, 'phase': 'B' if actual is not None else 'A', 'recommendations': [], 'warnings': [f'Keine historische 4-Spieler-Aufstellung für {opponent_team} gefunden.']}
+    if not scenarios:
+        return {'ok': True, 'phase': 'B' if actual is not None else 'A', 'recommendations': [], 'warnings': [f'Keine historische 4-Spieler-Aufstellung für {opponent_team} gefunden.']}
 
-    schedule = ((0,0),(1,1),(2,2),(3,3),(0,1),(1,0),(2,3),(3,2),(0,2),(2,0),(1,3),(3,1))
     relevant = set(own)
     for _, order in scenarios: relevant.update(order)
-    matchup_p = {(a,b): _matchup_probability(a,b,stats,matchups) for a in relevant for b in relevant if a != b}
+    matchup_p = {(a, b): _matchup_probability(a, b, stats, matchups) for a in relevant for b in relevant if a != b}
     evaluated = []
     for own_order in permutations(own):
-        expected = 0.0
+        expected_win = expected_draw = expected_loss = 0.0
+        own_doubles = _doubles_pairs(own_order, stats)
         for scenario_probability, opp_order in scenarios:
-            singles = [matchup_p.get((own_order[h], opp_order[a]), 0.5) for h,a in schedule]
-            doubles = [_pair_probability(own_order[0], own_order[1], opp_order[0], opp_order[1], stats), _pair_probability(own_order[2], own_order[3], opp_order[2], opp_order[3], stats)]
-            expected += scenario_probability * _team_win_probability(singles + doubles)
-        evaluated.append({'own_player_ids': list(own_order), 'players': [names.get(pid, f'Spieler {pid}') for pid in own_order], 'team_win_probability': round(expected, 6)})
-        if time.monotonic() - started > MAX_ANALYSIS_SECONDS: raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
+            singles = [matchup_p.get((own_order[h], opp_order[a]), 0.5) for h, a in SINGLES_SCHEDULE]
+            opp_doubles = _doubles_pairs(opp_order, stats)
+            doubles = [
+                _pair_probability(*own_doubles[0], *opp_doubles[0], stats),
+                _pair_probability(*own_doubles[1], *opp_doubles[1], stats),
+            ]
+            win, draw, loss = _team_result_probabilities(singles + doubles)
+            expected_win += scenario_probability * win
+            expected_draw += scenario_probability * draw
+            expected_loss += scenario_probability * loss
+        evaluated.append({
+            'own_player_ids': list(own_order),
+            'players': [names.get(pid, f'Spieler {pid}') for pid in own_order],
+            'team_win_probability': round(expected_win, 6),
+            'team_draw_probability': round(expected_draw, 6),
+            'team_loss_probability': round(expected_loss, 6),
+        })
+        if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
+            raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
     evaluated.sort(key=lambda x: (-x['team_win_probability'], x['own_player_ids']))
     for rank, item in enumerate(evaluated, 1): item['rank'] = rank
-    opponent_predictions = [{'player_ids': list(order), 'players': [{'id': p, 'name': names.get(p, f'Spieler {p}')} for p in order], 'probability': round(probability, 6)} for probability, order in scenarios]
+    opponent_predictions = [
+        {'player_ids': list(order), 'players': [{'id': p, 'name': names.get(p, f'Spieler {p}')} for p in order], 'probability': round(probability, 6)}
+        for probability, order in scenarios
+    ]
     elapsed = time.monotonic() - started
-    return {'ok': True, 'phase': 'B' if actual else 'A', 'opponent_team': opponent_team, 'own_player_ids': own, 'opponent_set_source': source, 'recommendation': evaluated[0], 'recommendations': evaluated, 'opponent_predictions': opponent_predictions, 'most_likely_opponent': opponent_predictions[0] if opponent_predictions else None, 'model': {'version': 'strength-h2h-doubles-v20', 'win_target': WIN_TARGET, 'single_games': SINGLE_GAMES, 'doubles_games': 2, 'opponent_lineups': 'historical four-player position orders; scoped raw fallback', 'player_stats': 'targeted raw XTTV stats for relevant IDs'}, 'data_quality': {'scenario_variants': len(scenarios), 'own_orders_evaluated': 24, 'runtime_seconds': round(elapsed,4), 'runtime_data_source': 'targeted-raw-stats-plus-lineup-cache', 'missing_player_stats_use_neutral_prior': False, 'position_probabilities_observed': source != 'all-24-uniform-fallback'}}
+    return {
+        'ok': True,
+        'phase': 'B' if actual else 'A',
+        'opponent_team': opponent_team,
+        'own_player_ids': own,
+        'opponent_set_source': source,
+        'recommendation': evaluated[0],
+        'recommendations': evaluated,
+        'opponent_predictions': opponent_predictions,
+        'most_likely_opponent': opponent_predictions[0] if opponent_predictions else None,
+        'model': {
+            'version': 'strength-h2h-doubles-v21-10-games',
+            'win_target': WIN_TARGET,
+            'single_games': SINGLE_GAMES,
+            'doubles_games': 2,
+            'total_games': TOTAL_GAMES,
+            'draw_possible': True,
+            'singles_schedule': '1-1, 2-2, 3-3, 4-4, 1-2, 2-1, 3-4, 4-3',
+            'doubles_pairing': 'two strongest together; two weakest together',
+            'opponent_lineups': 'historical four-player position orders; scoped raw fallback',
+            'player_stats': 'targeted raw XTTV stats for relevant IDs',
+        },
+        'data_quality': {
+            'scenario_variants': len(scenarios),
+            'own_orders_evaluated': 24,
+            'runtime_seconds': round(elapsed, 4),
+            'runtime_data_source': 'targeted-raw-stats-plus-lineup-cache',
+            'missing_player_stats_use_neutral_prior': False,
+            'position_probabilities_observed': source != 'all-24-uniform-fallback',
+        },
+    }
