@@ -69,15 +69,15 @@ def refresh_analysis_cache() -> dict:
         return {"ok": True, "refreshed": True, "source_matches": source_count}
 
 
-def ensure_analysis_cache() -> None:
-    """Do not rebuild the cache on an analysis request.
+def ensure_analysis_cache() -> bool:
+    """Never build the cache synchronously from an analysis HTTP request.
 
-    A warm cache is immediately usable even while a background refresh is running.
-    Only a completely missing cache is built synchronously (first installation).
+    A missing/stale cache is a deployment/import problem, not a reason to make a
+    user wait. The caller must fail fast and the background refresh can populate it.
     """
     global _READY
     if _READY:
-        return
+        return True
     try:
         with engine.connect() as db:
             tables = db.execute(text("""
@@ -85,13 +85,15 @@ def ensure_analysis_cache() -> None:
                 WHERE table_schema='public' AND table_name IN
                 ('analysis_player_stats','analysis_matchups','analysis_lineup_orders')
             """)).scalar()
-            cached = db.execute(text("SELECT count(*) FROM analysis_cache_meta WHERE cache_name='main'")) if int(tables or 0) == 3 else None
-            if cached is not None and int(cached.scalar() or 0) > 0:
-                _READY = True
-                return
+            if int(tables or 0) != 3:
+                return False
+            row = db.execute(text("SELECT source_match_count FROM analysis_cache_meta WHERE cache_name='main'" )).first()
+            if row is None:
+                return False
+            _READY = True
+            return True
     except Exception:
-        pass
-    refresh_analysis_cache()
+        return False
 
 
 def start_background_refresh() -> None:
