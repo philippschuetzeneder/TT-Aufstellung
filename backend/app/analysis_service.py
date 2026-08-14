@@ -9,22 +9,27 @@ WIN_TARGET = 8
 SINGLE_GAMES = 12
 MAX_ANALYSIS_SECONDS = 3.0
 
+
 def _strength(wins, games):
     return (wins + 5.0) / (games + 10.0)
+
 
 def _matchup_probability(a, b, stats, matchups):
     aw, ag = stats.get(a, (0, 0)); bw, bg = stats.get(b, (0, 0))
     base = 1.0 / (1.0 + math.exp(-7.0 * (_strength(aw, ag) - _strength(bw, bg))))
     wins, games = matchups.get((a, b), (0, 0))
-    if not games: return base
+    if not games:
+        return base
     direct = (wins + 2.0) / (games + 4.0)
     weight = min(0.55, games / 12.0)
     return (1.0 - weight) * base + weight * direct
+
 
 def _pair_probability(a, b, c, d, stats):
     left = (_strength(*stats.get(a, (0, 0))) + _strength(*stats.get(b, (0, 0)))) / 2.0
     right = (_strength(*stats.get(c, (0, 0))) + _strength(*stats.get(d, (0, 0)))) / 2.0
     return 1.0 / (1.0 + math.exp(-7.0 * (left - right)))
+
 
 def _team_win_probability(probs):
     distribution = [1.0]
@@ -36,10 +41,43 @@ def _team_win_probability(probs):
         distribution = nxt
     return sum(distribution[WIN_TARGET:])
 
+
+def _resolve_ids(db, ids):
+    """Normalize UI ids to stable XTTV external_player_id values.
+
+    Older frontend/database versions could send match_players.id while the
+    analysis tables use external_player_id. Accept both forms so a stale or
+    mixed data set cannot make valid players look nonexistent.
+    """
+    requested = [str(x) for x in ids]
+    if not requested:
+        return [], {}, []
+    rows = db.execute(text("""
+        SELECT id::text AS db_id, external_player_id::text AS external_id, max(name) AS player_name
+        FROM match_players
+        WHERE external_player_id::text = ANY(:ids)
+           OR id::text = ANY(:ids)
+        GROUP BY id, external_player_id
+    """), {"ids": requested}).mappings()
+    by_requested = {}
+    names = {}
+    for r in rows:
+        external = str(r["external_id"]) if r["external_id"] is not None else None
+        db_id = str(r["db_id"])
+        name = r["player_name"]
+        if external:
+            if external in requested:
+                by_requested[external] = external
+            if db_id in requested:
+                by_requested[db_id] = external
+            names[external] = name
+    normalized = [by_requested.get(x, x) for x in requested]
+    missing = [x for x in requested if x not in by_requested]
+    return normalized, names, missing
+
+
 def _load_targeted_raw_stats(db, ids, stats, names, matchups):
     ids = [str(x) for x in ids]
-    # Resolve player identity independently of game statistics. This fixes the
-    # bug where a valid selected player vanished because the cache had no row.
     rows = db.execute(text("""
         SELECT external_player_id::text AS player_id, max(name) AS player_name
         FROM match_players
@@ -85,69 +123,107 @@ def _load_targeted_raw_stats(db, ids, stats, names, matchups):
     for r in rows:
         matchups[(str(r["player_id"]), str(r["opponent_id"]))] = (int(r["wins"] or 0), int(r["games"] or 0))
 
+
 def _load_cache(own, opponent_team, actual):
     db = SessionLocal()
     try:
         db.execute(text("SET statement_timeout = '1000ms'"))
         db.execute(text("SET lock_timeout = '250ms'"))
+
+        own, own_names, own_missing = _resolve_ids(db, own)
+        if own_missing:
+            raise ValueError(f"Spieler nicht in XTTV-Daten gefunden: {', '.join(own_missing)}")
+
         if actual is not None:
+            actual, actual_names, actual_missing = _resolve_ids(db, actual)
+            if actual_missing:
+                raise ValueError(f"Gegner-Spieler nicht in XTTV-Daten gefunden: {', '.join(actual_missing)}")
             lineup_key = ",".join(sorted(actual))
             rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE lineup_key=:key ORDER BY appearances DESC LIMIT 24"), {"key": lineup_key}).mappings())
             total = sum(int(r["appearances"]) for r in rows)
-            scenarios = [(int(r["appearances"])/total,(str(r["p1"]),str(r["p2"]),str(r["p3"]),str(r["p4"]))) for r in rows] if total else [(1.0/24.0,tuple(o)) for o in permutations(actual)]
+            scenarios = [(int(r["appearances"]) / total, (str(r["p1"]), str(r["p2"]), str(r["p3"]), str(r["p4"]))) for r in rows] if total else [(1.0 / 24.0, tuple(o)) for o in permutations(actual)]
             relevant = set(own) | set(actual)
             source = "actual"
         else:
             rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE team=:team ORDER BY appearances DESC LIMIT 24"), {"team": opponent_team}).mappings())
             total = sum(int(r["appearances"]) for r in rows)
-            scenarios = [(int(r["appearances"])/total,(str(r["p1"]),str(r["p2"]),str(r["p3"]),str(r["p4"]))) for r in rows] if total else []
+            scenarios = [(int(r["appearances"]) / total, (str(r["p1"]), str(r["p2"]), str(r["p3"]), str(r["p4"]))) for r in rows] if total else []
             relevant = set(own)
-            for _, order in scenarios: relevant.update(order)
+            for _, order in scenarios:
+                relevant.update(order)
             source = "predicted"
-            if not scenarios: return {}, {}, {}, [], source
+            if not scenarios:
+                return {}, {}, {}, [], source
 
         ids = list(relevant)
         rows = db.execute(text("SELECT player_id::text AS player_id,player_name,singles_wins,singles_games FROM analysis_player_stats WHERE player_id::text = ANY(:ids)"), {"ids": ids}).mappings()
-        stats = {}; names = {}
+        stats = {}
+        names = dict(own_names)
+        names.update(actual_names if actual is not None else {})
         for r in rows:
-            pid = str(r["player_id"]); names[pid] = r["player_name"]; stats[pid] = (int(r["singles_wins"] or 0), int(r["singles_games"] or 0))
-        rows = db.execute(text("SELECT player_id::text AS player_id,opponent_id::text AS opponent_id,wins,games FROM analysis_matchups WHERE player_id::text = ANY(:ids) AND opponent_id::text = ANY(:ids)"), {"ids": ids}).mappings()
-        matchups = {(str(r["player_id"]),str(r["opponent_id"])):(int(r["wins"]),int(r["games"])) for r in rows}
+            pid = str(r["player_id"])
+            names[pid] = r["player_name"]
+            stats[pid] = (int(r["singles_wins"] or 0), int(r["singles_games"] or 0))
 
-        missing = [pid for pid in ids if pid not in names or pid not in stats]
-        if missing:
-            _load_targeted_raw_stats(db, missing, stats, names, matchups)
+        rows = db.execute(text("SELECT player_id::text AS player_id,opponent_id::text AS opponent_id,wins,games FROM analysis_matchups WHERE player_id::text = ANY(:ids) AND opponent_id::text = ANY(:ids)"), {"ids": ids}).mappings()
+        matchups = {(str(r["player_id"]), str(r["opponent_id"])): (int(r["wins"]), int(r["games"])) for r in rows}
+
+        missing_stats = [pid for pid in ids if pid not in stats]
+        if missing_stats:
+            _load_targeted_raw_stats(db, missing_stats, stats, names, matchups)
+
+        # A valid XTTV player with no recorded singles is still a valid player.
+        # Give the model the neutral prior rather than rejecting the request.
+        for pid in ids:
+            names.setdefault(pid, pid)
+            stats.setdefault(pid, (0, 0))
+
         return names, stats, matchups, scenarios, source
+    except ValueError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"Analysis-Cache nicht verfügbar: {type(exc).__name__}: {exc}") from exc
     finally:
         db.close()
 
+
 def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, opponent_limit=24):
     started = time.monotonic()
     own = [str(x) for x in own_player_ids]
-    if len(own)!=4 or len(set(own))!=4: raise ValueError("exactly four different own_player_ids are required")
-    if not opponent_team: raise ValueError("opponent_team is required")
+    if len(own) != 4 or len(set(own)) != 4:
+        raise ValueError("exactly four different own_player_ids are required")
+    if not opponent_team:
+        raise ValueError("opponent_team is required")
     actual = None if actual_opponent_ids is None else [str(x) for x in actual_opponent_ids]
-    if actual is not None and (len(actual)!=4 or len(set(actual))!=4): raise ValueError("exactly four different actual_opponent_ids are required")
-    names,stats,matchups,scenarios,source = _load_cache(own,opponent_team,actual)
+    if actual is not None and (len(actual) != 4 or len(set(actual)) != 4):
+        raise ValueError("exactly four different actual_opponent_ids are required")
+
+    names, stats, matchups, scenarios, source = _load_cache(own, opponent_team, actual)
     missing = [p for p in own if p not in names]
-    if missing: raise ValueError(f"Spieler nicht in XTTV-Daten gefunden: {', '.join(missing)}")
-    if not scenarios: return {"ok":True,"phase":"B" if actual is not None else "A","recommendations":[],"warnings":["Keine historische Viereraufstellung für diesen Gegner gefunden."]}
-    schedule=((0,0),(1,1),(2,2),(3,3),(0,1),(1,0),(2,3),(3,2),(0,2),(2,0),(1,3),(3,1))
-    relevant=set(own)
-    for _,order in scenarios: relevant.update(order)
-    matchup_p={(a,b):_matchup_probability(a,b,stats,matchups) for a in relevant for b in relevant if a!=b}
-    evaluated=[]
+    if missing:
+        raise ValueError(f"Spieler nicht in XTTV-Daten gefunden: {', '.join(missing)}")
+    if not scenarios:
+        return {"ok": True, "phase": "B" if actual is not None else "A", "recommendations": [], "warnings": ["Keine historische Viereraufstellung für diesen Gegner gefunden."]}
+
+    schedule = ((0,0),(1,1),(2,2),(3,3),(0,1),(1,0),(2,3),(3,2),(0,2),(2,0),(1,3),(3,1))
+    relevant = set(own)
+    for _, order in scenarios:
+        relevant.update(order)
+    matchup_p = {(a,b): _matchup_probability(a,b,stats,matchups) for a in relevant for b in relevant if a != b}
+
+    evaluated = []
     for own_order in permutations(own):
-        expected=0.0
-        for scenario_probability,opp_order in scenarios:
-            singles=[matchup_p.get((own_order[h],opp_order[a]),0.5) for h,a in schedule]
-            doubles=[_pair_probability(own_order[0],own_order[1],opp_order[0],opp_order[1],stats),_pair_probability(own_order[2],own_order[3],opp_order[2],opp_order[3],stats)]
-            expected += scenario_probability*_team_win_probability(singles+doubles)
-        evaluated.append({"own_player_ids":list(own_order),"players":[names.get(pid,pid) for pid in own_order],"team_win_probability":round(expected,6)})
-        if time.monotonic()-started>MAX_ANALYSIS_SECONDS: raise RuntimeError("Analysis exceeded the internal 3-second safety budget")
-    evaluated.sort(key=lambda x:(-x["team_win_probability"],x["own_player_ids"]))
-    for rank,item in enumerate(evaluated,1): item["rank"]=rank
-    elapsed=time.monotonic()-started
-    return {"ok":True,"phase":"B" if actual is not None else "A","opponent_team":opponent_team,"own_player_ids":own,"opponent_set_source":source,"recommendation":evaluated[0],"recommendations":evaluated,"opponent_predictions":[{"player_ids":list(o),"players":[{"id":p,"name":names.get(p,p)} for p in o],"probability":p} for p,o in scenarios],"model":{"version":"strength-h2h-doubles-v13-robust-player-fallback","win_target":WIN_TARGET,"single_games":SINGLE_GAMES,"doubles_games":2,"opponent_lineups":"observed historical position orders","actual_opponent_positions":"historical distribution; all 24 permutations if unseen"},"data_quality":{"scenario_variants":len(scenarios),"own_orders_evaluated":24,"runtime_seconds":round(elapsed,4),"runtime_data_source":"targeted-analysis-cache-with-raw-fallback"}}
+        expected = 0.0
+        for scenario_probability, opp_order in scenarios:
+            singles = [matchup_p.get((own_order[h], opp_order[a]), 0.5) for h,a in schedule]
+            doubles = [_pair_probability(own_order[0], own_order[1], opp_order[0], opp_order[1], stats), _pair_probability(own_order[2], own_order[3], opp_order[2], opp_order[3], stats)]
+            expected += scenario_probability * _team_win_probability(singles + doubles)
+        evaluated.append({"own_player_ids": list(own_order), "players": [names.get(pid, pid) for pid in own_order], "team_win_probability": round(expected, 6)})
+        if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
+            raise RuntimeError("Analysis exceeded the internal 3-second safety budget")
+
+    evaluated.sort(key=lambda x: (-x["team_win_probability"], x["own_player_ids"]))
+    for rank, item in enumerate(evaluated, 1):
+        item["rank"] = rank
+    elapsed = time.monotonic() - started
+    return {"ok": True, "phase": "B" if actual else "A", "opponent_team": opponent_team, "own_player_ids": own, "opponent_set_source": source, "recommendation": evaluated[0], "recommendations": evaluated, "opponent_predictions": [{"player_ids": list(o), "players": [{"id": p, "name": names.get(p,p)} for p in o], "probability": p} for p,o in scenarios], "model": {"version": "strength-h2h-doubles-v14-id-normalization", "win_target": WIN_TARGET, "single_games": SINGLE_GAMES, "doubles_games": 2, "opponent_lineups": "observed historical position orders", "actual_opponent_positions": "historical distribution; all 24 permutations if unseen"}, "data_quality": {"scenario_variants": len(scenarios), "own_orders_evaluated": 24, "runtime_seconds": round(elapsed,4), "runtime_data_source": "targeted-analysis-cache-with-id-normalization"}}
