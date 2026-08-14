@@ -22,19 +22,13 @@ from .db import SessionLocal
 #   exceptional 9:1 or 10:0 result can occur.
 # - Once a non-shutout score reaches 8 wins, the match is decided.
 # - If all 14 games are needed and the score is 7:7, it is a draw.
-# - Therefore the relevant final results include 8:2 ... 8:6, 9:1,
-#   10:0 and 7:7 (and their mirrored losses).
 SINGLE_GAMES = 12
 DOUBLE_GAMES = 2
 TOTAL_GAMES = 14
 WIN_TARGET = 8
 MAX_ANALYSIS_SECONDS = 5.0
 
-# Singles:
-# Games 1-4: first singles round.
-# Games 6-9: second singles round.
-# Games 11-14: third singles round.
-# Each player therefore plays exactly three singles.
+# Games 1-4, 6-9 and 11-14 are singles. Each player plays exactly 3 singles.
 SINGLES_SCHEDULE = (
     (0, 0), (1, 1), (2, 2), (3, 3),
     (0, 1), (1, 0), (2, 3), (3, 2),
@@ -64,54 +58,39 @@ def _pair_probability(a, b, c, d, stats):
 
 
 def _doubles_pairs(order, stats):
-    """Return the assumed doubles pairing: two strongest together, two weakest together."""
     ranked = sorted(order, key=lambda pid: _strength(*stats.get(pid, (0, 0))), reverse=True)
     return (ranked[0], ranked[1]), (ranked[2], ranked[3])
 
 
 def _is_terminal_after_game(game_number, wins, losses):
-    """Whether the match has ended after this game.
-
-    Games are 1-based. The first ten games are always played.
-    After game 10, normal first-to-8 stopping applies, with the two
-    special shutout paths 8:0/8:1 -> 9:1 or 10:0.
-    """
+    """Apply the real 14-game stopping rule."""
     if game_number < 10:
         return False
-
     if game_number == TOTAL_GAMES:
         return True
 
-    # Special continuation for the shutout paths.  At 8:0 the match
-    # must continue; at 8:1 it must continue one more game; at 9:0 it
-    # must continue one more game so that 9:1 or 10:0 can result.
+    # 8:0 / 8:1 and 9:0 are the special continuation paths that can
+    # produce 9:1 or 10:0. All other scores with 8+ wins are final.
     if wins >= WIN_TARGET:
         if wins == 8 and losses <= 1:
             return False
         if wins == 9 and losses == 0:
             return False
         return True
-
     if losses >= WIN_TARGET:
         if losses == 8 and wins <= 1:
             return False
         if losses == 9 and wins == 0:
             return False
         return True
-
     return False
 
 
 def _team_result_probabilities(probs):
-    """Return P(win), P(draw), P(loss) under the real 14-game stop rule.
-
-    The first 10 games are mandatory. After that the match stops when
-    the rules above are satisfied. A 7:7 result after game 14 is a draw.
-    """
+    """Return P(win), P(draw), P(loss) under the real 14-game stop rule."""
     if len(probs) != TOTAL_GAMES:
         raise ValueError(f'expected {TOTAL_GAMES} game probabilities, got {len(probs)}')
 
-    # State is (own_wins, opponent_wins) -> probability mass.
     states = {(0, 0): 1.0}
     terminal_win = terminal_draw = terminal_loss = 0.0
 
@@ -121,7 +100,9 @@ def _team_result_probabilities(probs):
             # Own team wins this game.
             nw, nl = wins + 1, losses
             mass_w = mass * p
-            if _is_terminal_after_game(game_index, nw, nl):
+            if game_index == TOTAL_GAMES and nw == nl == 7:
+                terminal_draw += mass_w
+            elif _is_terminal_after_game(game_index, nw, nl):
                 terminal_win += mass_w
             else:
                 next_states[(nw, nl)] += mass_w
@@ -129,18 +110,14 @@ def _team_result_probabilities(probs):
             # Own team loses this game.
             nw, nl = wins, losses + 1
             mass_l = mass * (1.0 - p)
-            if _is_terminal_after_game(game_index, nw, nl):
-                if game_index == TOTAL_GAMES and nw == nl == 7:
-                    terminal_draw += mass_l
-                else:
-                    terminal_loss += mass_l
+            if game_index == TOTAL_GAMES and nw == nl == 7:
+                terminal_draw += mass_l
+            elif _is_terminal_after_game(game_index, nw, nl):
+                terminal_loss += mass_l
             else:
                 next_states[(nw, nl)] += mass_l
-
         states = next_states
 
-    # At game 14 all non-terminal states are necessarily 7:7, but keep
-    # this explicit so the rule cannot silently change later.
     for (wins, losses), mass in states.items():
         if wins == losses == 7:
             terminal_draw += mass
@@ -196,7 +173,6 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None):
 
 
 def _load_raw_player_data(db, ids):
-    """Load only the requested players' names/stats from raw XTTV rows."""
     ids = [str(x) for x in ids]
     if not ids:
         return {}, {}, {}
@@ -317,7 +293,8 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
                 _pair_probability(*own_doubles[0], *opp_doubles[0], stats),
                 _pair_probability(*own_doubles[1], *opp_doubles[1], stats),
             ]
-            win, draw, loss = _team_result_probabilities(singles[:4] + doubles[:1] + singles[4:8] + doubles[1:] + singles[8:])
+            game_probs = singles[:4] + doubles[:1] + singles[4:8] + doubles[1:] + singles[8:]
+            win, draw, loss = _team_result_probabilities(game_probs)
             expected_win += scenario_probability * win
             expected_draw += scenario_probability * draw
             expected_loss += scenario_probability * loss
