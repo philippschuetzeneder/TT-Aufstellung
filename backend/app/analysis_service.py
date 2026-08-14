@@ -28,7 +28,6 @@ TOTAL_GAMES = 14
 WIN_TARGET = 8
 MAX_ANALYSIS_SECONDS = 5.0
 
-# Games 1-4, 6-9 and 11-14 are singles. Each player plays exactly 3 singles.
 SINGLES_SCHEDULE = (
     (0, 0), (1, 1), (2, 2), (3, 3),
     (0, 1), (1, 0), (2, 3), (3, 2),
@@ -63,14 +62,10 @@ def _doubles_pairs(order, stats):
 
 
 def _is_terminal_after_game(game_number, wins, losses):
-    """Apply the real 14-game stopping rule."""
     if game_number < 10:
         return False
     if game_number == TOTAL_GAMES:
         return True
-
-    # 8:0 / 8:1 and 9:0 are the special continuation paths that can
-    # produce 9:1 or 10:0. All other scores with 8+ wins are final.
     if wins >= WIN_TARGET:
         if wins == 8 and losses <= 1:
             return False
@@ -87,10 +82,8 @@ def _is_terminal_after_game(game_number, wins, losses):
 
 
 def _team_result_probabilities(probs):
-    """Return P(win), P(draw), P(loss) under the real 14-game stop rule."""
     if len(probs) != TOTAL_GAMES:
         raise ValueError(f'expected {TOTAL_GAMES} game probabilities, got {len(probs)}')
-
     states = {(0, 0): 1.0}
     terminal_win = terminal_draw = terminal_loss = 0.0
 
@@ -108,7 +101,6 @@ def _team_result_probabilities(probs):
     for game_index, p in enumerate(probs, start=1):
         next_states = defaultdict(float)
         for (wins, losses), mass in states.items():
-            # Own team wins this game.
             nw, nl = wins + 1, losses
             mass_w = mass * p
             if _is_terminal_after_game(game_index, nw, nl):
@@ -116,7 +108,6 @@ def _team_result_probabilities(probs):
             else:
                 next_states[(nw, nl)] += mass_w
 
-            # Own team loses this game.
             nw, nl = wins, losses + 1
             mass_l = mass * (1.0 - p)
             if _is_terminal_after_game(game_index, nw, nl):
@@ -127,7 +118,6 @@ def _team_result_probabilities(probs):
 
     for (wins, losses), mass in states.items():
         record_terminal(wins, losses, mass)
-
     return terminal_win, terminal_draw, terminal_loss
 
 
@@ -157,7 +147,8 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None):
             pid = str(r['player_id']); by_id.setdefault(pid, r); names.setdefault(pid, r['player_name'])
         ids = set(by_id)
         if required is not None:
-            if ids != required: continue
+            if ids != required:
+                continue
         elif len(ids) != 4:
             continue
         order = [None] * 4; valid = True
@@ -166,9 +157,11 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None):
             if idx is None or order[idx] is not None:
                 valid = False; break
             order[idx] = pid
-        if valid and all(order): counts[tuple(order)] += 1
+        if valid and all(order):
+            counts[tuple(order)] += 1
     total = sum(counts.values())
-    if not total: return [], names
+    if not total:
+        return [], names
     return [(count / total, order) for order, count in counts.most_common(24)], names
 
 
@@ -208,7 +201,8 @@ def _load_raw_player_data(db, ids):
     """).bindparams(bindparam('ids', expanding=True))
     for r in db.execute(name_stmt, params).mappings():
         pid = str(r['player_id'])
-        if r['player_name']: names[pid] = r['player_name']
+        if r['player_name']:
+            names[pid] = r['player_name']
 
     h2h_stmt = text("""
         WITH base AS (
@@ -246,7 +240,8 @@ def _load_analysis_data(own, opponent_team, actual):
                 scenarios = [(int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1','p2','p3','p4'))) for r in rows]; source = 'actual-historical-cache'
             else:
                 scenarios, fallback_names = _raw_team_lineup_scenarios(db, opponent_team, actual); source = 'actual-historical-raw'
-                if not scenarios: scenarios = [(1.0 / 24.0, tuple(order)) for order in permutations(actual)]; source = 'all-24-uniform-fallback'
+                if not scenarios:
+                    scenarios = [(1.0 / 24.0, tuple(order)) for order in permutations(actual)]; source = 'all-24-uniform-fallback'
         else:
             rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE team=:team ORDER BY appearances DESC LIMIT 24"), {'team': opponent_team}).mappings())
             total = sum(int(r['appearances'] or 0) for r in rows)
@@ -254,9 +249,11 @@ def _load_analysis_data(own, opponent_team, actual):
                 scenarios = [(int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1','p2','p3','p4'))) for r in rows]; source = 'predicted-historical-cache'
             else:
                 scenarios, fallback_names = _raw_team_lineup_scenarios(db, opponent_team); source = 'predicted-historical-raw'
-                if not scenarios: return {}, {}, {}, [], source
+                if not scenarios:
+                    return {}, {}, {}, [], source
         relevant = set(own)
-        for _, order in scenarios: relevant.update(order)
+        for _, order in scenarios:
+            relevant.update(order)
         ids = list(relevant)
         names, stats, matchups = _load_raw_player_data(db, ids)
         names.update({k: v for k, v in fallback_names.items() if v})
@@ -269,19 +266,134 @@ def _load_analysis_data(own, opponent_team, actual):
         db.close()
 
 
+def _explain_recommendation(own_order, scenarios, matchup_p, stats, names, evaluated):
+    """Create a human-readable, model-grounded explanation for the top lineup."""
+    weighted_games = [0.0] * TOTAL_GAMES
+    weighted_double = [0.0, 0.0]
+    position_rates = {pid: [0.0] * 4 for pid in own_order}
+
+    for scenario_probability, opp_order in scenarios:
+        singles = [matchup_p.get((own_order[h], opp_order[a]), 0.5) for h, a in SINGLES_SCHEDULE]
+        own_doubles = _doubles_pairs(own_order, stats)
+        opp_doubles = _doubles_pairs(opp_order, stats)
+        doubles = [
+            _pair_probability(*own_doubles[0], *opp_doubles[0], stats),
+            _pair_probability(*own_doubles[1], *opp_doubles[1], stats),
+        ]
+        game_probs = singles[:4] + doubles[:1] + singles[4:8] + doubles[1:] + singles[8:]
+        for i, p in enumerate(game_probs):
+            weighted_games[i] += scenario_probability * p
+        for i, p in enumerate(doubles):
+            weighted_double[i] += scenario_probability * p
+
+        # What would each own player see if moved to each position?
+        for pid in own_order:
+            for position in range(4):
+                rate = sum(matchup_p.get((pid, opp_order[a]), 0.5) for h, a in SINGLES_SCHEDULE if h == position) / 3.0
+                position_rates[pid][position] += scenario_probability * rate
+
+    player_current_rates = []
+    for position, pid in enumerate(own_order):
+        current = position_rates[pid][position]
+        best_pos = max(range(4), key=lambda p: position_rates[pid][p])
+        gain = position_rates[pid][best_pos] - current
+        player_current_rates.append((pid, current, best_pos, gain))
+
+    player_current_rates.sort(key=lambda x: x[1], reverse=True)
+    strongest = player_current_rates[0]
+    biggest_placement_gain = max(player_current_rates, key=lambda x: x[3])
+
+    # Recalculate the best alternative from the already evaluated permutations.
+    sorted_evaluated = sorted(evaluated, key=lambda x: x['team_win_probability'], reverse=True)
+    best = sorted_evaluated[0]
+    second = sorted_evaluated[1] if len(sorted_evaluated) > 1 else None
+    margin = (best['team_win_probability'] - second['team_win_probability']) if second else 0.0
+
+    # Most favorable and least favorable expected single game in the chosen order.
+    single_game_indices = list(range(4)) + list(range(5, 9)) + list(range(10, 14))
+    single_values = [(i + 1, weighted_games[i]) for i in single_game_indices]
+    best_game = max(single_values, key=lambda x: x[1])
+    worst_game = min(single_values, key=lambda x: x[1])
+
+    bullets = []
+    bullets.append(
+        f"Die Reihenfolge ist optimal, weil sie die erwarteten Einzelspiel-Duelle über alle "
+        f"historisch gewichteten gegnerischen Aufstellungen am besten verteilt."
+    )
+    if margin >= 0.005 and second:
+        bullets.append(
+            f"Gegenüber der zweitbesten Reihenfolge bringt sie rund {margin * 100:.1f} Prozentpunkte "
+            f"mehr Mannschafts-Siegwahrscheinlichkeit ({best['team_win_probability'] * 100:.1f} % statt {second['team_win_probability'] * 100:.1f} %)."
+        )
+    elif second:
+        bullets.append(
+            f"Die ersten Aufstellungen liegen sehr eng beieinander: der Abstand zur zweitbesten "
+            f"Reihenfolge beträgt nur {margin * 100:.1f} Prozentpunkte."
+        )
+
+    strongest_name = names.get(strongest[0], f'Spieler {strongest[0]}')
+    bullets.append(
+        f"{strongest_name} hat in seiner empfohlenen Position die höchste durchschnittliche "
+        f"Einzelspielchance der vier ({strongest[1] * 100:.1f} %)."
+    )
+
+    gain_name = names.get(biggest_placement_gain[0], f'Spieler {biggest_placement_gain[0]}')
+    if biggest_placement_gain[3] >= 0.01:
+        bullets.append(
+            f"Besonders wichtig ist die Positionierung von {gain_name}: seine aktuelle Position "
+            f"ist gegenüber seiner rechnerisch besten anderen Position um {biggest_placement_gain[3] * 100:.1f} "
+            f"Prozentpunkte günstiger als die entsprechende Platzierung in der übrigen Reihenfolge."
+        )
+
+    if weighted_double[0] >= 0.5 or weighted_double[1] >= 0.5:
+        bullets.append(
+            f"Die beiden Doppel werden ebenfalls berücksichtigt: erwartete Gewinnchance ca. "
+            f"{weighted_double[0] * 100:.1f} % im ersten und {weighted_double[1] * 100:.1f} % im zweiten Doppel."
+        )
+
+    return {
+        'headline': f"Warum diese Aufstellung? {names.get(own_order[0], own_order[0])} / {names.get(own_order[1], own_order[1])} / {names.get(own_order[2], own_order[2])} / {names.get(own_order[3], own_order[3])} erzielt im Modell die höchste Siegchance.",
+        'bullets': bullets[:5],
+        'detail': {
+            'single_game_best_probability': round(best_game[1], 6),
+            'single_game_worst_probability': round(worst_game[1], 6),
+            'first_doubles_probability': round(weighted_double[0], 6),
+            'second_doubles_probability': round(weighted_double[1], 6),
+            'position_rates': [
+                {
+                    'player_id': pid,
+                    'player_name': names.get(pid, f'Spieler {pid}'),
+                    'recommended_position': pos + 1,
+                    'recommended_single_probability': round(current, 6),
+                    'best_position_by_singles': best_pos + 1,
+                    'best_position_single_probability': round(position_rates[pid][best_pos], 6),
+                }
+                for pos, pid in enumerate(own_order)
+                for _, current, best_pos, _ in [next(x for x in player_current_rates if x[0] == pid)]
+            ],
+        },
+    }
+
+
 def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, opponent_limit=24):
     started = time.monotonic(); own = [str(x) for x in own_player_ids]
-    if len(own) != 4 or len(set(own)) != 4: raise ValueError('exactly four different own_player_ids are required')
-    if not opponent_team: raise ValueError('opponent_team is required')
+    if len(own) != 4 or len(set(own)) != 4:
+        raise ValueError('exactly four different own_player_ids are required')
+    if not opponent_team:
+        raise ValueError('opponent_team is required')
     actual = None if actual_opponent_ids is None else [str(x) for x in actual_opponent_ids]
-    if actual is not None and (len(actual) != 4 or len(set(actual)) != 4): raise ValueError('exactly four different actual_opponent_ids are required')
+    if actual is not None and (len(actual) != 4 or len(set(actual)) != 4):
+        raise ValueError('exactly four different actual_opponent_ids are required')
+
     names, stats, matchups, scenarios, source = _load_analysis_data(own, opponent_team, actual)
     if not scenarios:
         return {'ok': True, 'phase': 'B' if actual is not None else 'A', 'recommendations': [], 'warnings': [f'Keine historische 4-Spieler-Aufstellung für {opponent_team} gefunden.']}
 
     relevant = set(own)
-    for _, order in scenarios: relevant.update(order)
+    for _, order in scenarios:
+        relevant.update(order)
     matchup_p = {(a, b): _matchup_probability(a, b, stats, matchups) for a in relevant for b in relevant if a != b}
+
     evaluated = []
     for own_order in permutations(own):
         expected_win = expected_draw = expected_loss = 0.0
@@ -307,25 +419,32 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         })
         if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
             raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
+
     evaluated.sort(key=lambda x: (-x['team_win_probability'], x['own_player_ids']))
-    for rank, item in enumerate(evaluated, 1): item['rank'] = rank
+    for rank, item in enumerate(evaluated, 1):
+        item['rank'] = rank
+
+    recommendation = evaluated[0]
+    explanation = _explain_recommendation(recommendation['own_player_ids'], scenarios, matchup_p, stats, names, evaluated)
     opponent_predictions = [
         {'player_ids': list(order), 'players': [{'id': p, 'name': names.get(p, f'Spieler {p}')} for p in order], 'probability': round(probability, 6)}
         for probability, order in scenarios
     ]
     elapsed = time.monotonic() - started
+
     return {
         'ok': True,
         'phase': 'B' if actual else 'A',
         'opponent_team': opponent_team,
         'own_player_ids': own,
         'opponent_set_source': source,
-        'recommendation': evaluated[0],
+        'recommendation': recommendation,
         'recommendations': evaluated,
+        'explanation': explanation,
         'opponent_predictions': opponent_predictions,
         'most_likely_opponent': opponent_predictions[0] if opponent_predictions else None,
         'model': {
-            'version': 'strength-h2h-doubles-v22-14-games-stop-rule',
+            'version': 'strength-h2h-doubles-v23-explanations',
             'win_target': WIN_TARGET,
             'single_games': SINGLE_GAMES,
             'doubles_games': DOUBLE_GAMES,
