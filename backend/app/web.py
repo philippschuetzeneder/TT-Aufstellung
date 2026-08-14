@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
+from .analysis_cache import start_background_refresh, refresh_analysis_cache
 from .player_analysis_service import analyze, list_players, list_teams
 from .db import database_health
 from .db_routes import get_match
@@ -48,18 +49,16 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/analytics/lineups": return self.send_json(lineup_stats(query.get("team",[None])[0]))
             if parsed.path=="/api/analytics/matchups": return self.send_json(matchup_stats(query.get("player_id",[None])[0],query.get("opponent_id",[None])[0]))
             if parsed.path=="/api/analytics/matchup-matrix": return self.send_json(matchup_matrix())
+            if parsed.path=="/api/analysis/cache-refresh": return self.send_json(refresh_analysis_cache())
             if parsed.path=="/api/teams": return self.send_json(list_teams())
             if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0]))
-            # Canonical REST-style alias: /api/teams/{team}/players
-            # Keep the query-parameter route above for backwards compatibility.
             team_prefix="/api/teams/"
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
-                team_name=unquote(parsed.path[len(team_prefix):-len("/players")])
-                return self.send_json(list_players(team_name))
+                team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
             if parsed.path=="/api/analysis":
                 own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]
                 opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
-                return self.send_json(analyze(own,opponent,actual,int(query.get("opponent_limit",["25"])[0])))
+                return self.send_json(analyze(own,opponent,actual,int(query.get("opponent_limit",["24"])[0])))
             if parsed.path=="/api/xttv/debug": return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch": return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
             if parsed.path=="/api/xttv/inspect":
@@ -74,5 +73,7 @@ class Handler(BaseHTTPRequestHandler):
         if not str(target).startswith(str(ROOT.resolve())) or not target.is_file(): return self.send_error(404)
         content=target.read_bytes(); types={".html":"text/html",".css":"text/css",".mjs":"text/javascript",".js":"text/javascript"}; self.send_response(200); self.send_header("Content-Type",types.get(target.suffix,"application/octet-stream")+"; charset=utf-8"); self.send_header("Content-Length",str(len(content))); self.end_headers(); self.wfile.write(content)
 
-def main(): ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","10000"))),Handler).serve_forever()
+def main():
+    start_background_refresh()
+    ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","10000"))),Handler).serve_forever()
 if __name__=="__main__": main()
