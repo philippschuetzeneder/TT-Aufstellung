@@ -94,31 +94,8 @@ def _team_result_probabilities(probs):
     states = {(0, 0): 1.0}
     terminal_win = terminal_draw = terminal_loss = 0.0
 
-    for game_index, p in enumerate(probs, start=1):
-        next_states = defaultdict(float)
-        for (wins, losses), mass in states.items():
-            # Own team wins this game.
-            nw, nl = wins + 1, losses
-            mass_w = mass * p
-            if game_index == TOTAL_GAMES and nw == nl == 7:
-                terminal_draw += mass_w
-            elif _is_terminal_after_game(game_index, nw, nl):
-                terminal_win += mass_w
-            else:
-                next_states[(nw, nl)] += mass_w
-
-            # Own team loses this game.
-            nw, nl = wins, losses + 1
-            mass_l = mass * (1.0 - p)
-            if game_index == TOTAL_GAMES and nw == nl == 7:
-                terminal_draw += mass_l
-            elif _is_terminal_after_game(game_index, nw, nl):
-                terminal_loss += mass_l
-            else:
-                next_states[(nw, nl)] += mass_l
-        states = next_states
-
-    for (wins, losses), mass in states.items():
+    def record_terminal(wins, losses, mass):
+        nonlocal terminal_win, terminal_draw, terminal_loss
         if wins == losses == 7:
             terminal_draw += mass
         elif wins >= WIN_TARGET:
@@ -126,7 +103,30 @@ def _team_result_probabilities(probs):
         elif losses >= WIN_TARGET:
             terminal_loss += mass
         else:
-            raise RuntimeError(f'unresolved match state after game 14: {wins}:{losses}')
+            raise RuntimeError(f'invalid terminal score {wins}:{losses}')
+
+    for game_index, p in enumerate(probs, start=1):
+        next_states = defaultdict(float)
+        for (wins, losses), mass in states.items():
+            # Own team wins this game.
+            nw, nl = wins + 1, losses
+            mass_w = mass * p
+            if _is_terminal_after_game(game_index, nw, nl):
+                record_terminal(nw, nl, mass_w)
+            else:
+                next_states[(nw, nl)] += mass_w
+
+            # Own team loses this game.
+            nw, nl = wins, losses + 1
+            mass_l = mass * (1.0 - p)
+            if _is_terminal_after_game(game_index, nw, nl):
+                record_terminal(nw, nl, mass_l)
+            else:
+                next_states[(nw, nl)] += mass_l
+        states = next_states
+
+    for (wins, losses), mass in states.items():
+        record_terminal(wins, losses, mass)
 
     return terminal_win, terminal_draw, terminal_loss
 
