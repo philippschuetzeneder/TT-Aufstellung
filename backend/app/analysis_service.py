@@ -43,11 +43,13 @@ def _team_win_probability(probs):
 
 
 def _resolve_ids(db, ids):
-    """Normalize UI ids to stable XTTV external_player_id values.
+    """Normalize IDs when possible, but never reject a UI-selected ID.
 
-    Older frontend/database versions could send match_players.id while the
-    analysis tables use external_player_id. Accept both forms so a stale or
-    mixed data set cannot make valid players look nonexistent.
+    The UI historically received player IDs from more than one source. A
+    selected ID is therefore kept as-is if it cannot be mapped immediately;
+    the targeted statistics loader can still resolve it by either XTTV
+    external_player_id or match_players.id. Unknown IDs get the neutral prior
+    rather than aborting the entire calculation.
     """
     requested = [str(x) for x in ids]
     if not requested:
@@ -79,10 +81,10 @@ def _resolve_ids(db, ids):
 def _load_targeted_raw_stats(db, ids, stats, names, matchups):
     ids = [str(x) for x in ids]
     rows = db.execute(text("""
-        SELECT external_player_id::text AS player_id, max(name) AS player_name
+        SELECT COALESCE(external_player_id::text, id::text) AS player_id, max(name) AS player_name
         FROM match_players
-        WHERE external_player_id::text = ANY(:ids)
-        GROUP BY external_player_id
+        WHERE external_player_id::text = ANY(:ids) OR id::text = ANY(:ids)
+        GROUP BY COALESCE(external_player_id::text, id::text)
     """), {"ids": ids}).mappings()
     for r in rows:
         pid = str(r["player_id"])
@@ -90,7 +92,8 @@ def _load_targeted_raw_stats(db, ids, stats, names, matchups):
         stats.setdefault(pid, (0, 0))
 
     rows = db.execute(text("""
-        SELECT p.external_player_id::text AS player_id, count(g.id) AS games,
+        SELECT COALESCE(p.external_player_id::text,p.id::text) AS player_id,
+               count(g.id) AS games,
                count(g.id) FILTER (WHERE
                    (p.side='home' AND split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int)
                    OR (p.side='away' AND split_part(trim(g.result),':',2)::int > split_part(trim(g.result),':',1)::int)
@@ -98,22 +101,24 @@ def _load_targeted_raw_stats(db, ids, stats, names, matchups):
         FROM match_players p
         JOIN match_games g ON g.match_id=p.match_id AND g.game_type='singles'
           AND ((p.side='home' AND p.position=g.home_position) OR (p.side='away' AND p.position=g.away_position))
-        WHERE p.external_player_id::text = ANY(:ids)
+        WHERE (p.external_player_id::text = ANY(:ids) OR p.id::text = ANY(:ids))
           AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
-        GROUP BY p.external_player_id
+        GROUP BY COALESCE(p.external_player_id::text,p.id::text)
     """), {"ids": ids}).mappings()
     for r in rows:
         stats[str(r["player_id"])] = (int(r["wins"] or 0), int(r["games"] or 0))
 
     rows = db.execute(text("""
         WITH games AS (
-            SELECT hp.external_player_id::text AS home_id, ap.external_player_id::text AS away_id,
+            SELECT COALESCE(hp.external_player_id::text,hp.id::text) AS home_id,
+                   COALESCE(ap.external_player_id::text,ap.id::text) AS away_id,
                    CASE WHEN split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int THEN 1 ELSE 0 END AS home_win
             FROM match_games g
             JOIN match_players hp ON hp.match_id=g.match_id AND hp.side='home' AND hp.position=g.home_position
             JOIN match_players ap ON ap.match_id=g.match_id AND ap.side='away' AND ap.position=g.away_position
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
-              AND hp.external_player_id::text = ANY(:ids) AND ap.external_player_id::text = ANY(:ids)
+              AND (hp.external_player_id::text = ANY(:ids) OR hp.id::text = ANY(:ids))
+              AND (ap.external_player_id::text = ANY(:ids) OR ap.id::text = ANY(:ids))
         )
         SELECT home_id AS player_id, away_id AS opponent_id, sum(home_win) AS wins, count(*) AS games
         FROM games GROUP BY home_id,away_id
@@ -130,14 +135,10 @@ def _load_cache(own, opponent_team, actual):
         db.execute(text("SET statement_timeout = '1000ms'"))
         db.execute(text("SET lock_timeout = '250ms'"))
 
-        own, own_names, own_missing = _resolve_ids(db, own)
-        if own_missing:
-            raise ValueError(f"Spieler nicht in XTTV-Daten gefunden: {', '.join(own_missing)}")
+        own, own_names, _ = _resolve_ids(db, own)
 
         if actual is not None:
-            actual, actual_names, actual_missing = _resolve_ids(db, actual)
-            if actual_missing:
-                raise ValueError(f"Gegner-Spieler nicht in XTTV-Daten gefunden: {', '.join(actual_missing)}")
+            actual, actual_names, _ = _resolve_ids(db, actual)
             lineup_key = ",".join(sorted(actual))
             rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE lineup_key=:key ORDER BY appearances DESC LIMIT 24"), {"key": lineup_key}).mappings())
             total = sum(int(r["appearances"]) for r in rows)
@@ -152,6 +153,7 @@ def _load_cache(own, opponent_team, actual):
             for _, order in scenarios:
                 relevant.update(order)
             source = "predicted"
+            actual_names = {}
             if not scenarios:
                 return {}, {}, {}, [], source
 
@@ -172,15 +174,11 @@ def _load_cache(own, opponent_team, actual):
         if missing_stats:
             _load_targeted_raw_stats(db, missing_stats, stats, names, matchups)
 
-        # A valid XTTV player with no recorded singles is still a valid player.
-        # Give the model the neutral prior rather than rejecting the request.
         for pid in ids:
             names.setdefault(pid, pid)
             stats.setdefault(pid, (0, 0))
 
         return names, stats, matchups, scenarios, source
-    except ValueError:
-        raise
     except Exception as exc:
         raise RuntimeError(f"Analysis-Cache nicht verfügbar: {type(exc).__name__}: {exc}") from exc
     finally:
@@ -199,9 +197,6 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         raise ValueError("exactly four different actual_opponent_ids are required")
 
     names, stats, matchups, scenarios, source = _load_cache(own, opponent_team, actual)
-    missing = [p for p in own if p not in names]
-    if missing:
-        raise ValueError(f"Spieler nicht in XTTV-Daten gefunden: {', '.join(missing)}")
     if not scenarios:
         return {"ok": True, "phase": "B" if actual is not None else "A", "recommendations": [], "warnings": ["Keine historische Viereraufstellung für diesen Gegner gefunden."]}
 
@@ -226,4 +221,4 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     for rank, item in enumerate(evaluated, 1):
         item["rank"] = rank
     elapsed = time.monotonic() - started
-    return {"ok": True, "phase": "B" if actual else "A", "opponent_team": opponent_team, "own_player_ids": own, "opponent_set_source": source, "recommendation": evaluated[0], "recommendations": evaluated, "opponent_predictions": [{"player_ids": list(o), "players": [{"id": p, "name": names.get(p,p)} for p in o], "probability": p} for p,o in scenarios], "model": {"version": "strength-h2h-doubles-v14-id-normalization", "win_target": WIN_TARGET, "single_games": SINGLE_GAMES, "doubles_games": 2, "opponent_lineups": "observed historical position orders", "actual_opponent_positions": "historical distribution; all 24 permutations if unseen"}, "data_quality": {"scenario_variants": len(scenarios), "own_orders_evaluated": 24, "runtime_seconds": round(elapsed,4), "runtime_data_source": "targeted-analysis-cache-with-id-normalization"}}
+    return {"ok": True, "phase": "B" if actual else "A", "opponent_team": opponent_team, "own_player_ids": own, "opponent_set_source": source, "recommendation": evaluated[0], "recommendations": evaluated, "opponent_predictions": [{"player_ids": list(o), "players": [{"id": p, "name": names.get(p,p)} for p in o], "probability": p} for p,o in scenarios], "model": {"version": "strength-h2h-doubles-v15-tolerant-id-resolution", "win_target": WIN_TARGET, "single_games": SINGLE_GAMES, "doubles_games": 2, "opponent_lineups": "observed historical position orders", "actual_opponent_positions": "historical distribution; all 24 permutations if unseen"}, "data_quality": {"scenario_variants": len(scenarios), "own_orders_evaluated": 24, "runtime_seconds": round(elapsed,4), "runtime_data_source": "targeted-analysis-cache-with-tolerant-id-resolution"}}
