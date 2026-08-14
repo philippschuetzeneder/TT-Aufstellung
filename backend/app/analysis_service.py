@@ -7,20 +7,39 @@ import time
 from sqlalchemy import text, bindparam
 from .db import SessionLocal
 
-# A team match always consists of exactly 10 games:
-#   8 singles: every player plays exactly twice
-#   2 doubles
-# Therefore 8:0 and 8:1 are impossible; 10:0 and 9:1 are possible.
-SINGLE_GAMES = 8
-TOTAL_GAMES = 10
-WIN_TARGET = 6  # team wins iff it wins at least 6 of the 10 games; 5:5 is a draw
+# Match format:
+# - Games 1-10 are ALWAYS played.
+# - Games 1-4: each player plays one singles.
+# - Game 5: doubles (two strongest together).
+# - Games 6-9: each player plays their second singles.
+# - Game 10: doubles (two weakest together).
+# - If the match is not decided after game 10, games 11-14 are the
+#   third singles round (one singles per player).
+#
+# Stopping/result rule:
+# - Normally the match ends as soon as one team reaches 8 wins.
+# - 8:0 and 8:1 are NOT final results: play continues so that the
+#   exceptional 9:1 or 10:0 result can occur.
+# - Once a non-shutout score reaches 8 wins, the match is decided.
+# - If all 14 games are needed and the score is 7:7, it is a draw.
+# - Therefore the relevant final results include 8:2 ... 8:6, 9:1,
+#   10:0 and 7:7 (and their mirrored losses).
+SINGLE_GAMES = 12
+DOUBLE_GAMES = 2
+TOTAL_GAMES = 14
+WIN_TARGET = 8
 MAX_ANALYSIS_SECONDS = 5.0
 
-# Fixed singles order.  Every player appears exactly twice:
-# 1) 1-v-1, 2) 2-v-2, 3) 3-v-3, 4) 4-v-4,
-# 5) 1-v-2, 6) 2-v-1, 7) 3-v-4, 8) 4-v-3.
-SINGLES_SCHEDULE = ((0, 0), (1, 1), (2, 2), (3, 3),
-                    (0, 1), (1, 0), (2, 3), (3, 2))
+# Singles:
+# Games 1-4: first singles round.
+# Games 6-9: second singles round.
+# Games 11-14: third singles round.
+# Each player therefore plays exactly three singles.
+SINGLES_SCHEDULE = (
+    (0, 0), (1, 1), (2, 2), (3, 3),
+    (0, 1), (1, 0), (2, 3), (3, 2),
+    (0, 0), (1, 1), (2, 2), (3, 3),
+)
 
 
 def _strength(wins, games):
@@ -50,21 +69,89 @@ def _doubles_pairs(order, stats):
     return (ranked[0], ranked[1]), (ranked[2], ranked[3])
 
 
+def _is_terminal_after_game(game_number, wins, losses):
+    """Whether the match has ended after this game.
+
+    Games are 1-based. The first ten games are always played.
+    After game 10, normal first-to-8 stopping applies, with the two
+    special shutout paths 8:0/8:1 -> 9:1 or 10:0.
+    """
+    if game_number < 10:
+        return False
+
+    if game_number == TOTAL_GAMES:
+        return True
+
+    # Special continuation for the shutout paths.  At 8:0 the match
+    # must continue; at 8:1 it must continue one more game; at 9:0 it
+    # must continue one more game so that 9:1 or 10:0 can result.
+    if wins >= WIN_TARGET:
+        if wins == 8 and losses <= 1:
+            return False
+        if wins == 9 and losses == 0:
+            return False
+        return True
+
+    if losses >= WIN_TARGET:
+        if losses == 8 and wins <= 1:
+            return False
+        if losses == 9 and wins == 0:
+            return False
+        return True
+
+    return False
+
+
 def _team_result_probabilities(probs):
-    """Return P(win), P(draw), P(loss) for exactly ten independent game probabilities."""
+    """Return P(win), P(draw), P(loss) under the real 14-game stop rule.
+
+    The first 10 games are mandatory. After that the match stops when
+    the rules above are satisfied. A 7:7 result after game 14 is a draw.
+    """
     if len(probs) != TOTAL_GAMES:
         raise ValueError(f'expected {TOTAL_GAMES} game probabilities, got {len(probs)}')
-    distribution = [1.0]
-    for p in probs:
-        nxt = [0.0] * (len(distribution) + 1)
-        for wins, mass in enumerate(distribution):
-            nxt[wins] += mass * (1.0 - p)
-            nxt[wins + 1] += mass * p
-        distribution = nxt
-    draw = distribution[5]
-    win = sum(distribution[WIN_TARGET:])
-    loss = sum(distribution[:5])
-    return win, draw, loss
+
+    # State is (own_wins, opponent_wins) -> probability mass.
+    states = {(0, 0): 1.0}
+    terminal_win = terminal_draw = terminal_loss = 0.0
+
+    for game_index, p in enumerate(probs, start=1):
+        next_states = defaultdict(float)
+        for (wins, losses), mass in states.items():
+            # Own team wins this game.
+            nw, nl = wins + 1, losses
+            mass_w = mass * p
+            if _is_terminal_after_game(game_index, nw, nl):
+                terminal_win += mass_w
+            else:
+                next_states[(nw, nl)] += mass_w
+
+            # Own team loses this game.
+            nw, nl = wins, losses + 1
+            mass_l = mass * (1.0 - p)
+            if _is_terminal_after_game(game_index, nw, nl):
+                if game_index == TOTAL_GAMES and nw == nl == 7:
+                    terminal_draw += mass_l
+                else:
+                    terminal_loss += mass_l
+            else:
+                next_states[(nw, nl)] += mass_l
+
+        states = next_states
+
+    # At game 14 all non-terminal states are necessarily 7:7, but keep
+    # this explicit so the rule cannot silently change later.
+    for (wins, losses), mass in states.items():
+        if wins == losses == 7:
+            terminal_draw += mass
+        elif wins >= WIN_TARGET:
+            terminal_win += mass
+        elif losses >= WIN_TARGET:
+            terminal_loss += mass
+        else:
+            raise RuntimeError(f'unresolved match state after game 14: {wins}:{losses}')
+
+    return terminal_win, terminal_draw, terminal_loss
 
 
 def _position_index(position):
@@ -230,7 +317,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
                 _pair_probability(*own_doubles[0], *opp_doubles[0], stats),
                 _pair_probability(*own_doubles[1], *opp_doubles[1], stats),
             ]
-            win, draw, loss = _team_result_probabilities(singles + doubles)
+            win, draw, loss = _team_result_probabilities(singles[:4] + doubles[:1] + singles[4:8] + doubles[1:] + singles[8:])
             expected_win += scenario_probability * win
             expected_draw += scenario_probability * draw
             expected_loss += scenario_probability * loss
@@ -261,14 +348,16 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         'opponent_predictions': opponent_predictions,
         'most_likely_opponent': opponent_predictions[0] if opponent_predictions else None,
         'model': {
-            'version': 'strength-h2h-doubles-v21-10-games',
+            'version': 'strength-h2h-doubles-v22-14-games-stop-rule',
             'win_target': WIN_TARGET,
             'single_games': SINGLE_GAMES,
-            'doubles_games': 2,
+            'doubles_games': DOUBLE_GAMES,
             'total_games': TOTAL_GAMES,
-            'draw_possible': True,
-            'singles_schedule': '1-1, 2-2, 3-3, 4-4, 1-2, 2-1, 3-4, 4-3',
-            'doubles_pairing': 'two strongest together; two weakest together',
+            'mandatory_games': 10,
+            'draw_score': '7:7',
+            'special_results': ['9:1', '10:0'],
+            'singles_schedule': '1-1, 2-2, 3-3, 4-4, D, 1-2, 2-1, 3-4, 4-3, D, 1-1, 2-2, 3-3, 4-4',
+            'doubles_pairing': 'game 5: two strongest together; game 10: two weakest together',
             'opponent_lineups': 'historical four-player position orders; scoped raw fallback',
             'player_stats': 'targeted raw XTTV stats for relevant IDs',
         },
