@@ -42,13 +42,60 @@ def _team_win_probability(probs):
     return sum(distribution[WIN_TARGET:])
 
 
-def _load_cache(own, opponent_team, actual):
-    """One connection and only three tiny cache-table queries.
+def _load_targeted_raw_stats(db, ids, stats, names, matchups):
+    """Fallback for a cold/incomplete analysis cache.
 
-    Deliberately does NOT call ensure_analysis_cache(): an analysis request must
-    never start or wait for a full cache rebuild. If the cache is unavailable,
-    return immediately with a clear error.
+    Only the selected 4 players and the relevant opponent players are queried.
+    This is deliberately a small, indexed query and never rebuilds the cache.
     """
+    missing_ids = [str(x) for x in ids if str(x) not in stats]
+    if not missing_ids:
+        return
+
+    rows = db.execute(text("""
+        SELECT p.external_player_id AS player_id, max(p.name) AS player_name,
+               count(g.id) FILTER (WHERE g.id IS NOT NULL) AS games,
+               count(g.id) FILTER (
+                   WHERE (p.side='home' AND split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int)
+                      OR (p.side='away' AND split_part(trim(g.result),':',2)::int > split_part(trim(g.result),':',1)::int)
+               ) AS wins
+        FROM match_players p
+        JOIN match_games g ON g.match_id=p.match_id
+             AND g.game_type='singles'
+             AND ((p.side='home' AND p.position=g.home_position) OR (p.side='away' AND p.position=g.away_position))
+        WHERE p.external_player_id::text = ANY(:ids)
+          AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+        GROUP BY p.external_player_id
+    """), {"ids": missing_ids}).mappings()
+    for r in rows:
+        pid = str(r["player_id"])
+        names[pid] = r["player_name"]
+        stats[pid] = (int(r["wins"] or 0), int(r["games"] or 0))
+
+    # Only direct matchups among the relevant players are needed.
+    rows = db.execute(text("""
+        WITH games AS (
+            SELECT hp.external_player_id::text AS home_id, hp.name AS home_name,
+                   ap.external_player_id::text AS away_id, ap.name AS away_name,
+                   CASE WHEN split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int THEN 1 ELSE 0 END AS home_win
+            FROM match_games g
+            JOIN match_players hp ON hp.match_id=g.match_id AND hp.side='home' AND hp.position=g.home_position
+            JOIN match_players ap ON ap.match_id=g.match_id AND ap.side='away' AND ap.position=g.away_position
+            WHERE g.game_type='singles'
+              AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+              AND hp.external_player_id::text = ANY(:ids)
+              AND ap.external_player_id::text = ANY(:ids)
+        )
+        SELECT home_id AS player_id, away_id AS opponent_id, sum(home_win) AS wins, count(*) AS games FROM games GROUP BY home_id,away_id
+        UNION ALL
+        SELECT away_id, home_id, sum(1-home_win), count(*) FROM games GROUP BY away_id,home_id
+    """), {"ids": [str(x) for x in ids]}).mappings()
+    for r in rows:
+        matchups[(str(r["player_id"]), str(r["opponent_id"]))] = (int(r["wins"] or 0), int(r["games"] or 0))
+
+
+def _load_cache(own, opponent_team, actual):
+    """One connection and only tiny targeted cache queries; never rebuilds the cache."""
     db = SessionLocal()
     try:
         db.execute(text("SET statement_timeout = '1000ms'"))
@@ -83,7 +130,7 @@ def _load_cache(own, opponent_team, actual):
             ids=list(relevant)
             stat_rows=db.execute(text("""
                 SELECT player_id,player_name,singles_wins,singles_games
-                FROM analysis_player_stats WHERE player_id = ANY(:ids)
+                FROM analysis_player_stats WHERE player_id::text = ANY(:ids)
             """), {"ids":ids}).mappings()
             stats={}; names={}
             for r in stat_rows:
@@ -91,9 +138,13 @@ def _load_cache(own, opponent_team, actual):
 
             matchup_rows=db.execute(text("""
                 SELECT player_id,opponent_id,wins,games FROM analysis_matchups
-                WHERE player_id = ANY(:ids) AND opponent_id = ANY(:ids)
+                WHERE player_id::text = ANY(:ids) AND opponent_id::text = ANY(:ids)
             """), {"ids":ids}).mappings()
             matchups={(str(r["player_id"]),str(r["opponent_id"])):(int(r["wins"]),int(r["games"])) for r in matchup_rows}
+
+            # A partially built/old cache must never make a valid player fail.
+            # Fill only missing relevant players directly from the indexed raw data.
+            _load_targeted_raw_stats(db, ids, stats, names, matchups)
             return names,stats,matchups,scenarios,source
         except Exception as exc:
             raise RuntimeError(f"Analysis-Cache nicht verfügbar: {type(exc).__name__}: {exc}") from exc
@@ -111,7 +162,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
 
     names,stats,matchups,scenarios,source=_load_cache(own,opponent_team,actual)
     missing=[p for p in own if p not in names]
-    if missing: raise ValueError(f"Spielerstatistik fehlt für XTTV-IDs: {', '.join(missing)}. Analysis-Cache bitte aktualisieren.")
+    if missing: raise ValueError(f"Spielerstatistik fehlt für XTTV-IDs: {', '.join(missing)}.")
     if not scenarios:
         return {"ok":True,"phase":"B" if actual is not None else "A","recommendations":[],"warnings":["Keine historische Viereraufstellung für diesen Gegner gefunden."]}
 
@@ -132,4 +183,4 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     evaluated.sort(key=lambda x:(-x["team_win_probability"],x["own_player_ids"]))
     for rank,item in enumerate(evaluated,1): item["rank"]=rank
     elapsed=time.monotonic()-started
-    return {"ok":True,"phase":"B" if actual is not None else "A","opponent_team":opponent_team,"own_player_ids":own,"opponent_set_source":source,"recommendation":evaluated[0],"recommendations":evaluated,"opponent_predictions":[{"player_ids":list(o),"players":[{"id":p,"name":names.get(p,p)} for p in o],"probability":p} for p,o in scenarios],"model":{"version":"strength-h2h-doubles-v11-fast-cache","win_target":WIN_TARGET,"single_games":SINGLE_GAMES,"doubles_games":2,"opponent_lineups":"observed historical position orders","actual_opponent_positions":"historical distribution; all 24 permutations if unseen"},"data_quality":{"scenario_variants":len(scenarios),"own_orders_evaluated":24,"runtime_seconds":round(elapsed,4),"runtime_data_source":"targeted-analysis-cache"}}
+    return {"ok":True,"phase":"B" if actual is not None else "A","opponent_team":opponent_team,"own_player_ids":own,"opponent_set_source":source,"recommendation":evaluated[0],"recommendations":evaluated,"opponent_predictions":[{"player_ids":list(o),"players":[{"id":p,"name":names.get(p,p)} for p in o],"probability":p} for p,o in scenarios],"model":{"version":"strength-h2h-doubles-v12-targeted-fallback","win_target":WIN_TARGET,"single_games":SINGLE_GAMES,"doubles_games":2,"opponent_lineups":"observed historical position orders","actual_opponent_positions":"historical distribution; all 24 permutations if unseen"},"data_quality":{"scenario_variants":len(scenarios),"own_orders_evaluated":24,"runtime_seconds":round(elapsed,4),"runtime_data_source":"targeted-analysis-cache-with-raw-fallback"}}
