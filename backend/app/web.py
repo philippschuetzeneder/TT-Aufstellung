@@ -18,6 +18,7 @@ from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
 from .rc_matching import dry_run as rc_matching_dry_run
 from .rc_index import import_index as rc_index_import, debug_search as rc_index_debug_search
+from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -98,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
                 try: limit=min(max(int(query.get("limit",["5000"])[0]),1),10000); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
                 return self.send_json(rebuild_player_master(limit=limit,offset=offset))
+            if parsed.path=="/api/rc/events/debug":
+                raw=query.get("event_id",[""])[0].strip()
+                if not raw.isdigit(): return self.send_json({"ok":False,"error":"event_id must be numeric"},400)
+                return self.send_json(rc_event_debug(int(raw)))
             if parsed.path=="/api/rc/index/debug-search":
                 surname=query.get("surname",[""])[0].strip()
                 if not surname:return self.send_json({"ok":False,"error":"surname is required"},400)
