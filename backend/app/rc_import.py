@@ -34,14 +34,25 @@ def _parse_rating(value: str) -> tuple[float, float] | None:
 def parse_player_history(html: str, *, cutoff: date | None = None, today: date | None = None) -> dict:
     """Parse RC current rating and event-end ratings from the public history page."""
     soup = BeautifulSoup(html, "html.parser")
-    text = " ".join(soup.stripped_strings)
-    title_match = re.search(r"#?\s*([^#]+?)\s+(\d+)\s*[±+/-]\s*(\d+)", text)
-    if not title_match:
-        raise ValueError("Could not find current RC rating on PlayerHistory page")
+    heading = soup.find("h1")
+    name = " ".join(heading.stripped_strings) if heading else None
+    if not name:
+        raise ValueError("Could not find player name on PlayerHistory page")
 
-    name = title_match.group(1).strip()
-    current_rating = float(title_match.group(2))
-    current_deviation = float(title_match.group(3))
+    current_rating = current_deviation = None
+    for node in soup.find_all(string=re.compile(r"±|\\+/-")):
+        parsed = _parse_rating(node)
+        if parsed:
+            current_rating, current_deviation = parsed
+            break
+    if current_rating is None:
+        text = " ".join(soup.stripped_strings)
+        match = re.search(r"(\d+)\s*[±+/-]\s*(\d+)", text)
+        if not match:
+            raise ValueError("Could not find current RC rating on PlayerHistory page")
+        current_rating = float(match.group(1))
+        current_deviation = float(match.group(2))
+
     today = today or date.today()
     cutoff = cutoff or (today - timedelta(days=3 * 365 + 1))
 
@@ -83,12 +94,7 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
 
 
 def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cutoff: date | None = None) -> dict:
-    """Import the current RC value plus three years of historical observations.
-
-    The importer never calculates or modifies RC. It stores the published
-    rating and uncertainty verbatim. The analysis layer can continue using only
-    the current rc_rating until uncertainty/trend are explicitly enabled.
-    """
+    """Import the current RC value plus three years of historical observations."""
     create_all()
     html, content_type = fetch_player_history(rc_player_id)
     parsed = parse_player_history(html, cutoff=cutoff)
@@ -112,11 +118,7 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cu
         if player is None and xttv_player_id:
             player = session.query(XttvPlayer).filter_by(external_player_id=xttv_player_id).one_or_none()
         if player is None:
-            player = (
-                session.query(XttvPlayer)
-                .filter(XttvPlayer.name.ilike(parsed["name"]))
-                .one_or_none()
-            )
+            player = session.query(XttvPlayer).filter(XttvPlayer.name.ilike(parsed["name"])).one_or_none()
         if player is None:
             raise ValueError(
                 f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}). "
@@ -128,11 +130,9 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cu
         saved = 0
         for observation in observations:
             observed_at = datetime.fromisoformat(observation["observed_at"])
-            snapshot = (
-                session.query(PlayerRatingSnapshot)
-                .filter_by(player_id=player.id, observed_at=observed_at, source="ratingscentral")
-                .one_or_none()
-            )
+            snapshot = session.query(PlayerRatingSnapshot).filter_by(
+                player_id=player.id, observed_at=observed_at, source="ratingscentral"
+            ).one_or_none()
             if snapshot is None:
                 snapshot = PlayerRatingSnapshot(
                     player_id=player.id,
