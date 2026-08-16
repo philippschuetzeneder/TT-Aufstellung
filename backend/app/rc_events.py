@@ -67,9 +67,11 @@ def _debug_one(event_id: int) -> dict:
 
 
 def debug_event(event_id: int) -> dict:
-    # Backwards-compatible batch test: event IDs >= 1,000,000 encode
-    # "start event" as 1,000,000 + start. This lets the existing HTTP route
-    # exercise the batch importer without changing the running web server.
+    # Compatibility test mode: 1,000,000 + start means batch debug.
+    # Import mode: 2,000,000 + start means persist a batch of 10 events.
+    if event_id >= 2_000_000:
+        from .rc_event_import import import_event_batch
+        return import_event_batch(event_id - 2_000_000, 10)
     if event_id >= 1_000_000:
         start = event_id - 1_000_000
         count = 10
@@ -79,11 +81,5 @@ def debug_event(event_id: int) -> dict:
                 results.append(_debug_one(current))
             except Exception as exc:
                 results.append({"ok": False, "event_id": current, "error": f"{type(exc).__name__}: {exc}"})
-        return {
-            "ok": True,
-            "mode": "batch_debug",
-            "start": start,
-            "count": count,
-            "results": results,
-        }
+        return {"ok": True, "mode": "batch_debug", "start": start, "count": count, "results": results}
     return _debug_one(event_id)
