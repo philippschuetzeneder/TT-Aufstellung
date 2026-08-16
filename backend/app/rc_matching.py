@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 
 from .db import SessionLocal, create_all
 from .models import XttvPlayer
+from .rc_index import local_candidates
 
 RC_BASE = "https://www.ratingscentral.com"
 USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral player lookup)"
@@ -21,6 +22,7 @@ def clean_text(value: str) -> str:
 
 def norm_tokens(value: str) -> tuple[str, ...]:
     value = clean_text(value).casefold().replace(",", " ")
+    value = value.replace("ä", "a").replace("ö", "o").replace("ü", "u").replace("ß", "ss")
     value = re.sub(r"[^\w\s-]", " ", value, flags=re.UNICODE)
     return tuple(sorted(t for t in value.split() if t))
 
@@ -37,7 +39,21 @@ def score_name(xttv_name: str, rc_name: str) -> int:
 
 
 def search_rc(name: str, limit: int = 20) -> list[dict]:
-    params = {"Name": name, "PlayerSport": "Table Tennis"}
+    # Prefer the persistent RC index. If it is not populated yet, use the
+    # documented partial-name search as a fallback; importantly, RC expects
+    # the surname prefix including the comma (e.g. "Wittinghofer,").
+    indexed = local_candidates(name, limit=100)
+    if indexed:
+        candidates = []
+        for c in indexed:
+            score = score_name(name, c.get("name", ""))
+            if score:
+                candidates.append({**c, "score": score})
+        return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
+
+    parts = [p for p in re.split(r"[\s,]+", clean_text(name)) if p]
+    surname = parts[0] if parts else name
+    params = {"Name": f"{surname},", "PlayerSport": "Table Tennis"}
     url = f"{RC_BASE}/PlayerSearch.php?{urlencode(params)}"
     req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
     with urlopen(req, timeout=15) as response:
@@ -56,7 +72,6 @@ def search_rc(name: str, limit: int = 20) -> list[dict]:
                 break
         if rc_id is None:
             continue
-        # Player search result tables normally expose ID, Name, and rating columns.
         name_cell = next((c for c in cells if "," in c), None)
         if not name_cell:
             continue
