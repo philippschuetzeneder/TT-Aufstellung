@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import unicodedata
 from datetime import date, datetime, timedelta
 from urllib.request import Request, urlopen
 
@@ -15,7 +16,6 @@ USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral history import)"
 
 _RATING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[±+/-]\s*(\d+(?:\.\d+)?)\s*$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
-_CURRENT_SUFFIX_RE = re.compile(r"\s*\d+(?:\.\d+)?\s*[±+/-]\s*\d+(?:\.\d+)?\s*$")
 
 
 def fetch_player_history(rc_player_id: int) -> tuple[str, str]:
@@ -32,36 +32,39 @@ def _parse_rating(value: str) -> tuple[float, float] | None:
     return float(match.group(1)), float(match.group(2))
 
 
-def _clean_player_name(value: str) -> str:
-    """Remove RC's current-rating suffix and invisible Unicode spacing characters."""
-    value = value.replace("\u200b", "").replace("\ufeff", "")
-    value = _CURRENT_SUFFIX_RE.sub("", value)
-    return " ".join(value.split()).strip()
+def _normalized_name_tokens(value: str) -> tuple[str, ...]:
+    """Normalize names for matching RC 'Surname, Firstname' to XTTV variants."""
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = value.replace(",", " ")
+    value = re.sub(r"[^\w\s-]", " ", value, flags=re.UNICODE)
+    return tuple(sorted(token for token in value.split() if token))
 
 
-def _find_xttv_player(session, rc_player_id: int, rc_name: str, xttv_player_id: str | None = None):
+def _find_xttv_player(session, rc_player_id: int, rc_name: str, xttv_player_id: str | None):
     player = session.query(XttvPlayer).filter_by(rc_player_id=rc_player_id).one_or_none()
     if player is not None:
         return player
     if xttv_player_id:
-        player = session.query(XttvPlayer).filter_by(external_player_id=xttv_player_id).one_or_none()
-        if player is not None:
-            return player
+        return session.query(XttvPlayer).filter_by(external_player_id=xttv_player_id).one_or_none()
 
-    clean_name = _clean_player_name(rc_name)
-    player = session.query(XttvPlayer).filter(XttvPlayer.name.ilike(clean_name)).one_or_none()
+    # First try the exact spelling, then compare normalized name tokens so
+    # 'Schützeneder, Philipp' matches 'Philipp Schützeneder'.
+    player = session.query(XttvPlayer).filter(XttvPlayer.name.ilike(rc_name)).one_or_none()
     if player is not None:
         return player
 
-    # XTTV/RC may differ only in Unicode punctuation/spacing/case. Compare a
-    # normalized name in Python before giving up, while refusing ambiguous matches.
-    def norm(name: str) -> str:
-        return " ".join(name.replace("\u200b", "").replace("\ufeff", "").split()).casefold()
-
+    rc_tokens = _normalized_name_tokens(rc_name)
+    if not rc_tokens:
+        return None
     candidates = session.query(XttvPlayer).all()
-    matches = [candidate for candidate in candidates if norm(candidate.name) == norm(clean_name)]
+    matches = [candidate for candidate in candidates if _normalized_name_tokens(candidate.name) == rc_tokens]
     if len(matches) == 1:
         return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous XTTV player mapping for RC {rc_player_id} ({rc_name}): "
+            + ", ".join(f"{candidate.external_player_id}:{candidate.name}" for candidate in matches)
+        )
     return None
 
 
@@ -69,7 +72,7 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
     """Parse RC current rating and event-end ratings from the public history page."""
     soup = BeautifulSoup(html, "html.parser")
     heading = soup.find("h1")
-    name = _clean_player_name(" ".join(heading.stripped_strings)) if heading else None
+    name = " ".join(heading.stripped_strings) if heading else None
     if not name:
         raise ValueError("Could not find player name on PlayerHistory page")
 
