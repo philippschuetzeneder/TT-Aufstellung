@@ -16,7 +16,6 @@ def _database_url() -> str:
 
 
 DATABASE_URL = _database_url()
-# Never let an analysis request wait indefinitely for a database connection.
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -44,6 +43,11 @@ def create_all() -> None:
                 connection.execute(text(
                     "ALTER TABLE match_players ADD CONSTRAINT uq_match_player UNIQUE (match_id, external_player_id, side)"
                 ))
+            # create_all does not alter existing tables, so keep the small MVP
+            # schema migration here until Alembic is introduced.
+            connection.execute(text("ALTER TABLE xttv_players ADD COLUMN IF NOT EXISTS rc_player_id INTEGER"))
+            connection.execute(text("ALTER TABLE player_rating_snapshots ADD COLUMN IF NOT EXISTS rc_deviation DOUBLE PRECISION"))
+            connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_xttv_players_rc_player_id ON xttv_players (rc_player_id) WHERE rc_player_id IS NOT NULL"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_xttv_matches_home_team ON xttv_matches (home_team)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_xttv_matches_away_team ON xttv_matches (away_team)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_match_players_external_id ON match_players (external_player_id)"))
