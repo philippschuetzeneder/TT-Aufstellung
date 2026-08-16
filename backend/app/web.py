@@ -3,15 +3,13 @@ import json, os, socket, urllib.request, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
-from sqlalchemy import or_
 from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
 from .analysis_cache import start_background_refresh, refresh_analysis_cache
 from .player_analysis_service import list_players, list_teams
-from .db import database_health, SessionLocal
+from .db import database_health
 from .db_routes import get_match
-from .models import XttvPlayer
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
@@ -41,6 +39,8 @@ def _norm(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value)
 
 def find_xttv_players(name: str | None, team: str | None):
+    from .db import SessionLocal
+    from .models import XttvPlayer
     with SessionLocal() as session:
         rows = session.query(XttvPlayer).order_by(XttvPlayer.name).all()
     normalized_name = _norm(name or "")
@@ -48,18 +48,14 @@ def find_xttv_players(name: str | None, team: str | None):
     normalized_team = _norm(team or "")
     matches=[]
     for r in rows:
-        candidate_name = _norm(r.name)
-        candidate_club = _norm(r.club or "")
-        score = 0
+        candidate_name = _norm(r.name); candidate_club = _norm(r.club or ""); score = 0
         if normalized_name and candidate_name == normalized_name: score += 100
         elif normalized_name and all(t in candidate_name for t in name_tokens): score += 60
         if normalized_team:
             if normalized_team in candidate_club: score += 30
             elif normalized_team == "tragwein" and ("tragwein" in candidate_club or "kamig" in candidate_club or "trak" in candidate_club): score += 30
-        if score:
-            matches.append({"id":r.id,"external_player_id":r.external_player_id,"name":r.name,"club":r.club,"rc_player_id":r.rc_player_id,"score":score})
-    matches.sort(key=lambda x:(-x["score"],x["name"]))
-    return {"ok":True,"query":{"name":name,"team":team},"count":len(matches),"matches":matches[:20]}
+        if score: matches.append({"id":r.id,"external_player_id":r.external_player_id,"name":r.name,"club":r.club,"rc_player_id":r.rc_player_id,"score":score})
+    matches.sort(key=lambda x:(-x["score"],x["name"])); return {"ok":True,"query":{"name":name,"team":team},"count":len(matches),"matches":matches[:20]}
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
@@ -86,8 +82,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
             if parsed.path=="/api/analysis":
-                own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]
-                opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
+                own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]; opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
                 return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0])))
             if parsed.path=="/api/xttv/debug": return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch": return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
@@ -101,13 +96,12 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/rc/import":
                 raw_rc_id=query.get("player_id",[""])[0].strip()
                 if not raw_rc_id or not raw_rc_id.isdigit(): return self.send_json({"ok":False,"error":"player_id must be a numeric RatingsCentral player ID"},400)
-                return self.send_json(import_rc_player(int(raw_rc_id)))
+                return self.send_json(import_rc_player(int(raw_rc_id), xttv_player_id=query.get("xttv_player_id",[None])[0], xttv_external_player_id=query.get("xttv_external_player_id",[None])[0], xttv_name=query.get("xttv_name",[None])[0], xttv_club=query.get("xttv_club",[None])[0]))
         except Exception as exc: return self.send_json({"ok":False,"error":f"{type(exc).__name__}: {exc}"},500)
         rel="index.html" if parsed.path in ("","/") else parsed.path.lstrip("/"); target=(ROOT/rel).resolve()
         if not str(target).startswith(str(ROOT.resolve())) or not target.is_file(): return self.send_error(404)
         content=target.read_bytes(); types={".html":"text/html",".css":"text/css",".mjs":"text/javascript",".js":"text/javascript"}; self.send_response(200); self.send_header("Content-Type",types.get(target.suffix,"application/octet-stream")+"; charset=utf-8"); self.send_header("Content-Length",str(len(content))); self.end_headers(); self.wfile.write(content)
 
 def main():
-    start_background_refresh()
-    ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","10000"))),Handler).serve_forever()
+    start_background_refresh(); ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","10000"))),Handler).serve_forever()
 if __name__=="__main__": main()
