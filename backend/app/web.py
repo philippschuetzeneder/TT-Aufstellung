@@ -9,13 +9,14 @@ from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
 from .analysis_cache import start_background_refresh, refresh_analysis_cache
 from .player_analysis_service import list_players, list_teams
-from .db import database_health
+from .db import database_health, SessionLocal
 from .db_routes import get_match
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history
+from .models import XttvPlayer, PlayerRatingSnapshot
 ROOT=Path(__file__).resolve().parents[2]
 
 def http_fetch(url,timeout=20):
@@ -39,8 +40,6 @@ def _norm(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value)
 
 def find_xttv_players(name: str | None, team: str | None):
-    from .db import SessionLocal
-    from .models import XttvPlayer
     with SessionLocal() as session: rows = session.query(XttvPlayer).order_by(XttvPlayer.name).all()
     normalized_name = _norm(name or ""); name_tokens = [_norm(t) for t in re.split(r"[\s,]+", name or "") if _norm(t)]; normalized_team = _norm(team or ""); matches=[]
     for r in rows:
@@ -54,9 +53,7 @@ def find_xttv_players(name: str | None, team: str | None):
     matches.sort(key=lambda x:(-x["score"],x["name"])); return {"ok":True,"query":{"name":name,"team":team},"count":len(matches),"matches":matches[:20]}
 
 def rc_history_debug(player_id: int):
-    html, content_type = fetch_player_history(player_id)
-    soup = BeautifulSoup(html, "html.parser")
-    tables=[]
+    html, content_type = fetch_player_history(player_id); soup = BeautifulSoup(html, "html.parser"); tables=[]
     for ti, table in enumerate(soup.find_all("table")):
         rows=[]
         for row in table.find_all("tr")[:25]:
@@ -67,6 +64,30 @@ def rc_history_debug(player_id: int):
     try: parsed=parse_player_history(html)
     except Exception as exc: parse_error=f"{type(exc).__name__}: {exc}"
     return {"ok":True,"rc_player_id":player_id,"content_type":content_type,"html_bytes":len(html.encode("utf-8")),"table_count":len(tables),"tables":tables,"parsed":parsed,"parse_error":parse_error}
+
+def rc_snapshot_check(player_id: int):
+    with SessionLocal() as session:
+        player=session.query(XttvPlayer).filter_by(rc_player_id=player_id).one_or_none()
+        if player is None:
+            return {"ok":False,"error":"No XTTV player mapped to RC player", "rc_player_id":player_id}
+        snapshots=session.query(PlayerRatingSnapshot).filter_by(player_id=player.id,source="ratingscentral").order_by(PlayerRatingSnapshot.observed_at.asc()).all()
+        dates=[s.observed_at.date().isoformat() for s in snapshots]
+        ratings=[s.rc_rating for s in snapshots]
+        deviations=[s.rc_deviation for s in snapshots]
+        unique_keys=len(set((s.observed_at,s.source) for s in snapshots))
+        return {
+            "ok":True,"player":{"db_id":player.id,"external_player_id":player.external_player_id,"rc_player_id":player.rc_player_id,"name":player.name,"club":player.club},
+            "snapshot_count":len(snapshots),
+            "unique_observation_keys":unique_keys,
+            "first_observed_at":dates[0] if dates else None,
+            "last_observed_at":dates[-1] if dates else None,
+            "min_rating":min(ratings) if ratings else None,
+            "max_rating":max(ratings) if ratings else None,
+            "missing_deviation_count":sum(1 for v in deviations if v is None),
+            "duplicate_dates":sorted({d for d in dates if dates.count(d)>1}),
+            "first_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[:5]],
+            "last_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[-5:]],
+        }
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
@@ -93,6 +114,10 @@ class Handler(BaseHTTPRequestHandler):
                 raw=query.get("player_id",[""])[0].strip()
                 if not raw.isdigit(): return self.send_json({"ok":False,"error":"player_id must be numeric"},400)
                 return self.send_json(rc_history_debug(int(raw)))
+            if parsed.path=="/api/rc/check":
+                raw=query.get("player_id",[""])[0].strip()
+                if not raw.isdigit(): return self.send_json({"ok":False,"error":"player_id must be numeric"},400)
+                return self.send_json(rc_snapshot_check(int(raw)))
             team_prefix="/api/teams/"
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
