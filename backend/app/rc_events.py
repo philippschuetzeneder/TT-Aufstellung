@@ -21,8 +21,6 @@ def parse_event_summary(html: str) -> dict:
     text = soup.get_text("\n", strip=True)
     players = {}
 
-    # Summary reports contain rows with: RC ID | Name | Initial ±dev | change | Final ±dev.
-    # Parse table rows first, then use a regex fallback for RC's occasionally changing markup.
     for row in soup.find_all("tr"):
         cells = [" ".join(c.stripped_strings) for c in row.find_all(["th", "td"])]
         if len(cells) < 4:
@@ -53,7 +51,7 @@ def parse_event_summary(html: str) -> dict:
     return {"players": list(players.values())}
 
 
-def debug_event(event_id: int) -> dict:
+def _debug_one(event_id: int) -> dict:
     html, url = fetch_event_summary(event_id)
     parsed = parse_event_summary(html)
     sample = [p for p in parsed["players"] if "Wittinghofer" in p["name"]]
@@ -66,3 +64,26 @@ def debug_event(event_id: int) -> dict:
         "wittinghofer_matches": sample,
         "first_5": parsed["players"][:5],
     }
+
+
+def debug_event(event_id: int) -> dict:
+    # Backwards-compatible batch test: event IDs >= 1,000,000 encode
+    # "start event" as 1,000,000 + start. This lets the existing HTTP route
+    # exercise the batch importer without changing the running web server.
+    if event_id >= 1_000_000:
+        start = event_id - 1_000_000
+        count = 10
+        results = []
+        for current in range(start, start - count, -1):
+            try:
+                results.append(_debug_one(current))
+            except Exception as exc:
+                results.append({"ok": False, "event_id": current, "error": f"{type(exc).__name__}: {exc}"})
+        return {
+            "ok": True,
+            "mode": "batch_debug",
+            "start": start,
+            "count": count,
+            "results": results,
+        }
+    return _debug_one(event_id)
