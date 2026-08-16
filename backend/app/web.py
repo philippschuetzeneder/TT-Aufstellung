@@ -16,6 +16,7 @@ from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
+from .rc_matching import dry_run as rc_matching_dry_run
 from .models import XttvPlayer, PlayerRatingSnapshot
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -101,6 +102,10 @@ class Handler(BaseHTTPRequestHandler):
                 raw=query.get("player_id",[""])[0].strip()
                 if not raw.isdigit(): return self.send_json({"ok":False,"error":"player_id must be numeric"},400)
                 return self.send_json(rc_snapshot_check(int(raw)))
+            if parsed.path=="/api/rc/match-dry-run":
+                try: limit=min(max(int(query.get("limit",["30"])[0]),1),100); offset=max(int(query.get("offset",["0"])[0]),0)
+                except ValueError: return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
+                return self.send_json(rc_matching_dry_run(limit=limit,offset=offset))
             if parsed.path=="/api/rc/bulk":
                 try: limit=min(max(int(query.get("limit",["30"])[0]),1),100); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError: return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
