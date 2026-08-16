@@ -22,7 +22,8 @@ engine = create_engine(
     pool_timeout=2,
     connect_args={"connect_timeout": 2},
 )
-SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+# Keep autoflush enabled so upsert lookups see rows added earlier in the same transaction.
+SessionLocal = sessionmaker(bind=engine, autoflush=True, expire_on_commit=False)
 
 
 class Base(DeclarativeBase):
@@ -43,8 +44,6 @@ def create_all() -> None:
                 connection.execute(text(
                     "ALTER TABLE match_players ADD CONSTRAINT uq_match_player UNIQUE (match_id, external_player_id, side)"
                 ))
-            # create_all does not alter existing tables, so keep the small MVP
-            # schema migration here until Alembic is introduced.
             connection.execute(text("ALTER TABLE xttv_players ADD COLUMN IF NOT EXISTS rc_player_id INTEGER"))
             connection.execute(text("ALTER TABLE player_rating_snapshots ADD COLUMN IF NOT EXISTS rc_deviation DOUBLE PRECISION"))
             connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_xttv_players_rc_player_id ON xttv_players (rc_player_id) WHERE rc_player_id IS NOT NULL"))
