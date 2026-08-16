@@ -3,6 +3,7 @@ import json, os, socket, urllib.request, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from bs4 import BeautifulSoup
 from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
@@ -14,7 +15,7 @@ from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
 from .xttv_parser import parse_match
-from .rc_import import import_rc_player
+from .rc_import import import_rc_player, fetch_player_history, parse_player_history
 ROOT=Path(__file__).resolve().parents[2]
 
 def http_fetch(url,timeout=20):
@@ -34,19 +35,14 @@ def debug_xttv(meid):
     result["direct_success"]=any(c.get("method")=="direct HTTPS" and c.get("ok") for c in result["checks"]); return result
 
 def _norm(value: str) -> str:
-    value = (value or "").lower()
-    value = value.replace("ä","a").replace("ö","o").replace("ü","u").replace("ß","ss")
+    value = (value or "").lower(); value = value.replace("ä","a").replace("ö","o").replace("ü","u").replace("ß","ss")
     return re.sub(r"[^a-z0-9]+", "", value)
 
 def find_xttv_players(name: str | None, team: str | None):
     from .db import SessionLocal
     from .models import XttvPlayer
-    with SessionLocal() as session:
-        rows = session.query(XttvPlayer).order_by(XttvPlayer.name).all()
-    normalized_name = _norm(name or "")
-    name_tokens = [_norm(t) for t in re.split(r"[\s,]+", name or "") if _norm(t)]
-    normalized_team = _norm(team or "")
-    matches=[]
+    with SessionLocal() as session: rows = session.query(XttvPlayer).order_by(XttvPlayer.name).all()
+    normalized_name = _norm(name or ""); name_tokens = [_norm(t) for t in re.split(r"[\s,]+", name or "") if _norm(t)]; normalized_team = _norm(team or ""); matches=[]
     for r in rows:
         candidate_name = _norm(r.name); candidate_club = _norm(r.club or ""); score = 0
         if normalized_name and candidate_name == normalized_name: score += 100
@@ -56,6 +52,21 @@ def find_xttv_players(name: str | None, team: str | None):
             elif normalized_team == "tragwein" and ("tragwein" in candidate_club or "kamig" in candidate_club or "trak" in candidate_club): score += 30
         if score: matches.append({"id":r.id,"external_player_id":r.external_player_id,"name":r.name,"club":r.club,"rc_player_id":r.rc_player_id,"score":score})
     matches.sort(key=lambda x:(-x["score"],x["name"])); return {"ok":True,"query":{"name":name,"team":team},"count":len(matches),"matches":matches[:20]}
+
+def rc_history_debug(player_id: int):
+    html, content_type = fetch_player_history(player_id)
+    soup = BeautifulSoup(html, "html.parser")
+    tables=[]
+    for ti, table in enumerate(soup.find_all("table")):
+        rows=[]
+        for row in table.find_all("tr")[:25]:
+            cells=[" ".join(cell.stripped_strings) for cell in row.find_all(["th","td"])]
+            if cells: rows.append(cells)
+        tables.append({"index":ti,"rows":rows})
+    parsed=None; parse_error=None
+    try: parsed=parse_player_history(html)
+    except Exception as exc: parse_error=f"{type(exc).__name__}: {exc}"
+    return {"ok":True,"rc_player_id":player_id,"content_type":content_type,"html_bytes":len(html.encode("utf-8")),"table_count":len(tables),"tables":tables,"parsed":parsed,"parse_error":parse_error}
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
@@ -78,6 +89,10 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/teams": return self.send_json(list_teams())
             if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0]))
             if parsed.path=="/api/xttv/player-find": return self.send_json(find_xttv_players(query.get("name",[None])[0], query.get("team",[None])[0]))
+            if parsed.path=="/api/rc/debug-history":
+                raw=query.get("player_id",[""])[0].strip()
+                if not raw.isdigit(): return self.send_json({"ok":False,"error":"player_id must be numeric"},400)
+                return self.send_json(rc_history_debug(int(raw)))
             team_prefix="/api/teams/"
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
