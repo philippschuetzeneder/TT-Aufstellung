@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, socket, urllib.request
+import json, os, socket, urllib.request, re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -35,21 +35,31 @@ def debug_xttv(meid):
     for label,candidate in [("direct HTTPS",url),("HTTP fallback",url.replace("https://","http://",1)),("www HTTPS",url.replace("https://oettv.xttv.at","https://www.oettv.xttv.at",1)),("legacy HTTPS",url.replace("https://oettv.xttv.at","https://xttv.oettv.info",1))]: result["checks"].append({"method":label,"url":candidate,**http_fetch(candidate)})
     result["direct_success"]=any(c.get("method")=="direct HTTPS" and c.get("ok") for c in result["checks"]); return result
 
+def _norm(value: str) -> str:
+    value = (value or "").lower()
+    value = value.replace("ä","a").replace("ö","o").replace("ü","u").replace("ß","ss")
+    return re.sub(r"[^a-z0-9]+", "", value)
+
 def find_xttv_players(name: str | None, team: str | None):
     with SessionLocal() as session:
-        query = session.query(XttvPlayer)
-        if name:
-            normalized = " ".join(name.strip().split())
-            parts = normalized.replace(",", " ").split()
-            if len(parts) >= 2:
-                first, last = parts[0], parts[-1]
-                query = query.filter(or_(XttvPlayer.name.ilike(f"%{normalized}%"), XttvPlayer.name.ilike(f"%{first}%{last}%"), XttvPlayer.name.ilike(f"%{last}%{first}%")))
-            else:
-                query = query.filter(XttvPlayer.name.ilike(f"%{normalized}%"))
-        if team:
-            query = query.filter(XttvPlayer.club.ilike(f"%{team.strip()}%"))
-        rows = query.order_by(XttvPlayer.name).limit(50).all()
-        return {"ok": True, "count": len(rows), "matches": [{"id": r.id, "external_player_id": r.external_player_id, "name": r.name, "club": r.club, "rc_player_id": r.rc_player_id} for r in rows]}
+        rows = session.query(XttvPlayer).order_by(XttvPlayer.name).all()
+    normalized_name = _norm(name or "")
+    name_tokens = [_norm(t) for t in re.split(r"[\s,]+", name or "") if _norm(t)]
+    normalized_team = _norm(team or "")
+    matches=[]
+    for r in rows:
+        candidate_name = _norm(r.name)
+        candidate_club = _norm(r.club or "")
+        score = 0
+        if normalized_name and candidate_name == normalized_name: score += 100
+        elif normalized_name and all(t in candidate_name for t in name_tokens): score += 60
+        if normalized_team:
+            if normalized_team in candidate_club: score += 30
+            elif normalized_team == "tragwein" and ("tragwein" in candidate_club or "kamig" in candidate_club or "trak" in candidate_club): score += 30
+        if score:
+            matches.append({"id":r.id,"external_player_id":r.external_player_id,"name":r.name,"club":r.club,"rc_player_id":r.rc_player_id,"score":score})
+    matches.sort(key=lambda x:(-x["score"],x["name"]))
+    return {"ok":True,"query":{"name":name,"team":team},"count":len(matches),"matches":matches[:20]}
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
