@@ -15,7 +15,7 @@ from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
 from .xttv_parser import parse_match
-from .rc_import import import_rc_player, fetch_player_history, parse_player_history
+from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
 from .models import XttvPlayer, PlayerRatingSnapshot
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -68,26 +68,9 @@ def rc_history_debug(player_id: int):
 def rc_snapshot_check(player_id: int):
     with SessionLocal() as session:
         player=session.query(XttvPlayer).filter_by(rc_player_id=player_id).one_or_none()
-        if player is None:
-            return {"ok":False,"error":"No XTTV player mapped to RC player", "rc_player_id":player_id}
-        snapshots=session.query(PlayerRatingSnapshot).filter_by(player_id=player.id,source="ratingscentral").order_by(PlayerRatingSnapshot.observed_at.asc()).all()
-        dates=[s.observed_at.date().isoformat() for s in snapshots]
-        ratings=[s.rc_rating for s in snapshots]
-        deviations=[s.rc_deviation for s in snapshots]
-        unique_keys=len(set((s.observed_at,s.source) for s in snapshots))
-        return {
-            "ok":True,"player":{"db_id":player.id,"external_player_id":player.external_player_id,"rc_player_id":player.rc_player_id,"name":player.name,"club":player.club},
-            "snapshot_count":len(snapshots),
-            "unique_observation_keys":unique_keys,
-            "first_observed_at":dates[0] if dates else None,
-            "last_observed_at":dates[-1] if dates else None,
-            "min_rating":min(ratings) if ratings else None,
-            "max_rating":max(ratings) if ratings else None,
-            "missing_deviation_count":sum(1 for v in deviations if v is None),
-            "duplicate_dates":sorted({d for d in dates if dates.count(d)>1}),
-            "first_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[:5]],
-            "last_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[-5:]],
-        }
+        if player is None: return {"ok":False,"error":"No XTTV player mapped to RC player", "rc_player_id":player_id}
+        snapshots=session.query(PlayerRatingSnapshot).filter_by(player_id=player.id,source="ratingscentral").order_by(PlayerRatingSnapshot.observed_at.asc()).all(); dates=[s.observed_at.date().isoformat() for s in snapshots]; ratings=[s.rc_rating for s in snapshots]; deviations=[s.rc_deviation for s in snapshots]; unique_keys=len(set((s.observed_at,s.source) for s in snapshots))
+        return {"ok":True,"player":{"db_id":player.id,"external_player_id":player.external_player_id,"rc_player_id":player.rc_player_id,"name":player.name,"club":player.club},"snapshot_count":len(snapshots),"unique_observation_keys":unique_keys,"first_observed_at":dates[0] if dates else None,"last_observed_at":dates[-1] if dates else None,"min_rating":min(ratings) if ratings else None,"max_rating":max(ratings) if ratings else None,"missing_deviation_count":sum(1 for v in deviations if v is None),"duplicate_dates":sorted({d for d in dates if dates.count(d)>1}),"first_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[:5]],"last_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[-5:]]}
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
@@ -118,6 +101,10 @@ class Handler(BaseHTTPRequestHandler):
                 raw=query.get("player_id",[""])[0].strip()
                 if not raw.isdigit(): return self.send_json({"ok":False,"error":"player_id must be numeric"},400)
                 return self.send_json(rc_snapshot_check(int(raw)))
+            if parsed.path=="/api/rc/bulk":
+                try: limit=min(max(int(query.get("limit",["30"])[0]),1),100); offset=max(int(query.get("offset",["0"])[0]),0)
+                except ValueError: return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
+                return self.send_json(bulk_import_rc(limit=limit,offset=offset))
             team_prefix="/api/teams/"
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
