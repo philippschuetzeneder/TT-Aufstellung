@@ -17,6 +17,7 @@ from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, impor
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
 from .rc_matching import dry_run as rc_matching_dry_run
+from .rc_index import import_index as rc_index_import
 from .models import XttvPlayer, PlayerRatingSnapshot
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -97,6 +98,10 @@ class Handler(BaseHTTPRequestHandler):
                 try: limit=min(max(int(query.get("limit",["5000"])[0]),1),10000); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
                 return self.send_json(rebuild_player_master(limit=limit,offset=offset))
+            if parsed.path=="/api/rc/index/import":
+                try: limit=min(max(int(query.get("limit",["30"])[0]),1),500); offset=max(int(query.get("offset",["0"])[0]),0); force=query.get("force",["0"])[0] in {"1","true","yes"}
+                except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
+                return self.send_json(rc_index_import(limit=limit,offset=offset,force=force))
             if parsed.path=="/api/rc/debug-history":
                 raw=query.get("player_id",[""])[0].strip()
                 if not raw.isdigit():return self.send_json({"ok":False,"error":"player_id must be numeric"},400)
