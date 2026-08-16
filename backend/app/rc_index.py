@@ -8,18 +8,11 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup
 from .db import SessionLocal, create_all
 from .models import RcPlayerIndex, XttvPlayer
-
-RC_BASE="https://www.ratingscentral.com"
-USER_AGENT="TT-Aufstellung/0.1 (+public RatingsCentral player index)"
-
+RC_BASE="https://www.ratingscentral.com"; USER_AGENT="TT-Aufstellung/0.1 (+public RatingsCentral player index)"
 def clean_text(v:str)->str:
-    v=unicodedata.normalize("NFKC",v or "")
-    return "".join(c for c in v if unicodedata.category(c) not in {"Cf","Cc"} or c in "\t\n\r").strip()
-
+    v=unicodedata.normalize("NFKC",v or ""); return "".join(c for c in v if unicodedata.category(c) not in {"Cf","Cc"} or c in "\t\n\r").strip()
 def norm(v:str)->str:
-    v=clean_text(v).casefold().translate(str.maketrans({"ä":"a","ö":"o","ü":"u","ß":"ss"}))
-    return " ".join(re.sub(r"[^a-z0-9]+"," ",v).split())
-
+    v=clean_text(v).casefold().translate(str.maketrans({"ä":"a","ö":"o","ü":"u","ß":"ss"})); return " ".join(re.sub(r"[^a-z0-9]+"," ",v).split())
 def _parse_rows(html:str)->list[dict]:
     soup=BeautifulSoup(html,"html.parser"); out={}
     def add(i,n,extra=None):
@@ -37,29 +30,26 @@ def _parse_rows(html:str)->list[dict]:
         if n: add(i,n)
     if not out:
         for m in re.finditer(r"PlayerID=(\d+)[^<]{0,500}",html,re.I):
-            frag=BeautifulSoup(m.group(0),"html.parser").get_text(" ",strip=True)
-            n=re.search(r"([A-ZÀ-ÖØ-Ý][^<>\n]{1,80},\s*[A-Za-zÀ-ÿ][^<>\n]{1,80})",frag)
-            if n: add(m.group(1),n.group(1))
+            frag=BeautifulSoup(m.group(0),"html.parser").get_text(" ",strip=True); n=re.search(r"([A-ZÀ-ÖØ-Ý][^<>\n]{1,80},\s*[A-Za-zÀ-ÿ][^<>\n]{1,80})",frag)
+            if n:add(m.group(1),n.group(1))
     return list(out.values())
-
 def parse_rc_players(html:str)->list[dict]: return _parse_rows(html)
-
 def fetch_search(name_prefix:str)->tuple[str,str]:
-    url=f"{RC_BASE}/PlayerSearch.php?{urlencode({'Name':name_prefix,'PlayerSport':'Table Tennis','Search':'Search'})}"
-    req=Request(url,headers={"User-Agent":USER_AGENT,"Accept":"text/html,application/xhtml+xml"})
+    url=f"{RC_BASE}/PlayerSearch.php?{urlencode({'Name':name_prefix,'PlayerSport':'Table Tennis','Search':'Search'})}"; req=Request(url,headers={"User-Agent":USER_AGENT,"Accept":"text/html,application/xhtml+xml"})
     with urlopen(req,timeout=20) as r:return r.read().decode("utf-8",errors="replace"),url
-
 def debug_search(surname:str)->dict:
-    html,url=fetch_search(f"{surname.strip()},"); soup=BeautifulSoup(html,"html.parser"); players=parse_rc_players(html)
+    html,url=fetch_search(f"{surname.strip()},"); soup=BeautifulSoup(html,"html.parser"); players=parse_rc_players(html); event_matches=[]
+    # RC's OÖTTV EventSummary is the reliable fallback/index source. Start with a known-good OÖTTV event.
+    try:
+        from .rc_events import fetch_event_summary, parse_event_summary
+        eh,eu=fetch_event_summary(53814); event_matches=[p for p in parse_event_summary(eh)["players"] if norm(p["name"]).startswith(norm(surname)+" ") or norm(p["name"]).startswith(norm(surname)+",")]
+    except Exception as exc: event_error=f"{type(exc).__name__}: {exc}"
     links=[]
     for a in soup.find_all("a",href=True):
         m=re.search(r"[?&]PlayerID=(\d+)",a.get("href",""),re.I)
-        if m: links.append({"rc_player_id":int(m.group(1)),"text":clean_text(" ".join(a.stripped_strings)),"href":a.get("href")})
-    return {"ok":True,"surname":surname,"url":url,"html_bytes":len(html.encode()),"table_count":len(soup.find_all("table")),"player_link_count":len(links),"player_links":links[:50],"players":players[:50]}
-
-def _surname(name:str)->str:
-    return next((p for p in re.split(r"[\s,]+",clean_text(name)) if p),"")
-
+        if m:links.append({"rc_player_id":int(m.group(1)),"text":clean_text(" ".join(a.stripped_strings)),"href":a.get("href")})
+    return {"ok":True,"surname":surname,"url":url,"html_bytes":len(html.encode()),"table_count":len(soup.find_all("table")),"player_link_count":len(links),"player_links":links[:50],"players":players[:50],"event_fallback":{"event_id":53814,"url":"https://www.ratingscentral.com/EventSummary.php?EventID=53814","matches":event_matches,"error":locals().get("event_error")}}
+def _surname(name:str)->str:return next((p for p in re.split(r"[\s,]+",clean_text(name)) if p),"")
 def import_index(limit:int=30,offset:int=0,force:bool=False)->dict:
     create_all()
     with SessionLocal() as s: players=s.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all(); surnames=sorted({_surname(p.name) for p in players if _surname(p.name)})
@@ -68,17 +58,16 @@ def import_index(limit:int=30,offset:int=0,force:bool=False)->dict:
         key=f"surname:{norm(surname)}"
         with SessionLocal() as s:
             cached=s.query(RcPlayerIndex).filter_by(search_key=key).one_or_none()
-            if cached and not force: results.append({"search_key":key,"surname":surname,"status":"cached","players":cached.player_count}); continue
+            if cached and not force:results.append({"search_key":key,"surname":surname,"status":"cached","players":cached.player_count});continue
         try:
-            html,url=fetch_search(f"{surname},"); found=parse_rc_players(html); fetched+=1
+            html,url=fetch_search(f"{surname},");found=parse_rc_players(html);fetched+=1
             with SessionLocal.begin() as s:
                 e=s.query(RcPlayerIndex).filter_by(search_key=key).one_or_none()
                 if e is None:e=RcPlayerIndex(search_key=key);s.add(e)
                 e.url=url;e.fetched_at=datetime.utcnow();e.player_count=len(found);e.players_json=found;stored+=len(found)
             results.append({"search_key":key,"surname":surname,"status":"fetched","players":len(found)})
-        except Exception as exc: results.append({"search_key":key,"surname":surname,"status":"error","error":f"{type(exc).__name__}: {exc}"})
+        except Exception as exc:results.append({"search_key":key,"surname":surname,"status":"error","error":f"{type(exc).__name__}: {exc}"})
     return {"ok":True,"mode":"rc_index","offset":offset,"limit":limit,"requested_players":len(players),"unique_surnames":len(surnames),"requests_made":fetched,"candidate_rows_stored":stored,"results":results}
-
 def local_candidates(name:str,limit:int=20)->list[dict]:
     key=f"surname:{norm(_surname(name))}"
     with SessionLocal() as s:
