@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Float, Index
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Float, Index, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
@@ -35,6 +35,22 @@ class XttvPlayer(Base):
     rating_snapshots: Mapped[list[PlayerRatingSnapshot]] = relationship(
         back_populates="player", cascade="all, delete-orphan"
     )
+
+
+class RcPlayerIndex(Base):
+    """Persistent cache of RC PlayerSearch results.
+
+    Search results are keyed by a surname prefix so the same RC page is not
+    requested repeatedly for every XTTV player. The cache is refreshed on
+    demand and is safe to rebuild idempotently.
+    """
+    __tablename__ = "rc_player_index"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    search_key: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    url: Mapped[str] = mapped_column(Text)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    player_count: Mapped[int] = mapped_column(Integer, default=0)
+    players_json: Mapped[list] = mapped_column(JSON, default=list)
 
 
 class PlayerRatingSnapshot(Base):
