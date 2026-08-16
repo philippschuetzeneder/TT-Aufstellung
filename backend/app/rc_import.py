@@ -13,8 +13,7 @@ from .models import PlayerRatingSnapshot, RawSourceDocument, XttvPlayer
 
 RC_BASE = "https://www.ratingscentral.com"
 USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral history import)"
-
-_RATING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[±+/-]\s*(\d+(?:\.\d+)?)\s*$")
+_RATING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:±|\+/-|\+-)\s*(\d+(?:\.\d+)?)\s*$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 
@@ -27,15 +26,18 @@ def fetch_player_history(rc_player_id: int) -> tuple[str, str]:
 
 def _parse_rating(value: str) -> tuple[float, float] | None:
     match = _RATING_RE.match(" ".join(value.split()))
-    if not match:
-        return None
-    return float(match.group(1)), float(match.group(2))
+    return (float(match.group(1)), float(match.group(2))) if match else None
+
+
+def _clean_rc_name(value: str) -> str:
+    """RatingCentral puts the current rating/deviation directly after the name in the heading."""
+    value = unicodedata.normalize("NFKC", value).replace("\u200b", "").replace("\ufeff", "").strip()
+    value = re.sub(r"\s+\d+(?:\.\d+)?\s*(?:±|\+/-|\+-)\s*\d+(?:\.\d+)?\s*$", "", value)
+    return value.strip(" ,")
 
 
 def _normalized_name_tokens(value: str) -> tuple[str, ...]:
-    """Normalize names for matching RC 'Surname, Firstname' to XTTV variants."""
-    value = unicodedata.normalize("NFKC", value).casefold()
-    value = value.replace(",", " ")
+    value = unicodedata.normalize("NFKC", _clean_rc_name(value)).casefold().replace(",", " ")
     value = re.sub(r"[^\w\s-]", " ", value, flags=re.UNICODE)
     return tuple(sorted(token for token in value.split() if token))
 
@@ -47,52 +49,47 @@ def _find_xttv_player(session, rc_player_id: int, rc_name: str, xttv_player_id: 
     if xttv_player_id:
         return session.query(XttvPlayer).filter_by(external_player_id=xttv_player_id).one_or_none()
 
-    # First try the exact spelling, then compare normalized name tokens so
-    # 'Schützeneder, Philipp' matches 'Philipp Schützeneder'.
+    rc_name = _clean_rc_name(rc_name)
     player = session.query(XttvPlayer).filter(XttvPlayer.name.ilike(rc_name)).one_or_none()
     if player is not None:
         return player
 
     rc_tokens = _normalized_name_tokens(rc_name)
-    if not rc_tokens:
-        return None
     candidates = session.query(XttvPlayer).all()
-    matches = [candidate for candidate in candidates if _normalized_name_tokens(candidate.name) == rc_tokens]
+    matches = [p for p in candidates if _normalized_name_tokens(p.name) == rc_tokens]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
         raise ValueError(
             f"Ambiguous XTTV player mapping for RC {rc_player_id} ({rc_name}): "
-            + ", ".join(f"{candidate.external_player_id}:{candidate.name}" for candidate in matches)
+            + ", ".join(f"{p.external_player_id}:{p.name}" for p in matches)
         )
     return None
 
 
 def parse_player_history(html: str, *, cutoff: date | None = None, today: date | None = None) -> dict:
-    """Parse RC current rating and event-end ratings from the public history page."""
     soup = BeautifulSoup(html, "html.parser")
     heading = soup.find("h1")
-    name = " ".join(heading.stripped_strings) if heading else None
-    if not name:
+    raw_name = " ".join(heading.stripped_strings) if heading else None
+    if not raw_name:
         raise ValueError("Could not find player name on PlayerHistory page")
+    name = _clean_rc_name(raw_name)
 
     current_rating = current_deviation = None
-    for node in soup.find_all(string=re.compile(r"±|\\+/-")):
+    for node in soup.find_all(string=re.compile(r"±|\+/-|\+-")):
         parsed = _parse_rating(node)
         if parsed:
             current_rating, current_deviation = parsed
             break
     if current_rating is None:
-        text = " ".join(soup.stripped_strings)
-        match = re.search(r"(\d+)\s*[±+/-]\s*(\d+)", text)
+        text = " ".join(soup.stripped_strings).replace("\u200b", "")
+        match = re.search(r"(\d+)\s*(?:±|\+/-|\+-)\s*(\d+)", text)
         if not match:
             raise ValueError("Could not find current RC rating on PlayerHistory page")
-        current_rating = float(match.group(1))
-        current_deviation = float(match.group(2))
+        current_rating, current_deviation = float(match.group(1)), float(match.group(2))
 
     today = today or date.today()
     cutoff = cutoff or (today - timedelta(days=3 * 365 + 1))
-
     history: list[dict] = []
     for row in soup.find_all("tr"):
         cells = [" ".join(cell.stripped_strings) for cell in row.find_all(["th", "td"])]
@@ -119,19 +116,10 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
             "rc_deviation": final[1],
         })
 
-    return {
-        "name": name,
-        "current": {
-            "observed_at": today.isoformat(),
-            "rc_rating": current_rating,
-            "rc_deviation": current_deviation,
-        },
-        "history": history,
-    }
+    return {"name": name, "current": {"observed_at": today.isoformat(), "rc_rating": current_rating, "rc_deviation": current_deviation}, "history": history}
 
 
 def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cutoff: date | None = None) -> dict:
-    """Import the current RC value plus three years of historical observations."""
     create_all()
     html, content_type = fetch_player_history(rc_player_id)
     parsed = parse_player_history(html, cutoff=cutoff)
@@ -145,33 +133,21 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cu
             session.add(raw)
             session.flush()
         else:
-            raw.url = url
-            raw.content = html
-            raw.fetched_at = datetime.utcnow()
-            raw.content_type = content_type
+            raw.url, raw.content, raw.fetched_at, raw.content_type = url, html, datetime.utcnow(), content_type
         raw.http_status = 200
 
         player = _find_xttv_player(session, rc_player_id, parsed["name"], xttv_player_id)
         if player is None:
-            raise ValueError(
-                f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}). "
-                "Pass --xttv-player-id or create the mapping first."
-            )
+            raise ValueError(f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}). Pass --xttv-player-id or create the mapping first.")
         player.rc_player_id = rc_player_id
 
         observations = list(parsed["history"]) + [parsed["current"]]
         saved = 0
         for observation in observations:
             observed_at = datetime.fromisoformat(observation["observed_at"])
-            snapshot = session.query(PlayerRatingSnapshot).filter_by(
-                player_id=player.id, observed_at=observed_at, source="ratingscentral"
-            ).one_or_none()
+            snapshot = session.query(PlayerRatingSnapshot).filter_by(player_id=player.id, observed_at=observed_at, source="ratingscentral").one_or_none()
             if snapshot is None:
-                snapshot = PlayerRatingSnapshot(
-                    player_id=player.id,
-                    observed_at=observed_at,
-                    source="ratingscentral",
-                )
+                snapshot = PlayerRatingSnapshot(player_id=player.id, observed_at=observed_at, source="ratingscentral")
                 session.add(snapshot)
             snapshot.rc_rating = observation["rc_rating"]
             snapshot.rc_deviation = observation["rc_deviation"]
@@ -179,16 +155,7 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cu
             snapshot.imported_at = datetime.utcnow()
             saved += 1
 
-    return {
-        "ok": True,
-        "rc_player_id": rc_player_id,
-        "name": parsed["name"],
-        "xttv_player_id": player.external_player_id,
-        "current": parsed["current"],
-        "historical_observations": len(parsed["history"]),
-        "snapshots_upserted": saved,
-        "cutoff": (cutoff or (date.today() - timedelta(days=3 * 365 + 1))).isoformat(),
-    }
+    return {"ok": True, "rc_player_id": rc_player_id, "name": parsed["name"], "xttv_player_id": player.external_player_id, "current": parsed["current"], "historical_observations": len(parsed["history"]), "snapshots_upserted": saved, "cutoff": (cutoff or (date.today() - timedelta(days=3 * 365 + 1))).isoformat()}
 
 
 def main() -> None:
