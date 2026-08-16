@@ -20,15 +20,10 @@ class RawSourceDocument(Base):
 
 
 class XttvPlayer(Base):
-    """Canonical player identity.
-
-    XTTV external_player_id is the stable identity; the display name is kept
-    here as the current/canonical name, while MatchPlayer continues to retain
-    the historical name that was shown in each match.
-    """
     __tablename__ = "xttv_players"
     id: Mapped[int] = mapped_column(primary_key=True)
     external_player_id: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    rc_player_id: Mapped[int | None] = mapped_column(Integer, unique=True, index=True)
     name: Mapped[str] = mapped_column(String(200))
     club: Mapped[str | None] = mapped_column(String(200))
     birth_year: Mapped[int | None] = mapped_column(Integer)
@@ -43,19 +38,19 @@ class XttvPlayer(Base):
 
 
 class PlayerRatingSnapshot(Base):
-    """Point-in-time RC rating observation.
+    """Point-in-time Ratings Central observation.
 
-    We deliberately store observations instead of only the current RC. This
-    prevents future leakage when evaluating historical matches and lets the
-    analysis derive 30/90/180-day trends from information available at that
-    point in time.
+    The current matchup model deliberately reads only rc_rating. rc_deviation
+    and the historical series are persisted now so they can be evaluated and
+    incorporated later without changing the data model.
     """
     __tablename__ = "player_rating_snapshots"
     id: Mapped[int] = mapped_column(primary_key=True)
     player_id: Mapped[int] = mapped_column(ForeignKey("xttv_players.id", ondelete="CASCADE"))
     observed_at: Mapped[datetime] = mapped_column(DateTime)
     rc_rating: Mapped[float] = mapped_column(Float)
-    source: Mapped[str] = mapped_column(String(50), default="xttv")
+    rc_deviation: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(50), default="ratingscentral")
     source_document_id: Mapped[int | None] = mapped_column(ForeignKey("raw_source_documents.id", ondelete="SET NULL"))
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     player: Mapped[XttvPlayer] = relationship(back_populates="rating_snapshots")
