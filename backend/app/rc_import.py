@@ -24,13 +24,19 @@ def fetch_player_history(rc_player_id: int) -> tuple[str, str]:
         return response.read().decode("utf-8", errors="replace"), response.headers.get_content_type()
 
 
+def _clean_text(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value or "")
+    return "".join(ch for ch in value if unicodedata.category(ch) not in {"Cf", "Cc"} or ch in "\t\n\r").strip()
+
+
 def _parse_rating(value: str) -> tuple[float, float] | None:
-    match = _RATING_RE.match(" ".join(value.split()))
+    value = _clean_text(" ".join(value.split()))
+    match = _RATING_RE.match(value)
     return (float(match.group(1)), float(match.group(2))) if match else None
 
 
 def _clean_rc_name(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value).replace("\u200b", "").replace("\ufeff", "").strip()
+    value = _clean_text(value)
     value = re.sub(r"\s+\d+(?:\.\d+)?\s*(?:±|\+/-|\+-)\s*\d+(?:\.\d+)?\s*$", "", value)
     return value.strip(" ,")
 
@@ -76,7 +82,7 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
             current_rating, current_deviation = parsed
             break
     if current_rating is None:
-        text = " ".join(soup.stripped_strings).replace("\u200b", "")
+        text = _clean_text(" ".join(soup.stripped_strings))
         match = re.search(r"(\d+)\s*(?:±|\+/-|\+-)\s*(\d+)", text)
         if not match:
             raise ValueError("Could not find current RC rating on PlayerHistory page")
@@ -86,10 +92,9 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
     cutoff = cutoff or (today - timedelta(days=3 * 365 + 1))
     history: list[dict] = []
     for row in soup.find_all("tr"):
-        cells = [" ".join(cell.stripped_strings) for cell in row.find_all(["th", "td"])]
-        if len(cells) < 5:
+        cells = [_clean_text(" ".join(cell.stripped_strings)) for cell in row.find_all(["th", "td"])]
+        if len(cells) < 5 or cells[0].strip() == "Date":
             continue
-        # RatingCentral uses YYYY-MM-DD in the history table.
         match = _DATE_RE.match(cells[0].strip())
         if not match:
             continue
@@ -100,37 +105,9 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
         final = _parse_rating(cells[4])
         if initial is None or final is None:
             continue
-        change_text = cells[3].replace("−", "-").replace("–", "-").strip()
+        change_text = _clean_text(cells[3]).replace("−", "-").replace("–", "-").strip()
         change_match = re.search(r"[+-]\s*\d+(?:\.\d+)?", change_text)
-        history.append({
-            "observed_at": event_date.isoformat(),
-            "event": cells[1],
-            "initial_rating": initial[0],
-            "initial_deviation": initial[1],
-            "point_change": float(change_match.group(0).replace(" ", "")) if change_match else None,
-            "rc_rating": final[0],
-            "rc_deviation": final[1],
-        })
-
-    # Some RC deployments render the table cells in a different order. As a
-    # fallback, inspect every row for a date followed by two rating values.
-    if not history:
-        for row in soup.find_all("tr"):
-            cells = [" ".join(cell.stripped_strings) for cell in row.find_all(["th", "td"])]
-            if not cells:
-                continue
-            date_index = next((i for i, cell in enumerate(cells) if _DATE_RE.match(cell.strip())), None)
-            if date_index is None:
-                continue
-            ratings = [(i, _parse_rating(cell)) for i, cell in enumerate(cells) if _parse_rating(cell) is not None]
-            if len(ratings) < 2:
-                continue
-            event_date = date.fromisoformat(cells[date_index].strip())
-            if event_date < cutoff:
-                continue
-            initial = ratings[0][1]
-            final = ratings[-1][1]
-            history.append({"observed_at": event_date.isoformat(), "event": cells[date_index + 1] if date_index + 1 < len(cells) else "", "initial_rating": initial[0], "initial_deviation": initial[1], "point_change": None, "rc_rating": final[0], "rc_deviation": final[1]})
+        history.append({"observed_at": event_date.isoformat(), "event": cells[1], "initial_rating": initial[0], "initial_deviation": initial[1], "point_change": float(change_match.group(0).replace(" ", "")) if change_match else None, "rc_rating": final[0], "rc_deviation": final[1]})
 
     return {"name": name, "current": {"observed_at": today.isoformat(), "rc_rating": current_rating, "rc_deviation": current_deviation}, "history": history}
 
@@ -144,8 +121,7 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, xt
     with SessionLocal.begin() as session:
         raw = session.query(RawSourceDocument).filter_by(source="ratingscentral", external_id=source_external_id).one_or_none()
         if raw is None:
-            raw = RawSourceDocument(source="ratingscentral", external_id=source_external_id, url=url, content=html)
-            session.add(raw); session.flush()
+            raw = RawSourceDocument(source="ratingscentral", external_id=source_external_id, url=url, content=html); session.add(raw); session.flush()
         else:
             raw.url, raw.content, raw.fetched_at, raw.content_type = url, html, datetime.utcnow(), content_type
         raw.http_status = 200
@@ -153,8 +129,7 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, xt
         if player is None and xttv_external_player_id:
             player = session.query(XttvPlayer).filter_by(external_player_id=xttv_external_player_id).one_or_none()
             if player is None:
-                player = XttvPlayer(external_player_id=xttv_external_player_id, name=xttv_name or parsed["name"], club=xttv_club, source="xttv")
-                session.add(player); session.flush()
+                player = XttvPlayer(external_player_id=xttv_external_player_id, name=xttv_name or parsed["name"], club=xttv_club, source="xttv"); session.add(player); session.flush()
         if player is None:
             raise ValueError(f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}). Pass --xttv-player-id or provide --xttv-external-player-id.")
         if player.rc_player_id not in (None, rc_player_id):
