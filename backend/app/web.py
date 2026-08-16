@@ -3,13 +3,15 @@ import json, os, socket, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from sqlalchemy import or_
 from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
 from .analysis_cache import start_background_refresh, refresh_analysis_cache
 from .player_analysis_service import list_players, list_teams
-from .db import database_health
+from .db import database_health, SessionLocal
 from .db_routes import get_match
+from .models import XttvPlayer
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
@@ -33,6 +35,22 @@ def debug_xttv(meid):
     for label,candidate in [("direct HTTPS",url),("HTTP fallback",url.replace("https://","http://",1)),("www HTTPS",url.replace("https://oettv.xttv.at","https://www.oettv.xttv.at",1)),("legacy HTTPS",url.replace("https://oettv.xttv.at","https://xttv.oettv.info",1))]: result["checks"].append({"method":label,"url":candidate,**http_fetch(candidate)})
     result["direct_success"]=any(c.get("method")=="direct HTTPS" and c.get("ok") for c in result["checks"]); return result
 
+def find_xttv_players(name: str | None, team: str | None):
+    with SessionLocal() as session:
+        query = session.query(XttvPlayer)
+        if name:
+            normalized = " ".join(name.strip().split())
+            parts = normalized.replace(",", " ").split()
+            if len(parts) >= 2:
+                first, last = parts[0], parts[-1]
+                query = query.filter(or_(XttvPlayer.name.ilike(f"%{normalized}%"), XttvPlayer.name.ilike(f"%{first}%{last}%"), XttvPlayer.name.ilike(f"%{last}%{first}%")))
+            else:
+                query = query.filter(XttvPlayer.name.ilike(f"%{normalized}%"))
+        if team:
+            query = query.filter(XttvPlayer.club.ilike(f"%{team.strip()}%"))
+        rows = query.order_by(XttvPlayer.name).limit(50).all()
+        return {"ok": True, "count": len(rows), "matches": [{"id": r.id, "external_player_id": r.external_player_id, "name": r.name, "club": r.club, "rc_player_id": r.rc_player_id} for r in rows]}
+
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
         data=json.dumps(payload,ensure_ascii=False,default=str).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
@@ -53,6 +71,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/analysis/cache-refresh": return self.send_json(refresh_analysis_cache())
             if parsed.path=="/api/teams": return self.send_json(list_teams())
             if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0]))
+            if parsed.path=="/api/xttv/player-find": return self.send_json(find_xttv_players(query.get("name",[None])[0], query.get("team",[None])[0]))
             team_prefix="/api/teams/"
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
