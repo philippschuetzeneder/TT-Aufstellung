@@ -30,7 +30,6 @@ def _parse_rating(value: str) -> tuple[float, float] | None:
 
 
 def _clean_rc_name(value: str) -> str:
-    """RatingCentral puts the current rating/deviation directly after the name in the heading."""
     value = unicodedata.normalize("NFKC", value).replace("\u200b", "").replace("\ufeff", "").strip()
     value = re.sub(r"\s+\d+(?:\.\d+)?\s*(?:±|\+/-|\+-)\s*\d+(?:\.\d+)?\s*$", "", value)
     return value.strip(" ,")
@@ -119,7 +118,15 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
     return {"name": name, "current": {"observed_at": today.isoformat(), "rc_rating": current_rating, "rc_deviation": current_deviation}, "history": history}
 
 
-def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cutoff: date | None = None) -> dict:
+def import_rc_player(
+    rc_player_id: int,
+    *,
+    xttv_player_id: str | None = None,
+    xttv_external_player_id: str | None = None,
+    xttv_name: str | None = None,
+    xttv_club: str | None = None,
+    cutoff: date | None = None,
+) -> dict:
     create_all()
     html, content_type = fetch_player_history(rc_player_id)
     parsed = parse_player_history(html, cutoff=cutoff)
@@ -137,9 +144,26 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cu
         raw.http_status = 200
 
         player = _find_xttv_player(session, rc_player_id, parsed["name"], xttv_player_id)
+        if player is None and xttv_external_player_id:
+            player = session.query(XttvPlayer).filter_by(external_player_id=xttv_external_player_id).one_or_none()
+            if player is None:
+                player = XttvPlayer(
+                    external_player_id=xttv_external_player_id,
+                    name=xttv_name or parsed["name"],
+                    club=xttv_club,
+                    source="xttv",
+                )
+                session.add(player)
+                session.flush()
         if player is None:
-            raise ValueError(f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}). Pass --xttv-player-id or create the mapping first.")
+            raise ValueError(f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}). Pass --xttv-player-id or provide --xttv-external-player-id.")
+        if player.rc_player_id not in (None, rc_player_id):
+            raise ValueError(f"XTTV player {player.external_player_id} is already mapped to RC {player.rc_player_id}")
         player.rc_player_id = rc_player_id
+        if xttv_name:
+            player.name = xttv_name
+        if xttv_club:
+            player.club = xttv_club
 
         observations = list(parsed["history"]) + [parsed["current"]]
         saved = 0
@@ -162,9 +186,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Import Ratings Central current rating and 3-year history")
     parser.add_argument("rc_player_id", type=int)
     parser.add_argument("--xttv-player-id")
+    parser.add_argument("--xttv-external-player-id")
+    parser.add_argument("--xttv-name")
+    parser.add_argument("--xttv-club")
     parser.add_argument("--cutoff", type=date.fromisoformat)
     args = parser.parse_args()
-    print(import_rc_player(args.rc_player_id, xttv_player_id=args.xttv_player_id, cutoff=args.cutoff))
+    print(import_rc_player(args.rc_player_id, xttv_player_id=args.xttv_player_id, xttv_external_player_id=args.xttv_external_player_id, xttv_name=args.xttv_name, xttv_club=args.xttv_club, cutoff=args.cutoff))
 
 
 if __name__ == "__main__":
