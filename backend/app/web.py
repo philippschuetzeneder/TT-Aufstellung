@@ -14,6 +14,7 @@ from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import
 from .xttv_parser import parse_match
+from .rc_import import import_rc_player
 ROOT=Path(__file__).resolve().parents[2]
 
 def http_fetch(url,timeout=20):
@@ -58,11 +59,6 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/analysis":
                 own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]
                 opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
-                # IMPORTANT: use the dedicated fast analysis service. The old
-                # player_analysis_service.analyze() loads every XTTV match and
-                # recalculates every player's statistics on every request.
-                # For a 4-vs-4 analysis that is unnecessary and was the source
-                # of the repeated 20-second timeouts.
                 return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0])))
             if parsed.path=="/api/xttv/debug": return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch": return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
@@ -73,6 +69,10 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/xttv/import": return self.send_json({"meid":meid,**import_one(meid)})
             if parsed.path=="/api/xttv/scan-import":
                 start=int(query.get("start",[str(REFERENCE_MEID-DEFAULT_RADIUS)])[0]); end=int(query.get("end",[str(REFERENCE_MEID+DEFAULT_RADIUS)])[0]); limit=int(query.get("limit",[str(DEFAULT_LIMIT)])[0]); delay=float(query.get("delay",["0.05"])[0]); return self.send_json(scan_and_import(start,end,limit=limit,delay=delay))
+            if parsed.path=="/api/rc/import":
+                raw_rc_id=query.get("player_id",[""])[0].strip()
+                if not raw_rc_id or not raw_rc_id.isdigit(): return self.send_json({"ok":False,"error":"player_id must be a numeric RatingsCentral player ID"},400)
+                return self.send_json(import_rc_player(int(raw_rc_id)))
         except Exception as exc: return self.send_json({"ok":False,"error":f"{type(exc).__name__}: {exc}"},500)
         rel="index.html" if parsed.path in ("","/") else parsed.path.lstrip("/"); target=(ROOT/rel).resolve()
         if not str(target).startswith(str(ROOT.resolve())) or not target.is_file(): return self.send_error(404)
