@@ -2,7 +2,7 @@ from fastapi import APIRouter, Query
 
 from app.rc_events import debug_event
 
-router = APIRouter(prefix="/api/rc", tags=["rc"])
+router = APIRouter(tags=["rc"])
 
 
 @router.get("/events/debug")
