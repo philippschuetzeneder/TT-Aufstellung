@@ -15,6 +15,7 @@ USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral history import)"
 
 _RATING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*[±+/-]\s*(\d+(?:\.\d+)?)\s*$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_CURRENT_SUFFIX_RE = re.compile(r"\s*\d+(?:\.\d+)?\s*[±+/-]\s*\d+(?:\.\d+)?\s*$")
 
 
 def fetch_player_history(rc_player_id: int) -> tuple[str, str]:
@@ -31,11 +32,44 @@ def _parse_rating(value: str) -> tuple[float, float] | None:
     return float(match.group(1)), float(match.group(2))
 
 
+def _clean_player_name(value: str) -> str:
+    """Remove RC's current-rating suffix and invisible Unicode spacing characters."""
+    value = value.replace("\u200b", "").replace("\ufeff", "")
+    value = _CURRENT_SUFFIX_RE.sub("", value)
+    return " ".join(value.split()).strip()
+
+
+def _find_xttv_player(session, rc_player_id: int, rc_name: str, xttv_player_id: str | None = None):
+    player = session.query(XttvPlayer).filter_by(rc_player_id=rc_player_id).one_or_none()
+    if player is not None:
+        return player
+    if xttv_player_id:
+        player = session.query(XttvPlayer).filter_by(external_player_id=xttv_player_id).one_or_none()
+        if player is not None:
+            return player
+
+    clean_name = _clean_player_name(rc_name)
+    player = session.query(XttvPlayer).filter(XttvPlayer.name.ilike(clean_name)).one_or_none()
+    if player is not None:
+        return player
+
+    # XTTV/RC may differ only in Unicode punctuation/spacing/case. Compare a
+    # normalized name in Python before giving up, while refusing ambiguous matches.
+    def norm(name: str) -> str:
+        return " ".join(name.replace("\u200b", "").replace("\ufeff", "").split()).casefold()
+
+    candidates = session.query(XttvPlayer).all()
+    matches = [candidate for candidate in candidates if norm(candidate.name) == norm(clean_name)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def parse_player_history(html: str, *, cutoff: date | None = None, today: date | None = None) -> dict:
     """Parse RC current rating and event-end ratings from the public history page."""
     soup = BeautifulSoup(html, "html.parser")
     heading = soup.find("h1")
-    name = " ".join(heading.stripped_strings) if heading else None
+    name = _clean_player_name(" ".join(heading.stripped_strings)) if heading else None
     if not name:
         raise ValueError("Could not find player name on PlayerHistory page")
 
@@ -114,11 +148,7 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, cu
             raw.content_type = content_type
         raw.http_status = 200
 
-        player = session.query(XttvPlayer).filter_by(rc_player_id=rc_player_id).one_or_none()
-        if player is None and xttv_player_id:
-            player = session.query(XttvPlayer).filter_by(external_player_id=xttv_player_id).one_or_none()
-        if player is None:
-            player = session.query(XttvPlayer).filter(XttvPlayer.name.ilike(parsed["name"])).one_or_none()
+        player = _find_xttv_player(session, rc_player_id, parsed["name"], xttv_player_id)
         if player is None:
             raise ValueError(
                 f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}). "
