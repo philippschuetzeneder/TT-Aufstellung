@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as html_lib
 import re
 import unicodedata
 from datetime import datetime
@@ -27,31 +28,83 @@ def norm(value: str) -> str:
 
 
 def parse_rc_players(html: str) -> list[dict]:
+    """Parse RC PlayerSearch results.
+
+    RC currently renders the search results as links/cards rather than a
+    normal HTML table. Therefore we deliberately search the complete document
+    for PlayerID references and derive the nearby player name from the link
+    text or its containing element. The parser also retains the old row-based
+    path as a fallback.
+    """
     soup = BeautifulSoup(html, "html.parser")
     result: dict[int, dict] = {}
+
+    def add(rc_id: int, name: str, cells: list[str] | None = None) -> None:
+        name = clean_text(html_lib.unescape(name))
+        if not name or len(name) > 160:
+            return
+        # RC names are normally "Surname, Firstname". Reject obvious UI text.
+        if "," not in name:
+            return
+        if not re.search(r"[A-Za-zÀ-ÿ]", name):
+            return
+        result[rc_id] = {
+            "rc_player_id": rc_id,
+            "name": name,
+            "name_norm": norm(name),
+            "cells": cells or [name],
+        }
+
+    # Preferred path: every PlayerID link in the complete document.
+    for link in soup.find_all("a", href=True):
+        match = re.search(r"[?&]PlayerID=(\d+)", link.get("href", ""), re.I)
+        if not match:
+            continue
+        rc_id = int(match.group(1))
+        candidates: list[str] = []
+        text = clean_text(" ".join(link.stripped_strings))
+        if text:
+            candidates.append(text)
+        parent = link.parent
+        if parent:
+            candidates.append(clean_text(" ".join(parent.stripped_strings)))
+        # Sometimes the name is in the closest card/container.
+        for ancestor in list(link.parents)[:3]:
+            value = clean_text(" ".join(ancestor.stripped_strings))
+            if value and len(value) <= 300:
+                candidates.append(value)
+        name = next((c for c in candidates if "," in c and len(c) <= 160), None)
+        if name:
+            add(rc_id, name)
+
+    # Fallback for table-based rendering.
     for row in soup.find_all("tr"):
         cells = [clean_text(" ".join(c.stripped_strings)) for c in row.find_all(["th", "td"])]
         if not cells:
             continue
-        rc_id = None
         for link in row.find_all("a", href=True):
-            match = re.search(r"PlayerID=(\d+)", link["href"])
-            if match:
-                rc_id = int(match.group(1))
-                break
-        if rc_id is None:
-            continue
-        name = next((c for c in cells if "," in c), None)
-        if not name:
-            continue
-        result[rc_id] = {"rc_player_id": rc_id, "name": name, "name_norm": norm(name), "cells": cells}
+            match = re.search(r"[?&]PlayerID=(\d+)", link.get("href", ""), re.I)
+            if not match:
+                continue
+            rc_id = int(match.group(1))
+            name = next((c for c in cells if "," in c and len(c) <= 160), None)
+            if name:
+                add(rc_id, name, cells)
+
+    # Last-resort regex: useful if RC embeds the result payload in script/data
+    # attributes where BeautifulSoup does not expose a normal anchor.
+    if not result:
+        for match in re.finditer(r"PlayerID=(\d+)[^<]{0,500}", html, re.I):
+            rc_id = int(match.group(1))
+            fragment = BeautifulSoup(match.group(0), "html.parser").get_text(" ", strip=True)
+            name_match = re.search(r"([A-ZÀ-ÖØ-Ý][^<>\n]{1,80},\s*[A-Za-zÀ-ÿ][^<>\n]{1,80})", fragment)
+            if name_match:
+                add(rc_id, name_match.group(1))
+
     return list(result.values())
 
 
 def fetch_search(name_prefix: str) -> tuple[str, str]:
-    # PlayerSearch is a form endpoint. Include the submit control as well as
-    # the documented search fields; without the submitted Search value RC may
-    # simply return the empty search form (HTTP 200, but zero result rows).
     params = {"Name": name_prefix, "PlayerSport": "Table Tennis", "Search": "Search"}
     url = f"{RC_BASE}/PlayerSearch.php?{urlencode(params)}"
     req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
@@ -71,7 +124,22 @@ def debug_search(surname: str) -> dict:
                 rows.append(cells)
         tables.append({"index": index, "rows": rows})
     players = parse_rc_players(html)
-    return {"ok": True, "surname": surname, "url": url, "html_bytes": len(html.encode("utf-8")), "table_count": len(tables), "tables": tables, "players": players[:20]}
+    player_links = []
+    for link in soup.find_all("a", href=True):
+        match = re.search(r"[?&]PlayerID=(\d+)", link.get("href", ""), re.I)
+        if match:
+            player_links.append({"rc_player_id": int(match.group(1)), "text": clean_text(" ".join(link.stripped_strings)), "href": link.get("href")})
+    return {
+        "ok": True,
+        "surname": surname,
+        "url": url,
+        "html_bytes": len(html.encode("utf-8")),
+        "table_count": len(tables),
+        "tables": tables,
+        "player_link_count": len(player_links),
+        "player_links": player_links[:50],
+        "players": players[:50],
+    }
 
 
 def _surname(name: str) -> str:
