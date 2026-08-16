@@ -49,13 +49,29 @@ def parse_rc_players(html: str) -> list[dict]:
 
 
 def fetch_search(name_prefix: str) -> tuple[str, str]:
-    # RC explicitly documents that Name is a partial-name prefix search and
-    # PlayerSport is required for its player-search family of endpoints.
-    params = {"Name": name_prefix, "PlayerSport": "Table Tennis"}
+    # PlayerSearch is a form endpoint. Include the submit control as well as
+    # the documented search fields; without the submitted Search value RC may
+    # simply return the empty search form (HTTP 200, but zero result rows).
+    params = {"Name": name_prefix, "PlayerSport": "Table Tennis", "Search": "Search"}
     url = f"{RC_BASE}/PlayerSearch.php?{urlencode(params)}"
     req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
     with urlopen(req, timeout=20) as response:
         return response.read().decode("utf-8", errors="replace"), url
+
+
+def debug_search(surname: str) -> dict:
+    html, url = fetch_search(f"{surname.strip()},")
+    soup = BeautifulSoup(html, "html.parser")
+    tables = []
+    for index, table in enumerate(soup.find_all("table")):
+        rows = []
+        for row in table.find_all("tr")[:20]:
+            cells = [clean_text(" ".join(c.stripped_strings)) for c in row.find_all(["th", "td"])]
+            if cells:
+                rows.append(cells)
+        tables.append({"index": index, "rows": rows})
+    players = parse_rc_players(html)
+    return {"ok": True, "surname": surname, "url": url, "html_bytes": len(html.encode("utf-8")), "table_count": len(tables), "tables": tables, "players": players[:20]}
 
 
 def _surname(name: str) -> str:
