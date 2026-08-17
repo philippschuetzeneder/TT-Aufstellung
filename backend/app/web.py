@@ -124,7 +124,7 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
                 return self.send_json(rc_matching_dry_run(limit=limit,offset=offset))
             if parsed.path=="/api/rc/bulk":
-                try: limit=min(max(int(query.get("limit",["30"])[0]),1),100); offset=max(int(query.get("offset",["0"])[0]),0)
+                try: limit=min(max(int(query.get("limit",["30"])[0]),1),300); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
                 return self.send_json(bulk_import_rc(limit=limit,offset=offset))
             team_prefix="/api/teams/"
