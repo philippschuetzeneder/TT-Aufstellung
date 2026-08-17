@@ -2,6 +2,7 @@ from datetime import datetime
 import re
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from bs4 import BeautifulSoup
 from .db import SessionLocal, create_all
 from .models import PlayerRatingSnapshot, RawSourceDocument, XttvPlayer
 
@@ -12,7 +13,7 @@ EVENT_URL = f"{RC_BASE}/EventSummary.php?EventID={{event_id}}"
 
 def fetch_url(url: str):
     req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
-    with urlopen(req, timeout=20) as response:
+    with urlopen(req, timeout=30) as response:
         content = response.read().decode("utf-8", errors="replace")
         return content, response.status, response.headers.get("Content-Type"), response.geturl()
 
@@ -23,43 +24,63 @@ def _clean(value: str) -> str:
 
 
 def _parse_rating(value: str):
-    value = (value or "").replace("\u200b", "").replace("−", "-").strip()
+    value = _clean(value).replace("−", "-").replace("–", "-")
     m = re.search(r"(\d+(?:\.\d+)?)\s*(?:±|\+/-|\+-)\s*(\d+(?:\.\d+)?)", value)
     return (float(m.group(1)), float(m.group(2))) if m else (None, None)
 
 
 def _parse_event_rows(html: str):
-    clean = html.replace("\u200b", "")
+    """Parse RC event rows without assuming a Player.php link exists.
+
+    The debug parser already proved that RC exposes rows as ordinary table
+    cells: numeric player ID, name, initial rating, change, final rating.
+    The previous importer incorrectly required a PlayerID link inside every
+    row and therefore returned rating_rows=0.
+    """
+    soup = BeautifulSoup(html.replace("\u200b", ""), "html.parser")
     rows = {}
-    row_re = re.compile(r"<tr[^>]*>(.*?)</tr>", re.I | re.S)
-    cell_re = re.compile(r"<(?:td|th)[^>]*>(.*?)</(?:td|th)>", re.I | re.S)
-    link_re = re.compile(r"Player\.php\?PlayerID=(\d+)", re.I)
-    name_re = re.compile(r">\s*([^<>]+,\s*[^<>]+)\s*</a>", re.I | re.S)
-    for raw_row in row_re.findall(clean):
-        cells = [_clean(re.sub(r"<[^>]+>", " ", c)) for c in cell_re.findall(raw_row)]
-        link = link_re.search(raw_row)
-        if not link or len(cells) < 4:
+    for tr in soup.find_all("tr"):
+        cells = [_clean(" ".join(c.stripped_strings)) for c in tr.find_all(["th", "td"])]
+        if len(cells) < 4:
             continue
-        rc_id = int(link.group(1))
-        name_match = name_re.search(raw_row)
-        name = _clean(name_match.group(1)) if name_match else next((c for c in cells if "," in c), "")
-        valid = [_parse_rating(c) for c in cells]
-        valid = [(r, d) for r, d in valid if r is not None]
-        if len(valid) >= 2:
-            initial, final = valid[0], valid[-1]
-            rows[rc_id] = {
-                "rc_player_id": rc_id,
-                "name": name,
-                "initial_rating": initial[0],
-                "initial_deviation": initial[1],
-                "rc_rating": final[0],
-                "rc_deviation": final[1],
-            }
+
+        rc_id = None
+        if re.fullmatch(r"\d+", cells[0]):
+            rc_id = int(cells[0])
+        else:
+            link = tr.find("a", href=re.compile(r"[?&]PlayerID=(\d+)", re.I))
+            if link:
+                m = re.search(r"[?&]PlayerID=(\d+)", link.get("href", ""), re.I)
+                if m:
+                    rc_id = int(m.group(1))
+        if rc_id is None:
+            continue
+
+        name = next((c for c in cells[1:] if "," in c), "")
+        if not name:
+            continue
+
+        valid = []
+        for cell in cells:
+            rating, deviation = _parse_rating(cell)
+            if rating is not None:
+                valid.append((rating, deviation))
+        if len(valid) < 2:
+            continue
+
+        initial, final = valid[0], valid[-1]
+        rows[rc_id] = {
+            "rc_player_id": rc_id,
+            "name": name,
+            "initial_rating": initial[0],
+            "initial_deviation": initial[1],
+            "rc_rating": final[0],
+            "rc_deviation": final[1],
+        }
     return rows
 
 
 def _parse_event_date(html: str):
-    # RC currently exposes the event date in several textual formats.
     patterns = [
         r"\b(20\d{2}-\d{2}-\d{2})\b",
         r"\b(\d{1,2})[./-](\d{1,2})[./-](20\d{2})\b",
@@ -136,13 +157,4 @@ def import_event_batch(start: int, count: int = 10):
             results.append(import_event(event_id))
         except Exception as exc:
             results.append({"ok": False, "event_id": event_id, "error": f"{type(exc).__name__}: {exc}"})
-    return {
-        "ok": True,
-        "mode": "batch_import",
-        "start": int(start),
-        "count": count,
-        "results": results,
-        "snapshots_created": sum(r.get("snapshots_created", 0) for r in results),
-        "snapshots_updated": sum(r.get("snapshots_updated", 0) for r in results),
-        "errors": sum(not r.get("ok", False) for r in results),
-    }
+    return {"ok": True, "mode": "batch_import", "start": int(start), "count": count, "results": results, "snapshots_created": sum(r.get("snapshots_created", 0) for r in results), "snapshots_updated": sum(r.get("snapshots_updated", 0) for r in results), "errors": sum(not r.get("ok", False) for r in results)}
