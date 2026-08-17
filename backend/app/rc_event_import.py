@@ -1,8 +1,9 @@
 from datetime import datetime
 import re
-from urllib.parse import urlencode
+import unicodedata
 from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup
+from sqlalchemy import func
 from .db import SessionLocal, create_all
 from .models import PlayerRatingSnapshot, RawSourceDocument, XttvPlayer
 
@@ -29,14 +30,70 @@ def _parse_rating(value: str):
     return (float(m.group(1)), float(m.group(2))) if m else (None, None)
 
 
-def _parse_event_rows(html: str):
-    """Parse RC event rows without assuming a Player.php link exists.
+def _normalize_person_name(value: str) -> str:
+    """Normalize RC's 'Surname, Firstname' and XTTV's 'Firstname Surname'.
 
-    The debug parser already proved that RC exposes rows as ordinary table
-    cells: numeric player ID, name, initial rating, change, final rating.
-    The previous importer incorrectly required a PlayerID link inside every
-    row and therefore returned rating_rows=0.
+    Token sorting intentionally makes the representation independent of the
+    source's first-name/surname order while retaining middle names. Accents,
+    punctuation and case are ignored.
     """
+    value = _clean(value).replace(",", " ")
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    tokens = re.findall(r"[a-z0-9]+", value.lower())
+    return " ".join(sorted(tokens))
+
+
+def _build_name_index(session):
+    index = {}
+    for player in session.query(XttvPlayer).all():
+        key = _normalize_person_name(player.name)
+        if not key:
+            continue
+        index.setdefault(key, []).append(player)
+    return index
+
+
+def _match_rc_players(session, rows):
+    """Assign RC IDs to XTTV players using exact normalized names.
+
+    Only unique exact-name matches are auto-assigned. Multiple XTTV players
+    with the same normalized name remain unmatched rather than risking a
+    wrong rating history. Existing RC assignments are never stolen.
+    """
+    name_index = _build_name_index(session)
+    matched = ambiguous = already_assigned = 0
+
+    for rc_id, row in rows.items():
+        candidates = name_index.get(_normalize_person_name(row["name"]), [])
+        if len(candidates) != 1:
+            if len(candidates) > 1:
+                ambiguous += 1
+            continue
+
+        player = candidates[0]
+        if player.rc_player_id == rc_id:
+            already_assigned += 1
+            continue
+        if player.rc_player_id is not None and player.rc_player_id != rc_id:
+            continue
+
+        # rc_player_id has a unique DB constraint. Do not claim an RC ID that
+        # is already attached to a different XTTV player.
+        owner = session.query(XttvPlayer).filter(
+            XttvPlayer.rc_player_id == rc_id,
+            XttvPlayer.id != player.id,
+        ).one_or_none()
+        if owner is not None:
+            continue
+
+        player.rc_player_id = rc_id
+        matched += 1
+
+    return matched, ambiguous, already_assigned
+
+
+def _parse_event_rows(html: str):
     soup = BeautifulSoup(html.replace("\u200b", ""), "html.parser")
     rows = {}
     for tr in soup.find_all("tr"):
@@ -114,6 +171,7 @@ def import_event(event_id: int):
         return {"ok": False, "event_id": event_id, "url": url, "rating_rows": len(rows), "error": "event date not found; refusing to create undated snapshots"}
 
     imported = updated = unmatched = 0
+    matched = ambiguous = already_assigned = 0
     with SessionLocal.begin() as session:
         external_id = f"event:{event_id}"
         raw = session.query(RawSourceDocument).filter_by(source="ratingscentral", external_id=external_id).one_or_none()
@@ -127,6 +185,10 @@ def import_event(event_id: int):
             raw.content_type = content_type
             raw.http_status = status
             raw.fetched_at = datetime.utcnow()
+
+        # Match the whole event in one indexed pass before writing snapshots.
+        matched, ambiguous, already_assigned = _match_rc_players(session, rows)
+        session.flush()
 
         observed_at = datetime.fromisoformat(event_date)
         for rc_id, row in rows.items():
@@ -146,7 +208,20 @@ def import_event(event_id: int):
             snapshot.source_document_id = raw.id
             snapshot.imported_at = datetime.utcnow()
 
-    return {"ok": True, "mode": "import", "event_id": event_id, "url": url, "event_date": event_date, "rating_rows": len(rows), "snapshots_created": imported, "snapshots_updated": updated, "unmatched_rc_players": unmatched}
+    return {
+        "ok": True,
+        "mode": "import",
+        "event_id": event_id,
+        "url": url,
+        "event_date": event_date,
+        "rating_rows": len(rows),
+        "players_matched_now": matched,
+        "players_already_matched": already_assigned,
+        "ambiguous_name_matches": ambiguous,
+        "snapshots_created": imported,
+        "snapshots_updated": updated,
+        "unmatched_rc_players": unmatched,
+    }
 
 
 def import_event_batch(start: int, count: int = 10):
@@ -157,4 +232,15 @@ def import_event_batch(start: int, count: int = 10):
             results.append(import_event(event_id))
         except Exception as exc:
             results.append({"ok": False, "event_id": event_id, "error": f"{type(exc).__name__}: {exc}"})
-    return {"ok": True, "mode": "batch_import", "start": int(start), "count": count, "results": results, "snapshots_created": sum(r.get("snapshots_created", 0) for r in results), "snapshots_updated": sum(r.get("snapshots_updated", 0) for r in results), "errors": sum(not r.get("ok", False) for r in results)}
+    return {
+        "ok": True,
+        "mode": "batch_import",
+        "start": int(start),
+        "count": count,
+        "results": results,
+        "snapshots_created": sum(r.get("snapshots_created", 0) for r in results),
+        "snapshots_updated": sum(r.get("snapshots_updated", 0) for r in results),
+        "players_matched_now": sum(r.get("players_matched_now", 0) for r in results),
+        "ambiguous_name_matches": sum(r.get("ambiguous_name_matches", 0) for r in results),
+        "errors": sum(not r.get("ok", False) for r in results),
+    }
