@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 
 from .db import SessionLocal, create_all
 from .models import XttvPlayer
+from .rc_index import import_index as rc_index_import
 from .rc_index import local_candidates, to_rc_search_name
 
 RC_BASE = "https://www.ratingscentral.com"
@@ -57,11 +58,7 @@ def _parse_rc_search_results(html: str) -> list[dict]:
                 name = next((cell for cell in cells if "," in cell), "")
             if not name or "," not in name:
                 continue
-            unique[rc_id] = {
-                "rc_player_id": rc_id,
-                "name": name,
-                "cells": cells,
-            }
+            unique[rc_id] = {"rc_player_id": rc_id, "name": name, "cells": cells}
     return list(unique.values())
 
 
@@ -98,13 +95,7 @@ def search_rc(name: str, limit: int = 20) -> list[dict]:
         "MaxLastPlayedDate": "",
     }
     url = f"{RC_BASE}/PlayerList.php?{urlencode(params)}"
-    request = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml",
-        },
-    )
+    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
     with urlopen(request, timeout=20) as response:
         html = response.read().decode("utf-8", errors="replace")
 
@@ -129,6 +120,10 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
         )
         targets = [(p.external_player_id, p.name, p.club) for p in players]
 
+    # Warm the persistent exact-name cache once for the whole batch. Duplicate
+    # XTTV rows with the same person therefore share one RC request.
+    prefetch = rc_index_import(limit=limit, offset=offset, force=False)
+
     results = []
     for external_id, name, club in targets:
         try:
@@ -143,28 +138,24 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
             else:
                 status = "not_found"
                 candidate = None
-            results.append(
-                {
-                    "xttv_player_id": external_id,
-                    "name": name,
-                    "rc_search_name": to_rc_search_name(name),
-                    "club": club,
-                    "status": status,
-                    "candidate": candidate,
-                    "candidates": candidates[:10],
-                }
-            )
+            results.append({
+                "xttv_player_id": external_id,
+                "name": name,
+                "rc_search_name": to_rc_search_name(name),
+                "club": club,
+                "status": status,
+                "candidate": candidate,
+                "candidates": candidates[:10],
+            })
         except Exception as exc:
-            results.append(
-                {
-                    "xttv_player_id": external_id,
-                    "name": name,
-                    "rc_search_name": to_rc_search_name(name),
-                    "club": club,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+            results.append({
+                "xttv_player_id": external_id,
+                "name": name,
+                "rc_search_name": to_rc_search_name(name),
+                "club": club,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
 
     return {
         "ok": True,
@@ -172,6 +163,11 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
         "offset": offset,
         "limit": limit,
         "requested": len(targets),
+        "prefetch": {
+            "unique_search_names": prefetch.get("unique_search_names", 0),
+            "requests_made": prefetch.get("requests_made", 0),
+            "candidate_rows_stored": prefetch.get("candidate_rows_stored", 0),
+        },
         "matched": sum(r["status"] == "matched" for r in results),
         "ambiguous": sum(r["status"] == "ambiguous" for r in results),
         "not_found": sum(r["status"] == "not_found" for r in results),
