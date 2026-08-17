@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 from .db import SessionLocal, create_all
 from .models import XttvPlayer
-from .rc_index import local_candidates
+from .rc_index import local_candidates, to_rc_search_name
 
 RC_BASE = "https://www.ratingscentral.com"
 USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral player lookup)"
@@ -17,7 +17,10 @@ USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral player lookup)"
 
 def clean_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", value or "")
-    return "".join(ch for ch in value if unicodedata.category(ch) not in {"Cf", "Cc"} or ch in "\t\n\r").strip()
+    return "".join(
+        ch for ch in value
+        if unicodedata.category(ch) not in {"Cf", "Cc"} or ch in "\t\n\r"
+    ).strip()
 
 
 def norm_tokens(value: str) -> tuple[str, ...]:
@@ -38,57 +41,92 @@ def score_name(xttv_name: str, rc_name: str) -> int:
     return 0
 
 
+def _parse_rc_search_results(html: str) -> list[dict]:
+    """Parse the intermediate PlayerList.php result table."""
+    soup = BeautifulSoup(html, "html.parser")
+    unique: dict[int, dict] = {}
+    for row in soup.find_all("tr"):
+        cells = [clean_text(" ".join(c.stripped_strings)) for c in row.find_all(["th", "td"])]
+        for link in row.find_all("a", href=True):
+            match = re.search(r"[?&]PlayerID=(\d+)", link.get("href", ""), re.I)
+            if not match:
+                continue
+            rc_id = int(match.group(1))
+            name = clean_text(" ".join(link.stripped_strings))
+            if "," not in name:
+                name = next((cell for cell in cells if "," in cell), "")
+            if not name or "," not in name:
+                continue
+            unique[rc_id] = {
+                "rc_player_id": rc_id,
+                "name": name,
+                "cells": cells,
+            }
+    return list(unique.values())
+
+
 def search_rc(name: str, limit: int = 20) -> list[dict]:
-    # Prefer the persistent RC index. If it is not populated yet, use the
-    # documented partial-name search as a fallback; importantly, RC expects
-    # the surname prefix including the comma (e.g. "Wittinghofer,").
+    """Find an RC player using RC's real homepage search flow.
+
+    First use the persistent cache. If this exact full-name search has not
+    been cached yet, request PlayerList.php with 'Surname, Firstname'. The
+    returned table contains the Player.php link and therefore the RC ID.
+    """
     indexed = local_candidates(name, limit=100)
     if indexed:
         candidates = []
-        for c in indexed:
-            score = score_name(name, c.get("name", ""))
+        for candidate in indexed:
+            score = score_name(name, candidate.get("name", ""))
             if score:
-                candidates.append({**c, "score": score})
+                candidates.append({**candidate, "score": score})
         return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
 
-    parts = [p for p in re.split(r"[\s,]+", clean_text(name)) if p]
-    surname = parts[0] if parts else name
-    params = {"Name": f"{surname},", "PlayerSport": "Table Tennis"}
-    url = f"{RC_BASE}/PlayerSearch.php?{urlencode(params)}"
-    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
-    with urlopen(req, timeout=15) as response:
+    search_name = to_rc_search_name(name)
+    params = {
+        "PlayerName": search_name,
+        "PlayerID": "",
+        "PlayerUSATT_ID": "",
+        "PlayerTTA_ID": "",
+        "PlayerSport": "Any",
+        "MinRating": "",
+        "MaxRating": "",
+        "MaxCurrentStDev": "",
+        "MaxLastPlayedStDev": "",
+        "MinLastPlayed": "",
+        "MaxLastPlayed": "",
+        "MinLastPlayedDate": "",
+        "MaxLastPlayedDate": "",
+    }
+    url = f"{RC_BASE}/PlayerList.php?{urlencode(params)}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+    with urlopen(request, timeout=20) as response:
         html = response.read().decode("utf-8", errors="replace")
-    soup = BeautifulSoup(html, "html.parser")
+
     candidates = []
-    for row in soup.find_all("tr"):
-        cells = [clean_text(" ".join(c.stripped_strings)) for c in row.find_all(["th", "td"])]
-        if not cells:
-            continue
-        rc_id = None
-        for link in row.find_all("a", href=True):
-            m = re.search(r"PlayerID=(\d+)", link["href"])
-            if m:
-                rc_id = int(m.group(1))
-                break
-        if rc_id is None:
-            continue
-        name_cell = next((c for c in cells if "," in c), None)
-        if not name_cell:
-            continue
-        score = score_name(name, name_cell)
+    for candidate in _parse_rc_search_results(html):
+        score = score_name(name, candidate["name"])
         if score:
-            candidates.append({"rc_player_id": rc_id, "name": name_cell, "score": score, "cells": cells})
-    unique = {}
-    for c in candidates:
-        if c["rc_player_id"] not in unique or c["score"] > unique[c["rc_player_id"]]["score"]:
-            unique[c["rc_player_id"]] = c
-    return sorted(unique.values(), key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
+            candidates.append({**candidate, "score": score})
+    return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
 
 
 def dry_run(limit: int = 30, offset: int = 0) -> dict:
     create_all()
     with SessionLocal() as session:
-        players = session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all()
+        players = (
+            session.query(XttvPlayer)
+            .filter(XttvPlayer.rc_player_id.is_(None))
+            .order_by(XttvPlayer.id)
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
         targets = [(p.external_player_id, p.name, p.club) for p in players]
 
     results = []
@@ -105,9 +143,28 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
             else:
                 status = "not_found"
                 candidate = None
-            results.append({"xttv_player_id": external_id, "name": name, "club": club, "status": status, "candidate": candidate, "candidates": candidates[:10]})
+            results.append(
+                {
+                    "xttv_player_id": external_id,
+                    "name": name,
+                    "rc_search_name": to_rc_search_name(name),
+                    "club": club,
+                    "status": status,
+                    "candidate": candidate,
+                    "candidates": candidates[:10],
+                }
+            )
         except Exception as exc:
-            results.append({"xttv_player_id": external_id, "name": name, "club": club, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+            results.append(
+                {
+                    "xttv_player_id": external_id,
+                    "name": name,
+                    "rc_search_name": to_rc_search_name(name),
+                    "club": club,
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
 
     return {
         "ok": True,
