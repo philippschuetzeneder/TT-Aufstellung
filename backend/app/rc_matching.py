@@ -12,6 +12,7 @@ from .db import SessionLocal, create_all
 from .models import XttvPlayer
 from .rc_index import import_index as rc_index_import
 from .rc_index import local_candidates, to_rc_search_name
+from .rc_manual_overrides import RC_PLAYER_OVERRIDES
 
 RC_BASE = "https://www.ratingscentral.com"
 USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral player lookup)"
@@ -178,6 +179,23 @@ def search_rc(name: str, limit: int = 20) -> list[dict]:
     return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
 
 
+def _manual_override_candidate(external_id: str, name: str) -> dict | None:
+    rc_id = RC_PLAYER_OVERRIDES.get(str(external_id))
+    if rc_id is None:
+        return None
+    return {
+        "rc_player_id": rc_id,
+        "name": name,
+        "name_norm": " ".join(norm_tokens(name)),
+        "score": 100,
+        "name_score": 100,
+        "recency_score": 0.0,
+        "match_score": 100.0,
+        "last_played": None,
+        "manual_override": True,
+    }
+
+
 def dry_run(limit: int = 30, offset: int = 0) -> dict:
     create_all()
     with SessionLocal() as session:
@@ -191,13 +209,26 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
         )
         targets = [(p.external_player_id, p.name, p.club) for p in players]
 
-    # Warm the persistent exact-name cache once for the whole batch. Duplicate
-    # XTTV rows with the same person therefore share one RC request.
     prefetch = rc_index_import(limit=limit, offset=offset, force=False)
 
     results = []
     for external_id, name, club in targets:
         try:
+            override = _manual_override_candidate(external_id, name)
+            if override is not None:
+                result = {
+                    "xttv_player_id": external_id,
+                    "name": name,
+                    "rc_search_name": to_rc_search_name(name),
+                    "club": club,
+                    "status": "matched",
+                    "candidate": override,
+                    "candidates": [override],
+                    "match_reason": "manual override",
+                }
+                results.append(result)
+                continue
+
             candidates = search_rc(name)
             status, candidate, ranked = resolve_candidates(name, candidates)
             result = {
