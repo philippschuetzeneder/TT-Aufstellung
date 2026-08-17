@@ -143,6 +143,37 @@ def bulk_import_rc(limit: int = 30, offset: int = 0) -> dict:
     return {"ok": True, "offset": offset, "limit": limit, "requested": len(targets), "imported": sum(r["status"]=="imported" for r in results), "errors": sum(r["status"]=="error" for r in results), "results": results}
 
 
+def match_and_import_rc(limit: int = 30, offset: int = 0) -> dict:
+    """Resolve eligible XTTV players and immediately persist RC identities/history."""
+    from .rc_matching import _manual_override_candidate, resolve_candidates, search_rc
+    create_all()
+    with SessionLocal() as session:
+        players = (session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all())
+        targets = [(p.external_player_id, p.name, p.club) for p in players]
+
+    results = []
+    for external_id, name, club in targets:
+        try:
+            override = _manual_override_candidate(external_id, name)
+            if override is not None:
+                rc_id = int(override["rc_player_id"])
+                reason = "manual override"
+            else:
+                candidates = search_rc(name)
+                status, candidate, ranked = resolve_candidates(name, candidates)
+                if status != "matched" or candidate is None:
+                    results.append({"xttv_player_id": external_id, "name": name, "status": status, "candidates": ranked[:10]})
+                    continue
+                rc_id = int(candidate["rc_player_id"])
+                reason = "matched"
+            imported = import_rc_player(rc_id, xttv_external_player_id=external_id, xttv_name=name, xttv_club=club)
+            results.append({"xttv_player_id": external_id, "name": name, "rc_player_id": rc_id, "status": "imported", "match_reason": reason, "historical_observations": imported["historical_observations"], "snapshots_upserted": imported["snapshots_upserted"]})
+        except Exception as exc:
+            results.append({"xttv_player_id": external_id, "name": name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+
+    return {"ok": True, "mode": "match_and_import", "offset": offset, "limit": limit, "requested": len(targets), "imported": sum(r["status"] == "imported" for r in results), "ambiguous": sum(r["status"] == "ambiguous" for r in results), "not_found": sum(r["status"] == "not_found" for r in results), "errors": sum(r["status"] == "error" for r in results), "results": results}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import Ratings Central current rating and 3-year history")
     parser.add_argument("rc_player_id", type=int); parser.add_argument("--xttv-player-id"); parser.add_argument("--xttv-external-player-id"); parser.add_argument("--xttv-name"); parser.add_argument("--xttv-club"); parser.add_argument("--cutoff", type=date.fromisoformat)
