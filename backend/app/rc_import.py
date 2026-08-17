@@ -47,7 +47,13 @@ def _normalized_name_tokens(value: str) -> tuple[str, ...]:
     return tuple(sorted(token for token in value.split() if token))
 
 
-def _find_xttv_player(session, rc_player_id: int, rc_name: str, xttv_player_id: str | None):
+def _find_xttv_player(session, rc_player_id: int, rc_name: str, xttv_player_id: str | None, xttv_external_player_id: str | None = None):
+    # Explicit XTTV ID is the strongest mapping signal. This is important for
+    # genuine duplicate-name cases such as the two Brandstetter Daniel records.
+    if xttv_external_player_id:
+        player = session.query(XttvPlayer).filter_by(external_player_id=xttv_external_player_id).one_or_none()
+        if player is not None:
+            return player
     player = session.query(XttvPlayer).filter_by(rc_player_id=rc_player_id).one_or_none()
     if player is not None:
         return player
@@ -110,7 +116,7 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, xt
         if raw is None: raw = RawSourceDocument(source="ratingscentral", external_id=source_external_id, url=url, content=html); session.add(raw); session.flush()
         else: raw.url, raw.content, raw.fetched_at, raw.content_type = url, html, datetime.utcnow(), content_type
         raw.http_status = 200
-        player = _find_xttv_player(session, rc_player_id, parsed["name"], xttv_player_id)
+        player = _find_xttv_player(session, rc_player_id, parsed["name"], xttv_player_id, xttv_external_player_id)
         if player is None and xttv_external_player_id:
             player = session.query(XttvPlayer).filter_by(external_player_id=xttv_external_player_id).one_or_none()
             if player is None:
@@ -143,8 +149,7 @@ def match_and_import_rc(limit: int = 30, offset: int = 0) -> dict:
             if override is not None:
                 rc_id = int(override["rc_player_id"]); reason = "manual override"
             else:
-                candidates = search_rc(name)
-                status, candidate, ranked = resolve_candidates(name, candidates)
+                candidates = search_rc(name); status, candidate, ranked = resolve_candidates(name, candidates)
                 if status != "matched" or candidate is None:
                     results.append({"xttv_player_id": external_id, "name": name, "status": status, "candidates": ranked[:10]}); continue
                 rc_id = int(candidate["rc_player_id"]); reason = "matched"
