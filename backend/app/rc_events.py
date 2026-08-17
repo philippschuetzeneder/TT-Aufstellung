@@ -68,10 +68,10 @@ def _debug_one(event_id: int) -> dict:
 
 def debug_event(event_id: int) -> dict:
     # Compatibility test mode: 1,000,000 + start means batch debug.
-    # Import mode: 2,000,000 + start means persist a batch of 10 events.
+    # Import mode: 2,000,000 + start means persist a batch of 50 events.
     if event_id >= 2_000_000:
         from .rc_event_import import import_event_batch
-        return import_event_batch(event_id - 2_000_000, 10)
+        return import_event_batch(event_id - 2_000_000, 50)
     if event_id >= 1_000_000:
         start = event_id - 1_000_000
         count = 10
