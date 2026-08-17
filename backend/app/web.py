@@ -13,7 +13,7 @@ from .db import database_health, SessionLocal
 from .db_routes import get_match
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
-from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import, rebuild_player_master
+from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import, rebuild_player_master, player_master_status
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
 from .rc_matching import dry_run as rc_matching_dry_run
@@ -95,6 +95,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/teams": return self.send_json(list_teams())
             if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0]))
             if parsed.path=="/api/xttv/player-find": return self.send_json(find_xttv_players(query.get("name",[None])[0],query.get("team",[None])[0]))
+            if parsed.path=="/api/xttv/player-master-status": return self.send_json(player_master_status())
             if parsed.path=="/api/xttv/player-master-rebuild":
                 try: limit=min(max(int(query.get("limit",["5000"])[0]),1),10000); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)

@@ -60,6 +60,24 @@ def rebuild_player_master(limit: int = 5000, offset: int = 0) -> dict:
     return {"ok": True, "matches_processed": len(matches), "unique_players_seen": len(seen), "created": created, "updated": updated, "skipped_without_external_id": skipped, "offset": offset, "limit": limit}
 
 
+def player_master_status() -> dict:
+    """Report player-master coverage against distinct XTTV player IDs already present in imported matches."""
+    create_all()
+    with SessionLocal() as session:
+        master_ids = {str(value[0]) for value in session.query(XttvPlayer.external_player_id).filter(XttvPlayer.external_player_id.isnot(None)).all()}
+        source_rows = session.query(MatchPlayer.external_player_id, MatchPlayer.name).filter(MatchPlayer.external_player_id.isnot(None)).all()
+        source_ids = {str(external_id) for external_id, _ in source_rows}
+        missing_ids = sorted(source_ids - master_ids, key=lambda value: int(value) if value.isdigit() else value)
+        return {
+            "ok": True,
+            "master_players": len(master_ids),
+            "distinct_players_seen_in_matches": len(source_ids),
+            "missing_from_master": len(missing_ids),
+            "coverage_percent": round((len(source_ids & master_ids) / len(source_ids)) * 100, 2) if source_ids else 100.0,
+            "missing_external_player_ids": missing_ids[:100],
+        }
+
+
 def import_one(meid: int) -> dict:
     create_all()
     html, status, content_type, url = fetch_match(meid)
