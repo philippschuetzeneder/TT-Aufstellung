@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -40,6 +41,76 @@ def score_name(xttv_name: str, rc_name: str) -> int:
     if len(a) == len(b) and set(a) == set(b):
         return 95
     return 0
+
+
+def _candidate_last_played(candidate: dict) -> date | None:
+    """Extract RC's last-played date from the PlayerList row."""
+    for cell in reversed(candidate.get("cells", [])):
+        value = clean_text(str(cell))
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            try:
+                return date.fromisoformat(value)
+            except ValueError:
+                pass
+    return None
+
+
+def _recency_score(candidate: dict, *, today: date | None = None) -> float:
+    """Give modest extra weight to a recently active RC identity.
+
+    Name equality remains the primary signal. Recency is only a tie-breaker
+    between otherwise exact-name candidates. The score decays over roughly
+    five years and is capped at 30 points so it can never outweigh a name
+    mismatch.
+    """
+    played = _candidate_last_played(candidate)
+    if played is None:
+        return 0.0
+    today = today or date.today()
+    days = max(0, (today - played).days)
+    return max(0.0, 30.0 - days / 60.0)
+
+
+def rank_candidates(xttv_name: str, candidates: list[dict], *, today: date | None = None) -> list[dict]:
+    """Rank exact-name RC candidates using name score plus activity recency."""
+    ranked = []
+    for candidate in candidates:
+        name_score = score_name(xttv_name, candidate.get("name", ""))
+        recency = _recency_score(candidate, today=today)
+        last_played = _candidate_last_played(candidate)
+        ranked.append({
+            **candidate,
+            "name_score": name_score,
+            "recency_score": round(recency, 2),
+            "match_score": round(name_score + recency, 2),
+            "last_played": last_played.isoformat() if last_played else None,
+        })
+    return sorted(
+        ranked,
+        key=lambda c: (-c["match_score"], -c["name_score"], c["rc_player_id"]),
+    )
+
+
+def resolve_candidates(xttv_name: str, candidates: list[dict], *, today: date | None = None) -> tuple[str, dict | None, list[dict]]:
+    """Resolve a name search without making unsafe guesses.
+
+    An exact-name candidate can be auto-selected only when it is uniquely
+    best and beats the second exact-name candidate by at least 10 points.
+    This resolves stale-vs-current duplicate RC identities while leaving
+    genuinely indistinguishable duplicates ambiguous.
+    """
+    ranked = rank_candidates(xttv_name, candidates, today=today)
+    exact = [c for c in ranked if c["name_score"] >= 95]
+    if not exact:
+        return "not_found", None, ranked
+    if len(exact) == 1:
+        return "matched", exact[0], ranked
+
+    top, second = exact[0], exact[1]
+    margin = top["match_score"] - second["match_score"]
+    if margin >= 10.0:
+        return "matched", top, ranked
+    return "ambiguous", None, ranked
 
 
 def _parse_rc_search_results(html: str) -> list[dict]:
@@ -128,25 +199,25 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
     for external_id, name, club in targets:
         try:
             candidates = search_rc(name)
-            exact = [c for c in candidates if c["score"] >= 95]
-            if len(exact) == 1:
-                status = "matched"
-                candidate = exact[0]
-            elif len(exact) > 1:
-                status = "ambiguous"
-                candidate = None
-            else:
-                status = "not_found"
-                candidate = None
-            results.append({
+            status, candidate, ranked = resolve_candidates(name, candidates)
+            result = {
                 "xttv_player_id": external_id,
                 "name": name,
                 "rc_search_name": to_rc_search_name(name),
                 "club": club,
                 "status": status,
                 "candidate": candidate,
-                "candidates": candidates[:10],
-            })
+                "candidates": ranked[:10],
+            }
+            if candidate is not None:
+                result["match_reason"] = (
+                    "exact name + unique candidate"
+                    if len([c for c in ranked if c["name_score"] >= 95]) == 1
+                    else "exact name + materially more recent RC activity"
+                )
+            elif status == "ambiguous":
+                result["match_reason"] = "multiple exact-name candidates with insufficient score separation"
+            results.append(result)
         except Exception as exc:
             results.append({
                 "xttv_player_id": external_id,
