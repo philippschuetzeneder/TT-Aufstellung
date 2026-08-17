@@ -123,10 +123,9 @@ def _quick_report_info(html: str) -> dict:
         league = m.group(1).strip() if m else None
     season_match = re.search(r"\b(20\d{2}/20\d{2})\b", text)
     season = season_match.group(1) if season_match else None
-    normalized_text = text.lower().replace("ö", "o").replace("ä", "a").replace("ü", "u").replace("ß", "ss")
-    is_ooettv = bool(re.search(r"ooettv|ooe[- ]?ttv|ober[oö]sterreichischer tischtennisverband|ober[oö]sterreichischer tischtennis", normalized_text))
+    ooettv_logo = any("logo_ooettv.png" in (img.get("src") or "").lower() for img in soup.find_all("img"))
     three_player = bool(re.search(r"Heim-Mannschaft:\s*(?:A-C|1-3)|Gast-Mannschaft:\s*(?:A-C|1-3)", text, re.I))
-    return {"league": league, "season": season, "is_ooettv": is_ooettv, "is_three_player": three_player}
+    return {"league": league, "season": season, "is_ooettv": ooettv_logo, "ooettv_detection": "logo_ooettv.png" if ooettv_logo else None, "is_three_player": three_player}
 
 
 def _scan_order(start: int, end: int, reference: int) -> list[int]:
