@@ -11,7 +11,7 @@ from .models import MatchGame, MatchPlayer, RawSourceDocument, XttvMatch, XttvPl
 from .xttv_import import fetch_match
 from .xttv_parser import parse_match
 
-TARGET_LEAGUE = "411 RK Linz Umg. / MV Mitte 2025/2026"
+TARGET_SEASONS = {"2025/2026", "2024/2025", "2023/2024"}
 REFERENCE_MEID = 437757
 DEFAULT_RADIUS = 150
 DEFAULT_LIMIT = 20
@@ -108,16 +108,25 @@ def _already_imported(meid: int) -> bool:
 
 
 def _quick_report_info(html: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser"); tables = soup.find_all("table"); text = " ".join(soup.stripped_strings); league = None
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    text = " ".join(soup.stripped_strings)
+    league = None
     if len(tables) >= 2:
         rows = tables[1].find_all("tr")
         if rows:
             cells = rows[0].find_all(["th", "td"])
-            if cells: league = " ".join(cells[0].stripped_strings)
+            if cells:
+                league = " ".join(cells[0].stripped_strings)
     if not league:
-        m = re.search(r"(\d+\s+[^\d\n]+?\s+20\d{2}/20\d{2})", text); league = m.group(1).strip() if m else None
+        m = re.search(r"(\d+\s+[^\d\n]+?\s+20\d{2}/20\d{2})", text)
+        league = m.group(1).strip() if m else None
+    season_match = re.search(r"\b(20\d{2}/20\d{2})\b", text)
+    season = season_match.group(1) if season_match else None
+    normalized_text = text.lower().replace("ö", "o").replace("ä", "a").replace("ü", "u").replace("ß", "ss")
+    is_ooettv = bool(re.search(r"ooettv|ooe[- ]?ttv|ober[oö]sterreichischer tischtennisverband|ober[oö]sterreichischer tischtennis", normalized_text))
     three_player = bool(re.search(r"Heim-Mannschaft:\s*(?:A-C|1-3)|Gast-Mannschaft:\s*(?:A-C|1-3)", text, re.I))
-    return {"league": league, "is_three_player": three_player}
+    return {"league": league, "season": season, "is_ooettv": is_ooettv, "is_three_player": three_player}
 
 
 def _scan_order(start: int, end: int, reference: int) -> list[int]:
@@ -134,29 +143,62 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
     create_all()
     if end < start: raise ValueError("end must be >= start")
     if limit < 1 or limit > 100: raise ValueError("limit must be between 1 and 100")
-    checked = candidates = imported = skipped_existing = errors = three_player = non_target = 0; hits=[]; error_samples=[]; reference=REFERENCE_MEID if start <= REFERENCE_MEID <= end else (start+end)//2
-    for meid in _scan_order(start,end,reference):
+    checked = candidates = imported = skipped_existing = errors = three_player = non_target = 0
+    hits = []; error_samples = []
+    reference = REFERENCE_MEID if start <= REFERENCE_MEID <= end else (start + end) // 2
+    for meid in _scan_order(start, end, reference):
         if imported >= limit: break
         checked += 1
         try:
-            html,_,_,_=fetch_match(meid); quick=_quick_report_info(html)
-            if quick["league"] != TARGET_LEAGUE: non_target += 1; time.sleep(delay); continue
+            html, _, _, _ = fetch_match(meid)
+            quick = _quick_report_info(html)
+            if quick["season"] not in TARGET_SEASONS or not quick["is_ooettv"]:
+                non_target += 1
+                time.sleep(delay)
+                continue
             candidates += 1
-            if quick["is_three_player"]: three_player += 1; hits.append({"meid":meid,"saved":False,"reason":"three_player_report"}); time.sleep(delay); continue
-            parsed=parse_match(html,meid)
+            if quick["is_three_player"]:
+                three_player += 1
+                hits.append({"meid": meid, "saved": False, "reason": "three_player_report"})
+                time.sleep(delay)
+                continue
+            parsed = parse_match(html, meid)
         except Exception as exc:
             errors += 1
-            if len(error_samples)<20: error_samples.append({"meid":meid,"error":f"{type(exc).__name__}: {exc}"})
-            time.sleep(delay); continue
+            if len(error_samples) < 20: error_samples.append({"meid": meid, "error": f"{type(exc).__name__}: {exc}"})
+            time.sleep(delay)
+            continue
         if not _is_valid_4_player_report(parsed):
             errors += 1
-            if len(error_samples)<20: error_samples.append({"meid":meid,"error":f"invalid_4_player_report players={parsed.get('player_count')} singles={parsed.get('singles_count')} doubles={parsed.get('doubles_count')}"})
+            if len(error_samples) < 20: error_samples.append({"meid": meid, "error": f"invalid_4_player_report players={parsed.get('player_count')} singles={parsed.get('singles_count')} doubles={parsed.get('doubles_count')}"})
             continue
-        if _already_imported(meid): skipped_existing += 1; hits.append({"meid":meid,"saved":False,"reason":"already_imported"}); continue
+        if _already_imported(meid):
+            skipped_existing += 1
+            hits.append({"meid": meid, "saved": False, "reason": "already_imported"})
+            continue
         try:
-            result=import_one(meid); imported += 1; hits.append({"meid":meid,"saved":True,"match_id":result["match_id"],"home_team":result["home_team"],"away_team":result["away_team"],"team_result":result["team_result"]})
+            result = import_one(meid)
+            imported += 1
+            hits.append({"meid": meid, "saved": True, "match_id": result["match_id"], "home_team": result["home_team"], "away_team": result["away_team"], "team_result": result["team_result"]})
         except Exception as exc:
             errors += 1
-            if len(error_samples)<20: error_samples.append({"meid":meid,"error":f"{type(exc).__name__}: {exc}"})
+            if len(error_samples) < 20: error_samples.append({"meid": meid, "error": f"{type(exc).__name__}: {exc}"})
         time.sleep(delay)
-    return {"ok":True,"target_league":TARGET_LEAGUE,"reference_meid":reference,"range":{"start":start,"end":end},"limit":limit,"checked":checked,"league_candidates":candidates,"imported":imported,"skipped_existing":skipped_existing,"three_player_skipped":three_player,"non_target":non_target,"errors":errors,"hits":hits,"error_samples":error_samples,"stopped_after_limit":imported>=limit}
+    return {
+        "ok": True,
+        "target_seasons": sorted(TARGET_SEASONS, reverse=True),
+        "target_region": "OOETTV / Oberoesterreich",
+        "reference_meid": reference,
+        "range": {"start": start, "end": end},
+        "limit": limit,
+        "checked": checked,
+        "league_candidates": candidates,
+        "imported": imported,
+        "skipped_existing": skipped_existing,
+        "three_player_skipped": three_player,
+        "non_target": non_target,
+        "errors": errors,
+        "hits": hits,
+        "error_samples": error_samples,
+        "stopped_after_limit": imported >= limit,
+    }
