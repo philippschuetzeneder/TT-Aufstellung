@@ -129,8 +129,41 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, xt
     return {"ok": True, "rc_player_id": rc_player_id, "name": parsed["name"], "xttv_player_id": player.external_player_id, "current": parsed["current"], "historical_observations": len(parsed["history"]), "snapshots_upserted": saved}
 
 
+def match_and_import_rc(limit: int = 30, offset: int = 0) -> dict:
+    """Resolve eligible XTTV players and immediately persist RC identities/history."""
+    from .rc_matching import _manual_override_candidate, resolve_candidates, search_rc
+    create_all()
+    with SessionLocal() as session:
+        players = (session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all())
+        targets = [(p.external_player_id, p.name, p.club) for p in players]
+    results = []
+    for external_id, name, club in targets:
+        try:
+            override = _manual_override_candidate(external_id, name)
+            if override is not None:
+                rc_id = int(override["rc_player_id"]); reason = "manual override"
+            else:
+                candidates = search_rc(name)
+                status, candidate, ranked = resolve_candidates(name, candidates)
+                if status != "matched" or candidate is None:
+                    results.append({"xttv_player_id": external_id, "name": name, "status": status, "candidates": ranked[:10]}); continue
+                rc_id = int(candidate["rc_player_id"]); reason = "matched"
+            imported = import_rc_player(rc_id, xttv_external_player_id=external_id, xttv_name=name, xttv_club=club)
+            results.append({"xttv_player_id": external_id, "name": name, "rc_player_id": rc_id, "status": "imported", "match_reason": reason, "historical_observations": imported["historical_observations"], "snapshots_upserted": imported["snapshots_upserted"]})
+        except Exception as exc:
+            results.append({"xttv_player_id": external_id, "name": name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+    return {"ok": True, "mode": "match_and_import", "offset": offset, "limit": limit, "requested": len(targets), "imported": sum(r["status"] == "imported" for r in results), "ambiguous": sum(r["status"] == "ambiguous" for r in results), "not_found": sum(r["status"] == "not_found" for r in results), "errors": sum(r["status"] == "error" for r in results), "results": results}
+
+
 def bulk_import_rc(limit: int = 30, offset: int = 0) -> dict:
-    create_all(); results=[]
+    # The bulk endpoint now performs matching + import for currently unmapped players.
+    # Existing mapped players continue to be imported through the same endpoint.
+    create_all()
+    with SessionLocal() as session:
+        unmapped = session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).count()
+    if unmapped:
+        return match_and_import_rc(limit=limit, offset=offset)
+    results=[]
     with SessionLocal() as session:
         players = session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.isnot(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all()
         targets = [(p.id, p.external_player_id, p.rc_player_id, p.name, p.club) for p in players]
@@ -141,37 +174,6 @@ def bulk_import_rc(limit: int = 30, offset: int = 0) -> dict:
         except Exception as exc:
             results.append({"xttv_player_id": external_id, "name": name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
     return {"ok": True, "offset": offset, "limit": limit, "requested": len(targets), "imported": sum(r["status"]=="imported" for r in results), "errors": sum(r["status"]=="error" for r in results), "results": results}
-
-
-def match_and_import_rc(limit: int = 30, offset: int = 0) -> dict:
-    """Resolve eligible XTTV players and immediately persist RC identities/history."""
-    from .rc_matching import _manual_override_candidate, resolve_candidates, search_rc
-    create_all()
-    with SessionLocal() as session:
-        players = (session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all())
-        targets = [(p.external_player_id, p.name, p.club) for p in players]
-
-    results = []
-    for external_id, name, club in targets:
-        try:
-            override = _manual_override_candidate(external_id, name)
-            if override is not None:
-                rc_id = int(override["rc_player_id"])
-                reason = "manual override"
-            else:
-                candidates = search_rc(name)
-                status, candidate, ranked = resolve_candidates(name, candidates)
-                if status != "matched" or candidate is None:
-                    results.append({"xttv_player_id": external_id, "name": name, "status": status, "candidates": ranked[:10]})
-                    continue
-                rc_id = int(candidate["rc_player_id"])
-                reason = "matched"
-            imported = import_rc_player(rc_id, xttv_external_player_id=external_id, xttv_name=name, xttv_club=club)
-            results.append({"xttv_player_id": external_id, "name": name, "rc_player_id": rc_id, "status": "imported", "match_reason": reason, "historical_observations": imported["historical_observations"], "snapshots_upserted": imported["snapshots_upserted"]})
-        except Exception as exc:
-            results.append({"xttv_player_id": external_id, "name": name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
-
-    return {"ok": True, "mode": "match_and_import", "offset": offset, "limit": limit, "requested": len(targets), "imported": sum(r["status"] == "imported" for r in results), "ambiguous": sum(r["status"] == "ambiguous" for r in results), "not_found": sum(r["status"] == "not_found" for r in results), "errors": sum(r["status"] == "error" for r in results), "results": results}
 
 
 def main() -> None:
