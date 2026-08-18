@@ -43,6 +43,21 @@ def _pairs(cell: str):
     return result
 
 
+def _resolve_winner_code(winner_code: str, home_code: str, away_code: str) -> str:
+    if winner_code == home_code:
+        return "home"
+    if winner_code == away_code:
+        return "away"
+    matches = []
+    if home_code and home_code.startswith(winner_code):
+        matches.append("home")
+    if away_code and away_code.startswith(winner_code):
+        matches.append("away")
+    if len(matches) == 1:
+        return matches[0]
+    raise ValueError(f"Unknown winner code {winner_code!r}; expected {home_code!r} or {away_code!r}")
+
+
 def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code: str, away_code: str, vertical_side: str):
     # XTTV prints the score from the vertical lineup's perspective. Therefore
     # the score must be reversed only when the vertical lineup is the away team.
@@ -50,12 +65,7 @@ def _result_for_sides(raw_left: int, raw_right: int, winner_code: str, home_code
         result = f"{raw_left}:{raw_right}"
     else:
         result = f"{raw_right}:{raw_left}"
-
-    if winner_code == home_code:
-        return result, "home"
-    if winner_code == away_code:
-        return result, "away"
-    raise ValueError(f"Unknown winner code {winner_code!r}; expected {home_code!r} or {away_code!r}")
+    return result, _resolve_winner_code(winner_code, home_code, away_code)
 
 
 def _expected_singles_count(home_wins: int, away_wins: int) -> int:
@@ -199,18 +209,7 @@ def parse_match(html: str, meid: int) -> dict:
             vertical_player = by_pos[(vertical_side, pos)]
             home_player = horizontal_player if horizontal_side == "home" else vertical_player
             away_player = vertical_player if vertical_side == "away" else horizontal_player
-            games.append({
-                "sequence": seq,
-                "game_type": "singles",
-                "home_position": home_player["position"],
-                "away_position": away_player["position"],
-                "home_player": home_player["name"],
-                "away_player": away_player["name"],
-                "result": result,
-                "sets": result,
-                "winner_side": winner_side,
-                "raw_row": cell,
-            })
+            games.append({"sequence": seq, "game_type": "singles", "home_position": home_player["position"], "away_position": away_player["position"], "home_player": home_player["name"], "away_player": away_player["name"], "result": result, "sets": result, "winner_side": winner_side, "raw_row": cell})
 
     horizontal_pairs = {}
     for cell in grid[0]:
@@ -231,18 +230,7 @@ def parse_match(html: str, meid: int) -> dict:
             vp = vertical_pairs.get(seq)
             home_pair = hp["players"] if horizontal_side == "home" and hp else vp["players"] if vertical_side == "home" and vp else None
             away_pair = hp["players"] if horizontal_side == "away" and hp else vp["players"] if vertical_side == "away" and vp else None
-            games.append({
-                "sequence": seq,
-                "game_type": "doubles",
-                "home_position": None,
-                "away_position": None,
-                "home_player": home_pair,
-                "away_player": away_pair,
-                "result": result,
-                "sets": result,
-                "winner_side": winner_side,
-                "raw_row": cell,
-            })
+            games.append({"sequence": seq, "game_type": "doubles", "home_position": None, "away_position": None, "home_player": home_pair, "away_player": away_pair, "result": result, "sets": result, "winner_side": winner_side, "raw_row": cell})
 
     games.sort(key=lambda g: g["sequence"])
     home_wins = sum(g["winner_side"] == "home" for g in games)
@@ -258,27 +246,4 @@ def parse_match(html: str, meid: int) -> dict:
     singles = [g for g in games if g["game_type"] == "singles"]
     doubles = [g for g in games if g["game_type"] == "doubles"]
     season = re.search(r"\b(20\d{2}/20\d{2})\b", competition)
-    return {
-        "external_id": str(meid),
-        "source_url": MATCH_URL.format(meid=meid),
-        "title": clean(soup.title.get_text(" ", strip=True)) if soup.title else None,
-        "league": competition,
-        "season": season.group(1) if season else None,
-        "round": int(round_match.group(1)) if round_match else None,
-        "leg": int(round_match.group(2)) if round_match else None,
-        "match_date": date_match.group(1) if date_match else None,
-        "home_team": home_team,
-        "away_team": away_team,
-        "home_code": home_code,
-        "away_code": away_code,
-        "home_scheme": home_scheme,
-        "away_scheme": away_scheme,
-        "team_result": team_result,
-        "players": players,
-        "games": games,
-        "player_count": len(players),
-        "singles_count": len(singles),
-        "doubles_count": len(doubles),
-        "has_doubles": True,
-        "raw_text": clean(soup.get_text(" ", strip=True)),
-    }
+    return {"external_id": str(meid), "source_url": MATCH_URL.format(meid=meid), "title": clean(soup.title.get_text(" ", strip=True)) if soup.title else None, "league": competition, "season": season.group(1) if season else None, "round": int(round_match.group(1)) if round_match else None, "leg": int(round_match.group(2)) if round_match else None, "match_date": date_match.group(1) if date_match else None, "home_team": home_team, "away_team": away_team, "home_code": home_code, "away_code": away_code, "home_scheme": home_scheme, "away_scheme": away_scheme, "team_result": team_result, "players": players, "games": games, "player_count": len(players), "singles_count": len(singles), "doubles_count": len(doubles), "has_doubles": True, "raw_text": clean(soup.get_text(" ", strip=True))}
