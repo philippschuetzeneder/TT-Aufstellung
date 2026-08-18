@@ -110,9 +110,17 @@
         total+=Number(d.imported||0);
         log(`checked=${d.checked}, imported=${d.imported}, skipped=${d.skipped_existing}, errors=${d.errors}, stopped=${d.stopped_after_limit}, totalImported=${total}`);
 
-        current=direction==='forward'
-          ? currentEnd+1
-          : currentStart-1;
+        // Wenn der Scanner am Limit abgebrochen hat, bleibt derselbe 1000er-
+        // Bereich aktiv. Der nächste Request holt die nächsten Treffer aus
+        // diesem Bereich. Erst bei stopped_after_limit=false geht es weiter.
+        if(d.stopped_after_limit){
+          log("Limit erreicht – derselbe Bereich wird erneut verarbeitet …");
+        }else{
+          current=direction==='forward'
+            ? currentEnd+1
+            : currentStart-1;
+        }
+
         await new Promise(x=>setTimeout(x,250));
       }
 
