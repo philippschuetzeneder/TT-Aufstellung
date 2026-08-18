@@ -86,9 +86,8 @@ def import_one(meid: int) -> dict:
         raise ValueError(f"Not a valid 4-player report: players={parsed['player_count']}, singles={parsed['singles_count']}, doubles={parsed['doubles_count']}")
     with SessionLocal.begin() as session:
         raw = session.query(RawSourceDocument).filter_by(source="xttv", external_id=str(meid)).one_or_none()
-        if raw is None: raw = RawSourceDocument(source="xttv", external_id=str(meid), content=html); session.add(raw)
+        if raw is None: raw = RawSourceDocument(source="xttv", external_id=str(meid), url=url, content=html); session.add(raw)
         else: raw.url, raw.content = url, html
-        raw.url = url
         raw.http_status, raw.content_type, raw.fetched_at = status, content_type, datetime.utcnow()
         match = session.query(XttvMatch).filter_by(external_id=str(meid)).one_or_none()
         if match is None: match = XttvMatch(external_id=str(meid), source_url=url); session.add(match); session.flush()
