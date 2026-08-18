@@ -15,6 +15,7 @@ TARGET_SEASONS = {"2025/2026", "2024/2025", "2023/2024"}
 REFERENCE_MEID = 437757
 DEFAULT_RADIUS = 150
 DEFAULT_LIMIT = 20
+MAX_IMPORT_LIMIT = 1000
 
 
 def _is_valid_4_player_report(parsed: dict) -> bool:
@@ -140,7 +141,7 @@ def _scan_order(start: int, end: int, reference: int) -> list[int]:
 def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: float = 0.05) -> dict:
     create_all()
     if end < start: raise ValueError("end must be >= start")
-    if limit < 1 or limit > 100: raise ValueError("limit must be between 1 and 100")
+    if limit < 1 or limit > MAX_IMPORT_LIMIT: raise ValueError(f"limit must be between 1 and {MAX_IMPORT_LIMIT}")
     checked = candidates = imported = skipped_existing = errors = three_player = non_target = 0
     hits = []; error_samples = []
     reference = REFERENCE_MEID if start <= REFERENCE_MEID <= end else (start + end) // 2
