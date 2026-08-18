@@ -80,7 +80,6 @@ def player_master_status() -> dict:
 
 
 def import_one(meid: int) -> dict:
-    create_all()
     html, status, content_type, url = fetch_match(meid)
     parsed = parse_match(html, meid)
     if not _is_valid_4_player_report(parsed):
