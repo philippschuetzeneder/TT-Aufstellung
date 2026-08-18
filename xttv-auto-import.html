@@ -11,30 +11,32 @@
   <script>
     (async()=>{
       const p=new URLSearchParams(location.search),
-        s=Number(p.get("start")),
-        e=Number(p.get("end")),
+        initialStart=Number(p.get("start")),
+        finalEnd=Number(p.get("end")),
         b=Number(p.get("batch")||"200"),
+        span=1000,
         log=t=>document.getElementById("log").textContent+=`\n${t}`;
 
-      if(!Number.isInteger(s)||!Number.isInteger(e)||s>e||!Number.isInteger(b)||b<1||b>1000){
+      if(!Number.isInteger(initialStart)||!Number.isInteger(finalEnd)||initialStart>finalEnd||!Number.isInteger(b)||b<1||b>1000){
         log("Ungültige Parameter");
         return;
       }
 
       const maxRetries=8;
       const retryDelayMs=retry=>Math.min(30000,5000*2**(retry-1));
-      let n=0,total=0;
+      let batchNo=0,total=0,currentStart=initialStart;
 
-      for(;;){
-        n++;
-        const u=`/api/xttv/scan-import?start=${s}&end=${e}&limit=${b}&cb=${Date.now()}-${n}`;
-        log(`Batch ${n}: ${s}-${e}, limit=${b}`);
+      while(currentStart<=finalEnd){
+        batchNo++;
+        const currentEnd=Math.min(finalEnd,currentStart+span);
+        const u=`/api/xttv/scan-import?start=${currentStart}&end=${currentEnd}&limit=${b}&cb=${Date.now()}-${batchNo}`;
+        log(`Batch ${batchNo}: ${currentStart}-${currentEnd}, limit=${b}`);
 
-        let r;
         let d;
         let succeeded=false;
 
         for(let retry=0;retry<=maxRetries;retry++){
+          let r;
           try{
             r=await fetch(u,{cache:"no-store"});
           }catch(x){
@@ -58,8 +60,14 @@
                 log(`HTTP ${r.status}: kein JSON nach ${maxRetries} Wiederholungen`);
                 return;
               }
+              const wait=retryDelayMs(retry+1);
+              log(`HTTP ${r.status}: kein JSON – Wiederholung ${retry+1}/${maxRetries} in ${Math.ceil(wait/1000)}s …`);
+              await new Promise(x=>setTimeout(x,wait));
             }
-          }else if(r.status===429||r.status>=500){
+            continue;
+          }
+
+          if(r.status===429||r.status>=500){
             if(retry===maxRetries){
               log(`HTTP ${r.status}: nach ${maxRetries} Wiederholungen abgebrochen`);
               return;
@@ -68,29 +76,19 @@
             log(`HTTP ${r.status} – Wiederholung ${retry+1}/${maxRetries} in ${Math.ceil(wait/1000)}s …`);
             await new Promise(x=>setTimeout(x,wait));
             continue;
-          }else{
-            try{
-              d=await r.json();
-            }catch(x){
-              log(`HTTP ${r.status}: kein JSON`);
-              return;
-            }
-            succeeded=true;
-            break;
           }
 
-          if(!succeeded){
-            if(retry===maxRetries){
-              log(`HTTP ${r.status}: kein JSON nach ${maxRetries} Wiederholungen`);
-              return;
-            }
-            const wait=retryDelayMs(retry+1);
-            log(`HTTP ${r.status}: kein JSON – Wiederholung ${retry+1}/${maxRetries} in ${Math.ceil(wait/1000)}s …`);
-            await new Promise(x=>setTimeout(x,wait));
+          try{
+            d=await r.json();
+            succeeded=true;
+            break;
+          }catch(x){
+            log(`HTTP ${r.status}: kein JSON`);
+            return;
           }
         }
 
-        if(!d){
+        if(!succeeded||!d){
           log("Keine gültige Antwort erhalten.");
           return;
         }
@@ -103,13 +101,11 @@
         total+=Number(d.imported||0);
         log(`checked=${d.checked}, imported=${d.imported}, skipped=${d.skipped_existing}, errors=${d.errors}, stopped=${d.stopped_after_limit}, totalImported=${total}`);
 
-        if(!d.stopped_after_limit){
-          log(`FERTIG: ${total} neue Spiele importiert.`);
-          return;
-        }
-
+        currentStart=currentEnd+1;
         await new Promise(x=>setTimeout(x,250));
       }
+
+      log(`FERTIG: ${total} neue Spiele importiert.`);
     })();
   </script>
 </body>
