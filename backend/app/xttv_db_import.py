@@ -86,8 +86,9 @@ def import_one(meid: int) -> dict:
         raise ValueError(f"Not a valid 4-player report: players={parsed['player_count']}, singles={parsed['singles_count']}, doubles={parsed['doubles_count']}")
     with SessionLocal.begin() as session:
         raw = session.query(RawSourceDocument).filter_by(source="xttv", external_id=str(meid)).one_or_none()
-        if raw is None: raw = RawSourceDocument(source="xttv", external_id=str(meid), url=url, content=html); session.add(raw)
+        if raw is None: raw = RawSourceDocument(source="xttv", external_id=str(meid), content=html); session.add(raw)
         else: raw.url, raw.content = url, html
+        raw.url = url
         raw.http_status, raw.content_type, raw.fetched_at = status, content_type, datetime.utcnow()
         match = session.query(XttvMatch).filter_by(external_id=str(meid)).one_or_none()
         if match is None: match = XttvMatch(external_id=str(meid), source_url=url); session.add(match); session.flush()
@@ -123,9 +124,8 @@ def _quick_report_info(html: str) -> dict:
         league = m.group(1).strip() if m else None
     season_match = re.search(r"\b(20\d{2}/20\d{2})\b", text)
     season = season_match.group(1) if season_match else None
-    ooettv_logo = any("logo_ooettv.png" in (img.get("src") or "").lower() for img in soup.find_all("img"))
     three_player = bool(re.search(r"Heim-Mannschaft:\s*(?:A-C|1-3)|Gast-Mannschaft:\s*(?:A-C|1-3)", text, re.I))
-    return {"league": league, "season": season, "is_ooettv": ooettv_logo, "ooettv_detection": "logo_ooettv.png" if ooettv_logo else None, "is_three_player": three_player}
+    return {"league": league, "season": season, "is_three_player": three_player}
 
 
 def _scan_order(start: int, end: int, reference: int) -> list[int]:
@@ -151,7 +151,7 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
         try:
             html, _, _, _ = fetch_match(meid)
             quick = _quick_report_info(html)
-            if quick["season"] not in TARGET_SEASONS or not quick["is_ooettv"]:
+            if quick["season"] not in TARGET_SEASONS:
                 non_target += 1
                 time.sleep(delay)
                 continue
@@ -186,7 +186,6 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
     return {
         "ok": True,
         "target_seasons": sorted(TARGET_SEASONS, reverse=True),
-        "target_region": "OOETTV / Oberoesterreich",
         "reference_meid": reference,
         "range": {"start": start, "end": end},
         "limit": limit,
