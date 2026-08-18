@@ -14,23 +14,32 @@
         initialStart=Number(p.get("start")),
         finalEnd=Number(p.get("end")),
         b=Number(p.get("batch")||"200"),
+        direction=(p.get("direction")||"forward").toLowerCase(),
         span=1000,
         log=t=>document.getElementById("log").textContent+=`\n${t}`;
 
-      if(!Number.isInteger(initialStart)||!Number.isInteger(finalEnd)||initialStart>finalEnd||!Number.isInteger(b)||b<1||b>1000){
+      if(!Number.isInteger(initialStart)||!Number.isInteger(finalEnd)||!Number.isInteger(b)||b<1||b>1000||!['forward','backward'].includes(direction)||
+         (direction==='forward'&&initialStart>finalEnd)||(direction==='backward'&&initialStart<finalEnd)){
         log("Ungültige Parameter");
         return;
       }
 
       const maxRetries=8;
       const retryDelayMs=retry=>Math.min(30000,5000*2**(retry-1));
-      let batchNo=0,total=0,currentStart=initialStart;
+      let batchNo=0,total=0,current=initialStart;
 
-      while(currentStart<=finalEnd){
+      while(direction==='forward'?current<=finalEnd:current>=finalEnd){
         batchNo++;
-        const currentEnd=Math.min(finalEnd,currentStart+span);
+
+        const currentStart=direction==='forward'
+          ? current
+          : Math.max(finalEnd,current-span);
+        const currentEnd=direction==='forward'
+          ? Math.min(finalEnd,current+span)
+          : current;
+
         const u=`/api/xttv/scan-import?start=${currentStart}&end=${currentEnd}&limit=${b}&cb=${Date.now()}-${batchNo}`;
-        log(`Batch ${batchNo}: ${currentStart}-${currentEnd}, limit=${b}`);
+        log(`Batch ${batchNo}: ${currentStart}-${currentEnd}, limit=${b}, direction=${direction}`);
 
         let d;
         let succeeded=false;
@@ -101,7 +110,9 @@
         total+=Number(d.imported||0);
         log(`checked=${d.checked}, imported=${d.imported}, skipped=${d.skipped_existing}, errors=${d.errors}, stopped=${d.stopped_after_limit}, totalImported=${total}`);
 
-        currentStart=currentEnd+1;
+        current=direction==='forward'
+          ? currentEnd+1
+          : currentStart-1;
         await new Promise(x=>setTimeout(x,250));
       }
 
