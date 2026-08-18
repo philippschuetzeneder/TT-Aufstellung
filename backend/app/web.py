@@ -21,6 +21,8 @@ from .rc_index import import_index as rc_index_import, debug_search as rc_index_
 from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
 ROOT=Path(__file__).resolve().parents[2]
+RUNTIME_VERSION = "no-region-filter-v2"
+SOURCE_COMMIT = "7a59946ecd9a531cf0f7aa81154b93dce0a5fda0"
 
 def http_fetch(url,timeout=20):
     req=urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0 (compatible; TT-Aufstellung/0.1)","Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8","Accept-Language":"de-AT,de;q=0.9,en;q=0.5","Referer":"https://oettv.xttv.at/ed/index.php"})
@@ -76,13 +78,14 @@ def rc_snapshot_check(player_id:int):
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
-        data=json.dumps(payload,ensure_ascii=False,default=str).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
+        data=json.dumps(payload,ensure_ascii=False,default=str).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         parsed=urlparse(self.path); query=parse_qs(parsed.query)
         try: meid=int(query.get("meid",["437757"])[0])
         except ValueError: return self.send_json({"ok":False,"error":"meid must be an integer"},400)
         try:
-            if parsed.path=="/health": return self.send_json({"ok":True})
+            if parsed.path=="/health": return self.send_json({"ok":True,"runtime_version":RUNTIME_VERSION,"source_commit":SOURCE_COMMIT})
+            if parsed.path=="/api/runtime-version": return self.send_json({"ok":True,"runtime_version":RUNTIME_VERSION,"source_commit":SOURCE_COMMIT})
             if parsed.path=="/api/db/health": return self.send_json(database_health())
             if parsed.path=="/api/db/validate": return self.send_json(validate_database())
             if parsed.path=="/api/analytics/validate": return self.send_json(validate_analytics())
@@ -150,7 +153,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:return self.send_json({"ok":False,"error":f"{type(exc).__name__}: {exc}"},500)
         rel="index.html" if parsed.path in ("","/") else parsed.path.lstrip("/"); target=(ROOT/rel).resolve()
         if not str(target).startswith(str(ROOT.resolve())) or not target.is_file():return self.send_error(404)
-        content=target.read_bytes(); types={".html":"text/html",".css":"text/css",".mjs":"text/javascript",".js":"text/javascript"}; self.send_response(200); self.send_header("Content-Type",types.get(target.suffix,"application/octet-stream")+"; charset=utf-8"); self.send_header("Content-Length",str(len(content))); self.end_headers(); self.wfile.write(content)
+        content=target.read_bytes(); types={".html":"text/html",".css":"text/css",".mjs":"text/javascript",".js":"text/javascript"}; self.send_response(200); self.send_header("Content-Type",types.get(target.suffix,"application/octet-stream")+"; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(content))); self.end_headers(); self.wfile.write(content)
 
 def main():
     start_background_refresh(); ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","10000"))),Handler).serve_forever()
