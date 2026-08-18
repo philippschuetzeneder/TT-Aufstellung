@@ -123,9 +123,8 @@ def _quick_report_info(html: str) -> dict:
         league = m.group(1).strip() if m else None
     season_match = re.search(r"\b(20\d{2}/20\d{2})\b", text)
     season = season_match.group(1) if season_match else None
-    ooettv_logo = any("logo_ooettv.png" in (img.get("src") or "").lower() for img in soup.find_all("img"))
     three_player = bool(re.search(r"Heim-Mannschaft:\s*(?:A-C|1-3)|Gast-Mannschaft:\s*(?:A-C|1-3)", text, re.I))
-    return {"league": league, "season": season, "is_ooettv": ooettv_logo, "ooettv_detection": "logo_ooettv.png" if ooettv_logo else None, "is_three_player": three_player}
+    return {"league": league, "season": season, "is_three_player": three_player}
 
 
 def _scan_order(start: int, end: int, reference: int) -> list[int]:
@@ -151,7 +150,7 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
         try:
             html, _, _, _ = fetch_match(meid)
             quick = _quick_report_info(html)
-            if quick["season"] not in TARGET_SEASONS or not quick["is_ooettv"]:
+            if quick["season"] not in TARGET_SEASONS:
                 non_target += 1
                 time.sleep(delay)
                 continue
@@ -186,7 +185,6 @@ def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: flo
     return {
         "ok": True,
         "target_seasons": sorted(TARGET_SEASONS, reverse=True),
-        "target_region": "OOETTV / Oberoesterreich",
         "reference_meid": reference,
         "range": {"start": start, "end": end},
         "limit": limit,
