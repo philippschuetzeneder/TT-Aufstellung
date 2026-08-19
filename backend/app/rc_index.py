@@ -5,6 +5,7 @@ import re
 import socket
 import unicodedata
 from datetime import datetime
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -128,6 +129,9 @@ def import_index(limit: int = 30, offset: int = 0, force: bool = False, _batch_m
             results.append({"search_key": key, "search_name": search_name, "status": "fetched", "players": len(found)})
         except (socket.timeout, TimeoutError) as exc:
             results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}", "retryable": True})
+        except URLError as exc:
+            retryable = isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)) or "timed out" in str(exc).lower()
+            results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}", "retryable": retryable})
         except Exception as exc:
             results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}", "retryable": False})
     return {"ok": True, "mode": "rc_index", "offset": offset, "limit": limit, "requested_players": len(players), "unique_search_names": len(search_names), "requests_made": fetched, "candidate_rows_stored": stored, "retryable_errors": sum(1 for row in results if row.get("retryable")), "errors": sum(1 for row in results if row.get("status") == "error"), "results": results}
