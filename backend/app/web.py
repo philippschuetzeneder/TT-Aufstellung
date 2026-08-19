@@ -16,7 +16,7 @@ from .xttv_import import MATCH_URL, fetch_match, inspect_html
 from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import, rebuild_player_master, player_master_status
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
-from .rc_matching import dry_run as rc_matching_dry_run
+from .rc_matching import dry_run as rc_matching_dry_run, dry_run_all as rc_matching_dry_run_all
 from .rc_index import import_index as rc_index_import, debug_search as rc_index_debug_search
 from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
@@ -127,6 +127,7 @@ class Handler(BaseHTTPRequestHandler):
                 try: limit=min(max(int(query.get("limit",["30"])[0]),1),100); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
                 return self.send_json(rc_matching_dry_run(limit=limit,offset=offset))
+            if parsed.path=="/api/rc/match-dry-run-all": return self.send_json(rc_matching_dry_run_all())
             if parsed.path=="/api/rc/bulk":
                 try: limit=min(max(int(query.get("limit",["30"])[0]),1),300); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)

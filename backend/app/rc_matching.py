@@ -276,3 +276,80 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
         "errors": sum(r["status"] == "error" for r in results),
         "results": results,
     }
+
+
+def dry_run_all() -> dict:
+    """Run the RC matcher once across the complete XTTV master.
+
+    This endpoint is intentionally read-only. It uses only the already-built
+    local RC index and never falls back to live RatingsCentral requests. The
+    response contains aggregate counts plus only unresolved/error cases, so a
+    full 3,832-player run remains practical to inspect from the API.
+    """
+    create_all()
+    with SessionLocal() as session:
+        players = (
+            session.query(XttvPlayer)
+            .filter(XttvPlayer.rc_player_id.is_(None))
+            .order_by(XttvPlayer.id)
+            .all()
+        )
+        targets = [(p.external_player_id, p.name, p.club) for p in players]
+
+    matched = ambiguous = not_found = errors = 0
+    unresolved = []
+
+    for external_id, name, club in targets:
+        try:
+            override = _manual_override_candidate(external_id, name)
+            if override is not None:
+                matched += 1
+                continue
+
+            # Full-run deliberately uses only the completed local RC index.
+            # Do not trigger thousands of live RC requests if an index entry
+            # is missing; such a player is reported as not_found instead.
+            candidates = local_candidates(name, limit=100)
+            status, candidate, ranked = resolve_candidates(name, candidates)
+            if status == "matched":
+                matched += 1
+            elif status == "ambiguous":
+                ambiguous += 1
+                unresolved.append({
+                    "xttv_player_id": external_id,
+                    "name": name,
+                    "club": club,
+                    "status": status,
+                    "candidates": ranked[:10],
+                    "match_reason": "multiple exact-name candidates with insufficient score separation",
+                })
+            else:
+                not_found += 1
+                unresolved.append({
+                    "xttv_player_id": external_id,
+                    "name": name,
+                    "club": club,
+                    "status": "not_found",
+                    "candidates": ranked[:10],
+                })
+        except Exception as exc:
+            errors += 1
+            unresolved.append({
+                "xttv_player_id": external_id,
+                "name": name,
+                "club": club,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    total = len(targets)
+    return {
+        "ok": errors == 0,
+        "mode": "match_dry_run_all",
+        "total": total,
+        "matched": matched,
+        "ambiguous": ambiguous,
+        "not_found": not_found,
+        "errors": errors,
+        "unresolved": unresolved,
+    }
