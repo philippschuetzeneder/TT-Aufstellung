@@ -37,7 +37,7 @@ def debug_xttv(meid):
     for host in ("oettv.xttv.at","www.oettv.xttv.at","xttv.oettv.info"):
         try: result["checks"].append({"method":f"DNS {host}","ok":True,"addresses":sorted({x[4][0] for x in socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)})})
         except Exception as exc: result["checks"].append({"method":f"DNS {host}","ok":False,"error":f"{type(exc).__name__}: {exc}"})
-    for label,candidate in [("direct HTTPS",url),("HTTP fallback",url.replace("https://","http://",1)),("www HTTPS",url.replace("https://oettv.xttv.at","https://www.oettv.at",1)),("legacy HTTPS",url.replace("https://oettv.xttv.at","https://xttv.oettv.info",1))]: result["checks"].append({"method":label,"url":candidate,**http_fetch(candidate)})
+    for label,candidate in [("direct HTTPS",url),("HTTP fallback",url.replace("https://","http://",1)),("www HTTPS",url.replace("https://oettv.xttv.at","https://www.oettv.xttv.at",1)),("legacy HTTPS",url.replace("https://oettv.xttv.at","https://xttv.oettv.info",1))]: result["checks"].append({"method":label,"url":candidate,**http_fetch(candidate)})
     result["direct_success"]=any(c.get("method")=="direct HTTPS" and c.get("ok") for c in result["checks"]); return result
 
 def _norm(value: str) -> str:
