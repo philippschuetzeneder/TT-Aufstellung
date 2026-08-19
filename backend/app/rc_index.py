@@ -44,13 +44,6 @@ def to_rc_search_name(name: str) -> str:
 
 
 def _parse_rows(html: str) -> list[dict]:
-    """Parse the intermediate RC PlayerList result page.
-
-    PlayerList.php does not directly return the Player.php page. The result is
-    a table containing a clickable player name whose href contains PlayerID.
-    We deliberately take the anchor text as the canonical RC name and the
-    PlayerID from that same row.
-    """
     soup = BeautifulSoup(html, "html.parser")
     out: dict[int, dict] = {}
 
@@ -74,7 +67,6 @@ def _parse_rows(html: str) -> list[dict]:
         ]
         if not cells:
             continue
-
         for link in row.find_all("a", href=True):
             match = re.search(r"[?&]PlayerID=(\d+)", link.get("href", ""), re.I)
             if not match:
@@ -90,8 +82,6 @@ def _parse_rows(html: str) -> list[dict]:
             )
             add(player_id, name, cells)
 
-    # Fallback for table markup where the PlayerID link is outside the row
-    # structure that BeautifulSoup exposes normally.
     if not out:
         for link in soup.find_all("a", href=True):
             match = re.search(r"[?&]PlayerID=(\d+)", link.get("href", ""), re.I)
@@ -109,12 +99,6 @@ def parse_rc_players(html: str) -> list[dict]:
 
 
 def fetch_search(player_name: str) -> tuple[str, str]:
-    """Run the actual Ratings Central homepage player search.
-
-    RC expects the full name in 'Surname, Firstname' format and then returns
-    an intermediate PlayerList.php table. The PlayerID in that table is the
-    identifier used for the subsequent Player/PlayerHistory requests.
-    """
     search_name = to_rc_search_name(player_name)
     params = {
         "PlayerName": search_name,
@@ -165,12 +149,7 @@ def debug_search(player_name: str) -> dict:
 
 
 def import_index(limit: int = 30, offset: int = 0, force: bool = False) -> dict:
-    """Cache RC PlayerList results by unique full player name.
-
-    This avoids one request for every XTTV row when several rows refer to the
-    same player name, while keeping the exact full-name search required by RC.
-    Cached searches are reused by the matching endpoint.
-    """
+    """Cache RC PlayerList results by unique full player name."""
     create_all()
     with SessionLocal() as session:
         players = (
@@ -190,14 +169,7 @@ def import_index(limit: int = 30, offset: int = 0, force: bool = False) -> dict:
         with SessionLocal() as session:
             cached = session.query(RcPlayerIndex).filter_by(search_key=key).one_or_none()
             if cached and not force:
-                results.append(
-                    {
-                        "search_key": key,
-                        "search_name": search_name,
-                        "status": "cached",
-                        "players": cached.player_count,
-                    }
-                )
+                results.append({"search_key": key, "search_name": search_name, "status": "cached", "players": cached.player_count})
                 continue
 
         try:
@@ -214,23 +186,9 @@ def import_index(limit: int = 30, offset: int = 0, force: bool = False) -> dict:
                 entry.player_count = len(found)
                 entry.players_json = found
                 stored += len(found)
-            results.append(
-                {
-                    "search_key": key,
-                    "search_name": search_name,
-                    "status": "fetched",
-                    "players": len(found),
-                }
-            )
+            results.append({"search_key": key, "search_name": search_name, "status": "fetched", "players": len(found)})
         except Exception as exc:
-            results.append(
-                {
-                    "search_key": key,
-                    "search_name": search_name,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+            results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
 
     return {
         "ok": True,
@@ -242,6 +200,55 @@ def import_index(limit: int = 30, offset: int = 0, force: bool = False) -> dict:
         "requests_made": fetched,
         "candidate_rows_stored": stored,
         "results": results,
+    }
+
+
+def import_index_all(batch_size: int = 500, force: bool = False) -> dict:
+    """Process the complete XTTV player master in resumable fixed batches.
+
+    The regular endpoint intentionally caps a single request at 500 players.
+    This wrapper runs those chunks sequentially, so the caller needs only one
+    HTTP request. Fixed offsets are used because the RC matching step has not
+    run during this operation and therefore the source player set is stable.
+    """
+    create_all()
+    batch_size = min(max(int(batch_size), 1), 500)
+    with SessionLocal() as session:
+        total_players = session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).count()
+
+    batches = []
+    totals = {
+        "requested_players": 0,
+        "unique_search_names": 0,
+        "requests_made": 0,
+        "candidate_rows_stored": 0,
+        "errors": 0,
+    }
+
+    offset = 0
+    while offset < total_players:
+        result = import_index(limit=batch_size, offset=offset, force=force)
+        batches.append({
+            "offset": result["offset"],
+            "limit": result["limit"],
+            "requested_players": result["requested_players"],
+            "unique_search_names": result["unique_search_names"],
+            "requests_made": result["requests_made"],
+            "candidate_rows_stored": result["candidate_rows_stored"],
+            "errors": sum(1 for row in result["results"] if row.get("status") == "error"),
+        })
+        for key in totals:
+            totals[key] += batches[-1][key]
+        offset += batch_size
+
+    return {
+        "ok": totals["errors"] == 0,
+        "mode": "rc_index_all",
+        "total_players_at_start": total_players,
+        "batch_size": batch_size,
+        "batches_processed": len(batches),
+        **totals,
+        "batches": batches,
     }
 
 
