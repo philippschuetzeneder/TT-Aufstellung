@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+import socket
 import unicodedata
 from datetime import datetime
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -14,6 +16,7 @@ from .models import RcPlayerIndex, XttvPlayer
 
 RC_BASE = "https://www.ratingscentral.com"
 USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral player lookup)"
+RC_REQUEST_TIMEOUT_SECONDS = 8
 
 
 def clean_text(value: str) -> str:
@@ -76,7 +79,7 @@ def fetch_search(player_name: str) -> tuple[str, str]:
     params = {"PlayerName": search_name, "PlayerID": "", "PlayerUSATT_ID": "", "PlayerTTA_ID": "", "PlayerSport": "Any", "MinRating": "", "MaxRating": "", "MaxCurrentStDev": "", "MaxLastPlayedStDev": "", "MinLastPlayed": "", "MaxLastPlayed": "", "MinLastPlayedDate": "", "MaxLastPlayedDate": ""}
     url = f"{RC_BASE}/PlayerList.php?{urlencode(params)}"
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
-    with urlopen(request, timeout=20) as response:
+    with urlopen(request, timeout=RC_REQUEST_TIMEOUT_SECONDS) as response:
         return response.read().decode("utf-8", errors="replace"), url
 
 
@@ -124,9 +127,14 @@ def import_index(limit: int = 30, offset: int = 0, force: bool = False, _batch_m
                 entry.players_json = found
                 stored += len(found)
             results.append({"search_key": key, "search_name": search_name, "status": "fetched", "players": len(found)})
+        except (socket.timeout, TimeoutError) as exc:
+            results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}", "retryable": True})
+        except URLError as exc:
+            retryable = isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)) or "timed out" in str(exc).lower()
+            results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}", "retryable": retryable})
         except Exception as exc:
-            results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
-    return {"ok": True, "mode": "rc_index", "offset": offset, "limit": limit, "requested_players": len(players), "unique_search_names": len(search_names), "requests_made": fetched, "candidate_rows_stored": stored, "results": results}
+            results.append({"search_key": key, "search_name": search_name, "status": "error", "error": f"{type(exc).__name__}: {exc}", "retryable": False})
+    return {"ok": True, "mode": "rc_index", "offset": offset, "limit": limit, "requested_players": len(players), "unique_search_names": len(search_names), "requests_made": fetched, "candidate_rows_stored": stored, "retryable_errors": sum(1 for row in results if row.get("retryable")), "errors": sum(1 for row in results if row.get("status") == "error"), "results": results}
 
 
 def import_index_all(batch_size: int = 500, force: bool = False) -> dict:
@@ -140,7 +148,7 @@ def import_index_all(batch_size: int = 500, force: bool = False) -> dict:
     offset = 0
     while offset < total_players:
         result = import_index(limit=batch_size, offset=offset, force=force, _batch_mode=True)
-        batch = {"offset": result["offset"], "limit": result["limit"], "requested_players": result["requested_players"], "unique_search_names": result["unique_search_names"], "requests_made": result["requests_made"], "candidate_rows_stored": result["candidate_rows_stored"], "errors": sum(1 for row in result["results"] if row.get("status") == "error")}
+        batch = {"offset": result["offset"], "limit": result["limit"], "requested_players": result["requested_players"], "unique_search_names": result["unique_search_names"], "requests_made": result["requests_made"], "candidate_rows_stored": result["candidate_rows_stored"], "errors": result.get("errors", 0)}
         batches.append(batch)
         for key in totals:
             totals[key] += batch[key]
