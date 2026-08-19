@@ -37,7 +37,7 @@ def debug_xttv(meid):
     for host in ("oettv.xttv.at","www.oettv.xttv.at","xttv.oettv.info"):
         try: result["checks"].append({"method":f"DNS {host}","ok":True,"addresses":sorted({x[4][0] for x in socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)})})
         except Exception as exc: result["checks"].append({"method":f"DNS {host}","ok":False,"error":f"{type(exc).__name__}: {exc}"})
-    for label,candidate in [("direct HTTPS",url),("HTTP fallback",url.replace("https://","http://",1)),("www HTTPS",url.replace("https://oettv.xttv.at","https://www.oettv.xttv.at",1)),("legacy HTTPS",url.replace("https://oettv.xttv.at","https://xttv.oettv.info",1))]: result["checks"].append({"method":label,"url":candidate,**http_fetch(candidate)})
+    for label,candidate in [("direct HTTPS",url),("HTTP fallback",url.replace("https://","http://",1)),("www HTTPS",url.replace("https://oettv.xttv.at","https://www.oettv.at",1)),("legacy HTTPS",url.replace("https://oettv.xttv.at","https://xttv.oettv.info",1))]: result["checks"].append({"method":label,"url":candidate,**http_fetch(candidate)})
     result["direct_success"]=any(c.get("method")=="direct HTTPS" and c.get("ok") for c in result["checks"]); return result
 
 def _norm(value: str) -> str:
@@ -53,18 +53,60 @@ def find_xttv_players(name: str | None, team: str | None):
         if normalized_team:
             if normalized_team in candidate_club: score+=30
             elif normalized_team=="tragwein" and ("tragwein" in candidate_club or "kamig" in candidate_club or "trak" in candidate_club): score+=30
-        if score>0: matches.append({"id":r.id,"external_player_id":r.external_player_id,"name":r.name,"club":r.club,"score":score})
-    return {"ok":True,"query":{"name":name,"team":team},"count":len(matches),"players":sorted(matches,key=lambda x:(-x["score"],x["name"]))[:50]}
+        if score: matches.append({"id":r.id,"external_player_id":r.external_player_id,"name":r.name,"club":r.club,"rc_player_id":r.rc_player_id,"score":score})
+    matches.sort(key=lambda x:(-x["score"],x["name"])); return {"ok":True,"query":{"name":name,"team":team},"count":len(matches),"matches":matches[:20]}
+
+def rc_history_debug(player_id:int):
+    html,content_type=fetch_player_history(player_id); soup=BeautifulSoup(html,"html.parser"); tables=[]
+    for ti,table in enumerate(soup.find_all("table")):
+        rows=[]
+        for row in table.find_all("tr")[:25]:
+            cells=[" ".join(cell.stripped_strings) for cell in row.find_all(["th","td"])]
+            if cells: rows.append(cells)
+        tables.append({"index":ti,"rows":rows})
+    parsed=None; parse_error=None
+    try: parsed=parse_player_history(html)
+    except Exception as exc: parse_error=f"{type(exc).__name__}: {exc}"
+    return {"ok":True,"rc_player_id":player_id,"content_type":content_type,"html_bytes":len(html.encode("utf-8")),"table_count":len(tables),"tables":tables,"parsed":parsed,"parse_error":parse_error}
+
+def rc_snapshot_check(player_id:int):
+    with SessionLocal() as session:
+        player=session.query(XttvPlayer).filter_by(rc_player_id=player_id).one_or_none()
+        if player is None:return {"ok":False,"error":"No XTTV player mapped to RC player","rc_player_id":player_id}
+        snapshots=session.query(PlayerRatingSnapshot).filter_by(player_id=player.id,source="ratingscentral").order_by(PlayerRatingSnapshot.observed_at.asc()).all(); dates=[s.observed_at.date().isoformat() for s in snapshots]; ratings=[s.rc_rating for s in snapshots]; deviations=[s.rc_deviation for s in snapshots]; unique_keys=len(set((s.observed_at,s.source) for s in snapshots))
+        return {"ok":True,"player":{"db_id":player.id,"external_player_id":player.external_player_id,"rc_player_id":player.rc_player_id,"name":player.name,"club":player.club},"snapshot_count":len(snapshots),"unique_observation_keys":unique_keys,"first_observed_at":dates[0] if dates else None,"last_observed_at":dates[-1] if dates else None,"min_rating":min(ratings) if ratings else None,"max_rating":max(ratings) if ratings else None,"missing_deviation_count":sum(1 for v in deviations if v is None),"duplicate_dates":sorted({d for d in dates if dates.count(d)>1}),"first_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[:5]],"last_5":[{"observed_at":s.observed_at.isoformat(),"rc_rating":s.rc_rating,"rc_deviation":s.rc_deviation} for s in snapshots[-5:]]}
 
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
-        body=json.dumps(payload,ensure_ascii=False).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
-    def send_error(self,code,message=None):
-        body=(message or "")
-        self.send_response(code); self.send_header("Content-Type","text/plain; charset=utf-8"); self.end_headers(); self.wfile.write(body.encode("utf-8"))
+        data=json.dumps(payload,ensure_ascii=False,default=str).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         parsed=urlparse(self.path); query=parse_qs(parsed.query)
+        try: meid=int(query.get("meid",["437757"])[0])
+        except ValueError: return self.send_json({"ok":False,"error":"meid must be an integer"},400)
         try:
+            if parsed.path=="/health": return self.send_json({"ok":True,"runtime_version":RUNTIME_VERSION,"source_commit":SOURCE_COMMIT})
+            if parsed.path=="/api/runtime-version": return self.send_json({"ok":True,"runtime_version":RUNTIME_VERSION,"source_commit":SOURCE_COMMIT})
+            if parsed.path=="/api/db/health": return self.send_json(database_health())
+            if parsed.path=="/api/db/validate": return self.send_json(validate_database())
+            if parsed.path=="/api/analytics/validate": return self.send_json(validate_analytics())
+            if parsed.path=="/api/db/match": return self.send_json(get_match(meid))
+            if parsed.path=="/api/analytics/players": return self.send_json(player_stats())
+            if parsed.path=="/api/analytics/lineups": return self.send_json(lineup_stats(query.get("team",[None])[0]))
+            if parsed.path=="/api/analytics/matchups": return self.send_json(matchup_stats(query.get("player_id",[None])[0],query.get("opponent_id",[None])[0]))
+            if parsed.path=="/api/analytics/matchup-matrix": return self.send_json(matchup_matrix())
+            if parsed.path=="/api/analysis/cache-refresh": return self.send_json(refresh_analysis_cache())
+            if parsed.path=="/api/teams": return self.send_json(list_teams())
+            if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0]))
+            if parsed.path=="/api/xttv/player-find": return self.send_json(find_xttv_players(query.get("name",[None])[0],query.get("team",[None])[0]))
+            if parsed.path=="/api/xttv/player-master-status": return self.send_json(player_master_status())
+            if parsed.path=="/api/xttv/player-master-rebuild":
+                try: limit=min(max(int(query.get("limit",["5000"])[0]),1),10000); offset=max(int(query.get("offset",["0"])[0]),0)
+                except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
+                return self.send_json(rebuild_player_master(limit=limit,offset=offset))
+            if parsed.path=="/api/rc/events/debug":
+                raw=query.get("event_id",[""])[0].strip()
+                if not raw.isdigit(): return self.send_json({"ok":False,"error":"event_id must be numeric"},400)
+                return self.send_json(rc_event_debug(int(raw)))
             if parsed.path=="/api/rc/index/debug-search":
                 surname=query.get("surname",[""])[0].strip()
                 if not surname:return self.send_json({"ok":False,"error":"surname is required"},400)
@@ -85,8 +127,7 @@ class Handler(BaseHTTPRequestHandler):
                 try: limit=min(max(int(query.get("limit",["30"])[0]),1),100); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
                 return self.send_json(rc_matching_dry_run(limit=limit,offset=offset))
-            if parsed.path=="/api/rc/match-dry-run-all":
-                return self.send_json(rc_matching_dry_run_all())
+            if parsed.path=="/api/rc/match-dry-run-all": return self.send_json(rc_matching_dry_run_all())
             if parsed.path=="/api/rc/bulk":
                 try: limit=min(max(int(query.get("limit",["30"])[0]),1),300); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
