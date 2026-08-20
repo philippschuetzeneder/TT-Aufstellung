@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup
 
 from .db import SessionLocal, create_all
+from .models import XttvPlayer
 from .rc_fallback import fallback_candidates
 from .rc_index import import_index as rc_index_import
 from .rc_index import local_candidates, to_rc_search_name
@@ -67,7 +68,13 @@ def rank_candidates(xttv_name: str, candidates: list[dict], *, today: date | Non
         name_score = score_name(xttv_name, candidate.get("name", ""))
         recency = _recency_score(candidate, today=today)
         last_played = _candidate_last_played(candidate)
-        ranked.append({**candidate, "name_score": name_score, "recency_score": round(recency, 2), "match_score": round(name_score + recency, 2), "last_played": last_played.isoformat() if last_played else None})
+        ranked.append({
+            **candidate,
+            "name_score": name_score,
+            "recency_score": round(recency, 2),
+            "match_score": round(name_score + recency, 2),
+            "last_played": last_played.isoformat() if last_played else None,
+        })
     return sorted(ranked, key=lambda c: (-c["match_score"], -c["name_score"], c["rc_player_id"]))
 
 
@@ -97,22 +104,33 @@ def _parse_rc_search_results(html: str) -> list[dict]:
             name = clean_text(" ".join(link.stripped_strings))
             if "," not in name:
                 name = next((cell for cell in cells if "," in cell), "")
-            if name and "," in name:
-                unique[rc_id] = {"rc_player_id": rc_id, "name": name, "cells": cells}
+            if not name or "," not in name:
+                continue
+            unique[rc_id] = {"rc_player_id": rc_id, "name": name, "cells": cells}
     return list(unique.values())
 
 
 def search_rc(name: str, limit: int = 20) -> list[dict]:
     indexed = local_candidates(name, limit=100)
     if indexed:
-        candidates = [{**candidate, "score": score_name(name, candidate.get("name", ""))} for candidate in indexed if score_name(name, candidate.get("name", ""))]
+        candidates = []
+        for candidate in indexed:
+            score = score_name(name, candidate.get("name", ""))
+            if score:
+                candidates.append({**candidate, "score": score})
         return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
-    params = {"PlayerName": to_rc_search_name(name), "PlayerID": "", "PlayerUSATT_ID": "", "PlayerTTA_ID": "", "PlayerSport": "Any", "MinRating": "", "MaxRating": "", "MaxCurrentStDev": "", "MaxLastPlayedStDev": "", "MinLastPlayed": "", "MaxLastPlayed": "", "MinLastPlayedDate": "", "MaxLastPlayedDate": ""}
+
+    search_name = to_rc_search_name(name)
+    params = {"PlayerName": search_name, "PlayerID": "", "PlayerUSATT_ID": "", "PlayerTTA_ID": "", "PlayerSport": "Any", "MinRating": "", "MaxRating": "", "MaxCurrentStDev": "", "MaxLastPlayedStDev": "", "MinLastPlayed": "", "MaxLastPlayed": "", "MinLastPlayedDate": "", "MaxLastPlayedDate": ""}
     url = f"{RC_BASE}/PlayerList.php?{urlencode(params)}"
     request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
     with urlopen(request, timeout=20) as response:
         html = response.read().decode("utf-8", errors="replace")
-    candidates = [{**candidate, "score": score_name(name, candidate["name"])} for candidate in _parse_rc_search_results(html) if score_name(name, candidate["name"])]
+    candidates = []
+    for candidate in _parse_rc_search_results(html):
+        score = score_name(name, candidate["name"])
+        if score:
+            candidates.append({**candidate, "score": score})
     return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
 
 
@@ -150,19 +168,12 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
 
 
 def dry_run_all() -> dict:
-    """Classify every XTTV player, with a conservative live fallback.
-
-    Exact-name matching uses the local index. Players without an exact local
-    hit are then searched live in RC by surname and first given-name token.
-    Fallback results are informational only and are never persisted.
-    """
     create_all()
     with SessionLocal() as session:
         players = session.query(XttvPlayer).order_by(XttvPlayer.id).all()
         targets = [(p.external_player_id, p.name, p.club) for p in players]
 
-    matched = ambiguous = not_found = errors = 0
-    fallback_found = 0
+    matched = ambiguous = not_found = errors = fallback_found = 0
     unresolved = []
     for external_id, name, club in targets:
         try:
@@ -179,7 +190,6 @@ def dry_run_all() -> dict:
                 ambiguous += 1
                 unresolved.append({"xttv_player_id": external_id, "name": name, "club": club, "status": status, "candidates": ranked[:10], "match_reason": "multiple exact-name candidates with insufficient score separation"})
                 continue
-
             fallback = fallback_candidates(name, limit=10)
             if fallback:
                 fallback_found += 1
