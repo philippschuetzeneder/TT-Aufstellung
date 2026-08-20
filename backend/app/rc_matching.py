@@ -290,7 +290,6 @@ def dry_run_all() -> dict:
     with SessionLocal() as session:
         players = (
             session.query(XttvPlayer)
-            .filter(XttvPlayer.rc_player_id.is_(None))
             .order_by(XttvPlayer.id)
             .all()
         )
