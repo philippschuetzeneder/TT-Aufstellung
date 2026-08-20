@@ -93,6 +93,11 @@ def debug_search(player_name: str) -> dict:
 def import_index(limit: int = 30, offset: int = 0, force: bool = False, _batch_mode: bool = False) -> dict:
     """Cache RC PlayerList results by unique full player name.
 
+    All XTTV players are considered for indexing, including players that
+    already have an rc_player_id. The index is a read-only lookup cache and
+    must cover the complete XTTV master so later dry-runs can re-evaluate
+    existing matches as well as previously unmatched players.
+
     A request using the public endpoint's maximum limit (500) at offset 0
     runs the complete player master in fixed 500-player chunks. Smaller limits
     keep the original single-batch behavior for diagnostics and tests.
@@ -101,7 +106,7 @@ def import_index(limit: int = 30, offset: int = 0, force: bool = False, _batch_m
         return import_index_all(batch_size=500, force=force)
     create_all()
     with SessionLocal() as session:
-        players = session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all()
+        players = session.query(XttvPlayer).order_by(XttvPlayer.id).offset(offset).limit(limit).all()
         search_names = sorted({to_rc_search_name(p.name) for p in players if p.name})
     results = []
     fetched = stored = 0
@@ -142,7 +147,7 @@ def import_index_all(batch_size: int = 500, force: bool = False) -> dict:
     create_all()
     batch_size = min(max(int(batch_size), 1), 500)
     with SessionLocal() as session:
-        total_players = session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).count()
+        total_players = session.query(XttvPlayer).count()
     batches = []
     totals = {"requested_players": 0, "unique_search_names": 0, "requests_made": 0, "candidate_rows_stored": 0, "errors": 0}
     offset = 0
