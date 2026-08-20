@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup
 
 from .db import SessionLocal, create_all
-from .models import XttvPlayer
+from .rc_fallback import fallback_candidates
 from .rc_index import import_index as rc_index_import
 from .rc_index import local_candidates, to_rc_search_name
 from .rc_manual_overrides import RC_PLAYER_OVERRIDES
@@ -150,11 +150,11 @@ def dry_run(limit: int = 30, offset: int = 0) -> dict:
 
 
 def dry_run_all() -> dict:
-    """Classify every XTTV player and return the complete unresolved list.
+    """Classify every XTTV player, with a conservative live fallback.
 
-    Read-only: no RC mappings are persisted. The response intentionally
-    includes every ambiguous/not-found/error record and its ranked RC
-    candidates so all unresolved cases can be reviewed directly as JSON.
+    Exact-name matching uses the local index. Players without an exact local
+    hit are then searched live in RC by surname and first given-name token.
+    Fallback results are informational only and are never persisted.
     """
     create_all()
     with SessionLocal() as session:
@@ -162,6 +162,7 @@ def dry_run_all() -> dict:
         targets = [(p.external_player_id, p.name, p.club) for p in players]
 
     matched = ambiguous = not_found = errors = 0
+    fallback_found = 0
     unresolved = []
     for external_id, name, club in targets:
         try:
@@ -176,13 +177,18 @@ def dry_run_all() -> dict:
                 continue
             if status == "ambiguous":
                 ambiguous += 1
-                reason = "multiple exact-name candidates with insufficient score separation"
+                unresolved.append({"xttv_player_id": external_id, "name": name, "club": club, "status": status, "candidates": ranked[:10], "match_reason": "multiple exact-name candidates with insufficient score separation"})
+                continue
+
+            fallback = fallback_candidates(name, limit=10)
+            if fallback:
+                fallback_found += 1
+                unresolved.append({"xttv_player_id": external_id, "name": name, "club": club, "status": "not_found", "candidates": fallback, "match_reason": "no exact-name match; conservative fuzzy RC fallback candidates"})
             else:
                 not_found += 1
-                reason = "no exact-name RC candidate in local index"
-            unresolved.append({"xttv_player_id": external_id, "name": name, "club": club, "status": status, "candidates": ranked[:10], "match_reason": reason})
+                unresolved.append({"xttv_player_id": external_id, "name": name, "club": club, "status": "not_found", "candidates": [], "match_reason": "no exact-name RC candidate and no conservative fallback candidate"})
         except Exception as exc:
             errors += 1
             unresolved.append({"xttv_player_id": external_id, "name": name, "club": club, "status": "error", "candidates": [], "match_reason": f"{type(exc).__name__}: {exc}"})
 
-    return {"ok": errors == 0, "mode": "match_dry_run_all", "total": len(targets), "matched": matched, "ambiguous": ambiguous, "not_found": not_found, "errors": errors, "unresolved_count": len(unresolved), "unresolved": unresolved}
+    return {"ok": errors == 0, "mode": "match_dry_run_all", "total": len(targets), "matched": matched, "ambiguous": ambiguous, "not_found": not_found, "errors": errors, "fallback_candidates_found": fallback_found, "unresolved_count": len(unresolved), "unresolved": unresolved}
