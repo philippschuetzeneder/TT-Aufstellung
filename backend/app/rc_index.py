@@ -17,6 +17,7 @@ from .models import RcPlayerIndex, XttvPlayer
 RC_BASE = "https://www.ratingscentral.com"
 USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral player lookup)"
 RC_REQUEST_TIMEOUT_SECONDS = 8
+_RATING_CELL_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[±\+\/-]+\s*(\d+(?:\.\d+)?)")
 
 
 def clean_text(value: str) -> str:
@@ -167,3 +168,101 @@ def local_candidates(name: str, limit: int = 20) -> list[dict]:
     with SessionLocal() as session:
         entry = session.query(RcPlayerIndex).filter_by(search_key=key).one_or_none()
         return list(entry.players_json or [])[:limit] if entry else []
+
+
+def parse_rating_from_cells(cells: list | None) -> tuple[float, float] | None:
+    for cell in cells or []:
+        match = _RATING_CELL_RE.search(str(cell))
+        if match:
+            return float(match.group(1)), float(match.group(2))
+    return None
+
+
+def lookup_rc_candidate(rc_player_id: int, name: str) -> dict | None:
+    for candidate in local_candidates(name, limit=100):
+        if int(candidate.get("rc_player_id", 0)) == int(rc_player_id):
+            return candidate
+    return None
+
+
+def _observed_at_from_candidate(candidate: dict) -> datetime:
+    for cell in reversed(candidate.get("cells") or []):
+        value = clean_text(str(cell))
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                continue
+    return datetime.utcnow()
+
+
+def sync_current_ratings_from_index(batch_size: int = 500) -> dict:
+    """Persist current RC ratings from the local index cache (no network)."""
+    from .models import PlayerRatingSnapshot
+
+    create_all()
+    batch_size = min(max(int(batch_size), 1), 2000)
+    synced = skipped = missing_index = 0
+    offset = 0
+    batches = []
+
+    with SessionLocal() as session:
+        index_by_rc_id: dict[int, dict] = {}
+        for entry in session.query(RcPlayerIndex).all():
+            for candidate in entry.players_json or []:
+                rc_id = candidate.get("rc_player_id")
+                if rc_id is not None:
+                    index_by_rc_id[int(rc_id)] = candidate
+
+    while True:
+        with SessionLocal() as session:
+            players = (
+                session.query(XttvPlayer)
+                .filter(XttvPlayer.rc_player_id.isnot(None))
+                .order_by(XttvPlayer.id)
+                .offset(offset)
+                .limit(batch_size)
+                .all()
+            )
+        if not players:
+            break
+        batch_synced = 0
+        with SessionLocal() as session:
+            for player in players:
+                candidate = index_by_rc_id.get(int(player.rc_player_id or 0))
+                if candidate is None:
+                    missing_index += 1
+                    continue
+                parsed = parse_rating_from_cells(candidate.get("cells"))
+                if parsed is None:
+                    skipped += 1
+                    continue
+                rating, deviation = parsed
+                observed_at = _observed_at_from_candidate(candidate)
+                db_player = session.query(XttvPlayer).filter_by(id=player.id).one()
+                snapshot = session.query(PlayerRatingSnapshot).filter_by(
+                    player_id=db_player.id, observed_at=observed_at, source="ratingscentral"
+                ).one_or_none()
+                if snapshot is None:
+                    snapshot = PlayerRatingSnapshot(
+                        player_id=db_player.id,
+                        observed_at=observed_at,
+                        source="ratingscentral",
+                    )
+                    session.add(snapshot)
+                snapshot.rc_rating = rating
+                snapshot.rc_deviation = deviation
+                snapshot.imported_at = datetime.utcnow()
+                synced += 1
+                batch_synced += 1
+            session.commit()
+        batches.append({"offset": offset, "synced": batch_synced, "batch_size": len(players)})
+        offset += batch_size
+    return {
+        "ok": True,
+        "mode": "sync_current_ratings_from_index",
+        "synced": synced,
+        "skipped": skipped,
+        "missing_index": missing_index,
+        "batches": batches,
+    }

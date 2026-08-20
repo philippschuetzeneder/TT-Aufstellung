@@ -8,6 +8,8 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
+from sqlalchemy import text
+
 from .db import SessionLocal, create_all
 from .models import XttvPlayer
 from .rc_fallback import fallback_candidates
@@ -86,9 +88,74 @@ def resolve_candidates(xttv_name: str, candidates: list[dict], *, today: date | 
     if len(exact) == 1:
         return "matched", exact[0], ranked
     top, second = exact[0], exact[1]
-    if top["match_score"] - second["match_score"] >= 10.0:
+    if top["match_score"] - second["match_score"] >= 5.0:
         return "matched", top, ranked
     return "ambiguous", None, ranked
+
+
+_RATING_CELL_RE = re.compile(r"(\d{3,4})\s*(?:±|\+/-|\+-)")
+
+
+def _candidate_rc_rating(candidate: dict) -> int | None:
+    for cell in candidate.get("cells", []):
+        match = _RATING_CELL_RE.search(clean_text(str(cell)))
+        if match:
+            value = int(match.group(1))
+            if 500 <= value <= 3000:
+                return value
+    return None
+
+
+def _xttv_pseudo_rc_rating(wins: int, games: int) -> float:
+    strength = (wins + 5.0) / (games + 10.0)
+    return 1400.0 + (strength - 0.5) * 500.0
+
+
+def _load_xttv_singles_summary(external_id: str) -> tuple[int, int]:
+    with SessionLocal() as session:
+        row = session.execute(text("""
+            WITH games AS (
+                SELECT CASE WHEN split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int THEN 1 ELSE 0 END AS win
+                FROM match_games g
+                JOIN match_players hp ON hp.match_id=g.match_id AND hp.side='home' AND hp.position=g.home_position
+                WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+                  AND hp.external_player_id::text = :player_id
+                UNION ALL
+                SELECT CASE WHEN split_part(trim(g.result),':',2)::int > split_part(trim(g.result),':',1)::int THEN 1 ELSE 0 END
+                FROM match_games g
+                JOIN match_players ap ON ap.match_id=g.match_id AND ap.side='away' AND ap.position=g.away_position
+                WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+                  AND ap.external_player_id::text = :player_id
+            )
+            SELECT coalesce(sum(win), 0) AS wins, count(*) AS games FROM games
+        """), {"player_id": str(external_id)}).mappings().first()
+    if not row:
+        return 0, 0
+    return int(row["wins"] or 0), int(row["games"] or 0)
+
+
+def _disambiguate_duplicate_names(external_id: str, ranked: list[dict]) -> dict | None:
+    exact = [c for c in ranked if c["name_score"] >= 95]
+    if len(exact) < 2:
+        return None
+
+    wins, games = _load_xttv_singles_summary(external_id)
+    if games >= 8:
+        target = _xttv_pseudo_rc_rating(wins, games)
+        rated = []
+        for candidate in exact:
+            rc_rating = _candidate_rc_rating(candidate)
+            if rc_rating is None:
+                continue
+            rated.append((abs(rc_rating - target), candidate, rc_rating))
+        if len(rated) >= 2:
+            rated.sort(key=lambda item: item[0])
+            if rated[0][0] + 40 <= rated[1][0]:
+                return rated[0][1]
+        elif len(rated) == 1:
+            return rated[0][1]
+
+    return None
 
 
 def _parse_rc_search_results(html: str) -> list[dict]:
@@ -139,6 +206,248 @@ def _manual_override_candidate(external_id: str, name: str) -> dict | None:
     if rc_id is None:
         return None
     return {"rc_player_id": rc_id, "name": name, "name_norm": " ".join(norm_tokens(name)), "score": 100, "name_score": 100, "recency_score": 0.0, "match_score": 100.0, "last_played": None, "manual_override": True}
+
+
+def _resolve_player(external_id: str, name: str, club: str | None = None, *, allow_network_fallback: bool = False) -> dict:
+    """Evaluate RC match status for one XTTV player using the local index."""
+    override = _manual_override_candidate(external_id, name)
+    if override is not None:
+        return {
+            "xttv_player_id": external_id,
+            "name": name,
+            "club": club,
+            "status": "matched",
+            "candidate": override,
+            "candidates": [override],
+            "match_reason": "manual override",
+        }
+    candidates = local_candidates(name, limit=100)
+    status, candidate, ranked = resolve_candidates(name, candidates)
+    disambiguated = False
+    if status == "ambiguous":
+        candidate = _disambiguate_duplicate_names(external_id, ranked)
+        if candidate is not None:
+            status = "matched"
+            disambiguated = True
+    result = {
+        "xttv_player_id": external_id,
+        "name": name,
+        "club": club,
+        "rc_search_name": to_rc_search_name(name),
+        "status": status,
+        "candidate": candidate,
+        "candidates": ranked[:10],
+    }
+    if candidate is not None:
+        exact = [c for c in ranked if c["name_score"] >= 95]
+        if disambiguated:
+            result["match_reason"] = "exact name + XTTV singles strength matched to RC rating"
+        elif len(exact) == 1:
+            result["match_reason"] = "exact name + unique candidate"
+        else:
+            result["match_reason"] = "exact name + materially more recent RC activity"
+    elif status == "ambiguous":
+        result["match_reason"] = "multiple exact-name candidates with insufficient score separation"
+    elif status == "not_found" and allow_network_fallback:
+        ranked_fb = fallback_candidates(name, limit=10)
+        if ranked_fb:
+            top, second = ranked_fb[0], ranked_fb[1] if len(ranked_fb) > 1 else None
+            if top["fallback_score"] >= 85.0 and (
+                second is None or top["fallback_score"] - second["fallback_score"] >= 10.0
+            ):
+                candidate = {
+                    **top,
+                    "name_score": int(round(top.get("surname_similarity", 0) * 100)),
+                    "recency_score": 0.0,
+                    "match_score": top["fallback_score"],
+                    "last_played": None,
+                    "fuzzy_fallback": True,
+                }
+                result.update({
+                    "status": "matched",
+                    "candidate": candidate,
+                    "candidates": ranked_fb[:10],
+                    "match_reason": "conservative fuzzy RC fallback",
+                })
+            else:
+                result["match_reason"] = "no exact-name RC candidate"
+        else:
+            result["match_reason"] = "no exact-name RC candidate"
+    elif status == "not_found":
+        result["match_reason"] = "no exact-name RC candidate"
+    return result
+
+
+def _rc_id_taken(session, rc_player_id: int, external_player_id: str) -> XttvPlayer | None:
+    other = session.query(XttvPlayer).filter_by(rc_player_id=rc_player_id).one_or_none()
+    if other is not None and str(other.external_player_id) != str(external_player_id):
+        return other
+    return None
+
+
+def apply_matches(limit: int = 500, offset: int = 0, import_history: bool = True, only_unmapped: bool = True) -> dict:
+    """Persist safe RC matches (matched + manual overrides). Skips ambiguous/not_found."""
+    from .rc_import import import_rc_player
+
+    create_all()
+    with SessionLocal() as session:
+        query = session.query(XttvPlayer).order_by(XttvPlayer.id)
+        if only_unmapped:
+            query = query.filter(XttvPlayer.rc_player_id.is_(None))
+        players = query.offset(offset).limit(limit).all()
+        targets = [(p.external_player_id, p.name, p.club) for p in players]
+
+    applied = skipped = ambiguous = not_found = conflicts = errors = 0
+    results: list[dict] = []
+    for external_id, name, club in targets:
+        try:
+            resolved = _resolve_player(external_id, name, club, allow_network_fallback=False)
+            status = resolved["status"]
+            if status == "ambiguous":
+                ambiguous += 1
+                results.append({**resolved, "action": "skipped"})
+                continue
+            if status == "not_found":
+                not_found += 1
+                results.append({**resolved, "action": "skipped"})
+                continue
+            if status != "matched" or resolved.get("candidate") is None:
+                skipped += 1
+                results.append({**resolved, "action": "skipped"})
+                continue
+
+            rc_id = int(resolved["candidate"]["rc_player_id"])
+            with SessionLocal() as session:
+                conflict = _rc_id_taken(session, rc_id, external_id)
+                if conflict is not None:
+                    conflicts += 1
+                    results.append({
+                        **resolved,
+                        "action": "conflict",
+                        "error": f"RC {rc_id} already mapped to {conflict.external_player_id} ({conflict.name})",
+                    })
+                    continue
+                player = session.query(XttvPlayer).filter_by(external_player_id=str(external_id)).one_or_none()
+                if player is None:
+                    errors += 1
+                    results.append({**resolved, "action": "error", "error": "XTTV player not found"})
+                    continue
+                if player.rc_player_id is not None and player.rc_player_id != rc_id:
+                    conflicts += 1
+                    results.append({
+                        **resolved,
+                        "action": "conflict",
+                        "error": f"already mapped to RC {player.rc_player_id}",
+                    })
+                    continue
+                player.rc_player_id = rc_id
+                session.commit()
+
+            entry = {
+                **resolved,
+                "rc_player_id": rc_id,
+                "action": "mapped",
+            }
+            if import_history:
+                imported = import_rc_player(
+                    rc_id,
+                    xttv_external_player_id=external_id,
+                    xttv_name=name,
+                    xttv_club=club,
+                )
+                entry["historical_observations"] = imported["historical_observations"]
+                entry["snapshots_upserted"] = imported["snapshots_upserted"]
+                entry["action"] = "imported"
+            applied += 1
+            results.append(entry)
+        except Exception as exc:
+            errors += 1
+            results.append({
+                "xttv_player_id": external_id,
+                "name": name,
+                "club": club,
+                "status": "error",
+                "action": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return {
+        "ok": errors == 0,
+        "mode": "apply_matches",
+        "offset": offset,
+        "limit": limit,
+        "only_unmapped": only_unmapped,
+        "import_history": import_history,
+        "requested": len(targets),
+        "applied": applied,
+        "ambiguous": ambiguous,
+        "not_found": not_found,
+        "conflicts": conflicts,
+        "skipped": skipped,
+        "errors": errors,
+        "results": results[:50],
+    }
+
+
+def apply_matches_all(batch_size: int = 200, import_history: bool = True, only_unmapped: bool = True) -> dict:
+    """Apply matches for the full player master in resumable batches."""
+    create_all()
+    batch_size = min(max(int(batch_size), 1), 500)
+    with SessionLocal() as session:
+        query = session.query(XttvPlayer)
+        if only_unmapped:
+            query = query.filter(XttvPlayer.rc_player_id.is_(None))
+        total = query.count()
+
+    totals = {
+        "requested": 0,
+        "applied": 0,
+        "ambiguous": 0,
+        "not_found": 0,
+        "conflicts": 0,
+        "skipped": 0,
+        "errors": 0,
+    }
+    batches = []
+    while True:
+        with SessionLocal() as session:
+            query = session.query(XttvPlayer)
+            if only_unmapped:
+                query = query.filter(XttvPlayer.rc_player_id.is_(None))
+            remaining = query.count()
+        if remaining == 0:
+            break
+        result = apply_matches(
+            limit=min(batch_size, remaining),
+            offset=0,
+            import_history=import_history,
+            only_unmapped=only_unmapped,
+        )
+        batch = {k: result[k] for k in totals}
+        batches.append({"offset": 0, "limit": batch_size, "remaining_before": remaining, **batch})
+        for key in totals:
+            totals[key] += batch[key]
+        if batch["requested"] == 0:
+            break
+        # Stop when nothing mappable left (only ambiguous/not_found/conflicts remain).
+        if batch["applied"] == 0:
+            break
+
+    with SessionLocal() as session:
+        mapped = session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.isnot(None)).count()
+
+    return {
+        "ok": totals["errors"] == 0,
+        "mode": "apply_matches_all",
+        "total_at_start": total,
+        "batch_size": batch_size,
+        "import_history": import_history,
+        "only_unmapped": only_unmapped,
+        "players_with_rc_id_after": mapped,
+        "batches_processed": len(batches),
+        **totals,
+        "batches": batches,
+    }
 
 
 def dry_run(limit: int = 30, offset: int = 0) -> dict:

@@ -1,13 +1,72 @@
 from __future__ import annotations
 from collections import defaultdict
+from datetime import timedelta
 from itertools import permutations
 import math, re
+from sqlalchemy import text
 from sqlalchemy.orm import selectinload
 from .db import SessionLocal, create_all
 from .models import MatchPlayer, XttvMatch
 from .opponent_prediction_service import predict_opponent_lineups
 
 WIN_TARGET = 8
+_LEAGUE_SEASON_SUFFIX = re.compile(r"\s+(20\d{2}/20\d{2})\s*$")
+
+
+def _league_group(league: str | None) -> str:
+    if not league:
+        return ""
+    return _LEAGUE_SEASON_SUFFIX.sub("", league).strip()
+
+
+def _season_label(league: str | None) -> str | None:
+    match = _LEAGUE_SEASON_SUFFIX.search(league or "")
+    return match.group(1) if match else None
+
+
+def _season_sort_key(league: str) -> tuple[int, int]:
+    label = _season_label(league)
+    if not label:
+        return (0, 0)
+    start, end = label.split("/")
+    return (int(start), int(end))
+
+
+def resolve_latest_league_season(session, league_group: str) -> str | None:
+    """Resolve a league group (without season suffix) to the newest season row in DB."""
+    pattern = league_group.strip() + "%"
+    rows = session.execute(
+        text("SELECT league FROM xttv_matches WHERE league LIKE :pattern GROUP BY league ORDER BY league"),
+        {"pattern": pattern},
+    ).scalars().all()
+    if not rows:
+        return None
+    return max(rows, key=_season_sort_key)
+
+
+def list_leagues():
+    """Distinct league groups with counts for the latest available season only."""
+    with SessionLocal() as session:
+        rows = session.execute(text(
+            "SELECT league, COUNT(*) AS c FROM xttv_matches WHERE league IS NOT NULL GROUP BY league ORDER BY league"
+        )).mappings()
+        by_group: dict[str, list[tuple[str, int]]] = {}
+        for row in rows:
+            group = _league_group(row["league"])
+            if not group:
+                continue
+            by_group.setdefault(group, []).append((row["league"], int(row["c"])))
+    leagues = []
+    for name, entries in sorted(by_group.items()):
+        latest_league, match_count = max(entries, key=lambda item: _season_sort_key(item[0]))
+        leagues.append({
+            "id": name,
+            "name": name,
+            "season": _season_label(latest_league),
+            "latest_league": latest_league,
+            "match_count": match_count,
+        })
+    return {"ok": True, "leagues": leagues, "count": len(leagues)}
 
 def _id(p): return str(p.external_player_id or f"name:{p.name}")
 def _pos(v):
@@ -75,25 +134,133 @@ def _team_win(single,doubles):
         dist=nxt
     return sum(dist[WIN_TARGET:])
 
-def list_teams():
-    create_all(); db,ms=_load()
-    try:
-        teams={}
-        for m in ms:
-            for side,name in (("home",m.home_team),("away",m.away_team)):
-                if name: teams.setdefault(name,set()).update(_id(p) for p in m.players if p.side==side)
-        return {"ok":True,"teams":[{"id":n,"name":n,"player_count":len(ids)} for n,ids in sorted(teams.items())]}
-    finally: db.close()
+def list_teams(league: str | None = None):
+    with SessionLocal() as session:
+        if league:
+            resolved = resolve_latest_league_season(session, league)
+            if not resolved:
+                return {"ok": True, "league": league, "season": None, "teams": [], "count": 0}
+            rows = session.execute(
+                text("""
+                    SELECT team_name, COUNT(DISTINCT match_id) AS match_count
+                    FROM (
+                        SELECT home_team AS team_name, id AS match_id
+                        FROM xttv_matches WHERE league = :league AND home_team IS NOT NULL
+                        UNION ALL
+                        SELECT away_team AS team_name, id AS match_id
+                        FROM xttv_matches WHERE league = :league AND away_team IS NOT NULL
+                    ) t
+                    GROUP BY team_name
+                    ORDER BY team_name
+                """),
+                {"league": resolved},
+            ).mappings()
+            teams = [
+                {"id": row["team_name"], "name": row["team_name"], "player_count": int(row["match_count"])}
+                for row in rows
+            ]
+            return {
+                "ok": True,
+                "league": league,
+                "season": _season_label(resolved),
+                "latest_league": resolved,
+                "teams": teams,
+                "count": len(teams),
+            }
 
-def list_players(team_name):
-    create_all(); db,ms=_load()
-    try:
-        names,overall,_=_stats(ms); ids=set()
-        for m in ms:
-            if m.home_team==team_name: ids.update(_id(p) for p in m.players if p.side=="home")
-            if m.away_team==team_name: ids.update(_id(p) for p in m.players if p.side=="away")
-        return {"ok":True,"team":team_name,"players":[{"id":pid,"name":names.get(pid,pid),"games":overall.get(pid,[0,0])[1],"win_rate":round(_strength(pid,overall),4)} for pid in sorted(ids,key=lambda x:names.get(x,x))]}
-    finally: db.close()
+        rows = session.execute(
+            text("""
+                SELECT team_name, COUNT(DISTINCT external_player_id) AS player_count
+                FROM (
+                    SELECT m.home_team AS team_name, mp.external_player_id
+                    FROM xttv_matches m JOIN match_players mp ON mp.match_id = m.id AND mp.side = 'home'
+                    WHERE m.home_team IS NOT NULL AND mp.external_player_id IS NOT NULL
+                    UNION
+                    SELECT m.away_team AS team_name, mp.external_player_id
+                    FROM xttv_matches m JOIN match_players mp ON mp.match_id = m.id AND mp.side = 'away'
+                    WHERE m.away_team IS NOT NULL AND mp.external_player_id IS NOT NULL
+                ) t
+                GROUP BY team_name
+                ORDER BY team_name
+            """)
+        ).mappings()
+        teams = [
+            {"id": row["team_name"], "name": row["team_name"], "player_count": int(row["player_count"])}
+            for row in rows
+        ]
+        return {"ok": True, "teams": teams, "count": len(teams)}
+
+def list_players(team_name, league: str | None = None):
+    if not team_name:
+        return {"ok": False, "error": "team is required", "players": []}
+    with SessionLocal() as session:
+        resolved = resolve_latest_league_season(session, league) if league else None
+        ref_row = session.execute(text("""
+            SELECT max(to_date(substring(match_date from 1 for 10), 'DD.MM.YYYY')) AS latest
+            FROM xttv_matches WHERE match_date IS NOT NULL
+        """)).mappings().first()
+        ref_date = ref_row["latest"] if ref_row and ref_row["latest"] else None
+        cutoff = None
+        if ref_date:
+            cutoff = ref_date - timedelta(days=int(round(2 * 365.25)))
+        league_clause = ""
+        params = {"team": team_name}
+        if resolved:
+            params["league_pattern"] = _league_group(resolved) + "%"
+            league_clause = "AND m.league LIKE :league_pattern"
+        if cutoff:
+            params["cutoff"] = cutoff
+            league_clause += " AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff"
+        rows = session.execute(
+            text(f"""
+                WITH team_players AS (
+                    SELECT mp.external_player_id::text AS external_id,
+                           max(mp.name) AS name
+                    FROM match_players mp
+                    JOIN xttv_matches m ON m.id = mp.match_id
+                    WHERE mp.external_player_id IS NOT NULL
+                      AND (
+                        (m.home_team = :team AND mp.side = 'home')
+                        OR (m.away_team = :team AND mp.side = 'away')
+                      )
+                      {league_clause}
+                    GROUP BY mp.external_player_id
+                )
+                SELECT tp.external_id AS id,
+                       tp.name,
+                       xp.rc_player_id,
+                       snap.rc_rating,
+                       snap.rc_deviation
+                FROM team_players tp
+                LEFT JOIN xttv_players xp ON xp.external_player_id = tp.external_id
+                LEFT JOIN LATERAL (
+                    SELECT rc_rating, rc_deviation
+                    FROM player_rating_snapshots
+                    WHERE player_id = xp.id AND source = 'ratingscentral'
+                    ORDER BY observed_at DESC
+                    LIMIT 1
+                ) snap ON true
+                ORDER BY tp.name
+            """),
+            params,
+        ).mappings()
+    players = [
+        {
+            "id": str(row["id"]),
+            "name": row["name"],
+            "rc_matched": row["rc_player_id"] is not None,
+            "rc_rating": float(row["rc_rating"]) if row["rc_rating"] is not None else None,
+            "rc_deviation": float(row["rc_deviation"]) if row["rc_deviation"] is not None else None,
+        }
+        for row in rows
+    ]
+    return {
+        "ok": True,
+        "team": team_name,
+        "season": _season_label(resolved) if resolved else None,
+        "player_window_years": 2,
+        "players": players,
+    }
 
 def analyze(own_ids,opponent_team,actual_opponent_ids=None,limit=25):
     own=[str(x) for x in own_ids]

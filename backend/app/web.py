@@ -8,8 +8,8 @@ from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, play
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
 from .analysis_cache import start_background_refresh, refresh_analysis_cache
-from .player_analysis_service import list_players, list_teams
-from .db import database_health, SessionLocal
+from .player_analysis_service import list_leagues, list_players, list_teams
+from .db import database_health, SessionLocal, create_all
 from .db_routes import get_match
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
@@ -17,7 +17,8 @@ from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, impor
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
 from .rc_matching import dry_run as rc_matching_dry_run, dry_run_all as rc_matching_dry_run_all
-from .rc_index import import_index as rc_index_import, debug_search as rc_index_debug_search
+from .rc_matching import apply_matches as rc_apply_matches, apply_matches_all as rc_apply_matches_all
+from .rc_index import import_index as rc_index_import, debug_search as rc_index_debug_search, sync_current_ratings_from_index
 from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
 ROOT=Path(__file__).resolve().parents[2]
@@ -95,8 +96,9 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/analytics/matchups": return self.send_json(matchup_stats(query.get("player_id",[None])[0],query.get("opponent_id",[None])[0]))
             if parsed.path=="/api/analytics/matchup-matrix": return self.send_json(matchup_matrix())
             if parsed.path=="/api/analysis/cache-refresh": return self.send_json(refresh_analysis_cache())
-            if parsed.path=="/api/teams": return self.send_json(list_teams())
-            if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0]))
+            if parsed.path=="/api/leagues": return self.send_json(list_leagues())
+            if parsed.path=="/api/teams": return self.send_json(list_teams(query.get("league",[None])[0]))
+            if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0], query.get("league",[None])[0]))
             if parsed.path=="/api/xttv/player-find": return self.send_json(find_xttv_players(query.get("name",[None])[0],query.get("team",[None])[0]))
             if parsed.path=="/api/xttv/player-master-status": return self.send_json(player_master_status())
             if parsed.path=="/api/xttv/player-master-rebuild":
@@ -128,6 +130,20 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
                 return self.send_json(rc_matching_dry_run(limit=limit,offset=offset))
             if parsed.path=="/api/rc/match-dry-run-all": return self.send_json(rc_matching_dry_run_all())
+            if parsed.path=="/api/rc/match-apply":
+                try: limit=min(max(int(query.get("limit",["200"])[0]),1),500); offset=max(int(query.get("offset",["0"])[0]),0)
+                except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
+                import_history=query.get("import_history",["1"])[0] in {"1","true","yes"}
+                return self.send_json(rc_apply_matches(limit=limit,offset=offset,import_history=import_history))
+            if parsed.path=="/api/rc/match-apply-all":
+                try: batch=min(max(int(query.get("batch_size",["200"])[0]),1),500)
+                except ValueError:return self.send_json({"ok":False,"error":"batch_size must be an integer"},400)
+                import_history=query.get("import_history",["1"])[0] in {"1","true","yes"}
+                return self.send_json(rc_apply_matches_all(batch_size=batch,import_history=import_history))
+            if parsed.path=="/api/rc/sync-ratings-from-index":
+                try: batch=min(max(int(query.get("batch_size",["500"])[0]),1),2000)
+                except ValueError:return self.send_json({"ok":False,"error":"batch_size must be an integer"},400)
+                return self.send_json(sync_current_ratings_from_index(batch_size=batch))
             if parsed.path=="/api/rc/bulk":
                 try: limit=min(max(int(query.get("limit",["30"])[0]),1),300); offset=max(int(query.get("offset",["0"])[0]),0)
                 except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
@@ -137,7 +153,10 @@ class Handler(BaseHTTPRequestHandler):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
             if parsed.path=="/api/analysis":
                 own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]; opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
-                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0])))
+                raw_home=query.get("own_is_home",[""])[0].strip().lower(); own_is_home=None
+                if raw_home in ("1","true","home","yes"): own_is_home=True
+                elif raw_home in ("0","false","away","no"): own_is_home=False
+                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0]),own_is_home=own_is_home))
             if parsed.path=="/api/xttv/debug":return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch":return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
             if parsed.path=="/api/xttv/inspect":
@@ -157,5 +176,6 @@ class Handler(BaseHTTPRequestHandler):
         content=target.read_bytes(); types={".html":"text/html",".css":"text/css",".mjs":"text/javascript",".js":"text/javascript"}; self.send_response(200); self.send_header("Content-Type",types.get(target.suffix,"application/octet-stream")+"; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(content))); self.end_headers(); self.wfile.write(content)
 
 def main():
+    create_all()
     start_background_refresh(); ThreadingHTTPServer(("0.0.0.0",int(os.environ.get("PORT","10000"))),Handler).serve_forever()
 if __name__=="__main__":main()

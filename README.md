@@ -2,7 +2,19 @@
 
 Mobile-first MVP zur Optimierung einer Tischtennis-Mannschaftsaufstellung.
 
-## Starten
+## Lokale Entwicklung (Cursor)
+
+Vollständige Anleitung: [`docs/local-development.md`](docs/local-development.md)
+
+```powershell
+.\scripts\setup-local.ps1
+.\scripts\clone-render-db.ps1   # optional: Render-Daten read-only klonen
+.\scripts\start-dev.ps1
+```
+
+GUI: http://localhost:10000/
+
+## Demo-Start (nur Frontend, ohne Backend-Daten)
 
 ```bash
 npm install

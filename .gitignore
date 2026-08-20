@@ -2,3 +2,13 @@ dist/
 node_modules/
 .DS_Store
 npm-debug.log*
+.env
+.env.local
+.env.*.local
+.venv/
+*.pyc
+__pycache__/
+*.dump
+*.sql
+rc_apply_result.json
+pgdata/
