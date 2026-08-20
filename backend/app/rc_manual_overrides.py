@@ -9,6 +9,4 @@ RC_PLAYER_OVERRIDES: dict[str, int] = {
     # Two different real players share the exact same XTTV/RC name.
     "21417": 53717,
     "23995": 65528,
-    # Explicitly verified manual identity mapping.
-    "21773": 53678,
 }
