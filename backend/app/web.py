@@ -21,9 +21,9 @@ from .rc_matching import apply_matches as rc_apply_matches, apply_matches_all as
 from .rc_index import import_index as rc_index_import, debug_search as rc_index_debug_search, sync_current_ratings_from_index
 from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
-from .spieltyp_service import bulk_import_text, list_spieltyp
+from .doubles_service import suggest_pairs as suggest_double_pairs
 ROOT=Path(__file__).resolve().parents[2]
-RUNTIME_VERSION = "no-region-filter-v2"
+RUNTIME_VERSION = "doubles-v4-fast-local"
 SOURCE_COMMIT = "7a59946ecd9a531cf0f7aa81154b93dce0a5fda0"
 
 def http_fetch(url,timeout=20):
@@ -168,6 +168,12 @@ class Handler(BaseHTTPRequestHandler):
             team_prefix="/api/teams/"
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
+            if parsed.path=="/api/doubles/suggest":
+                raw_ids=query.get("player_ids",[""])[0]
+                ids=[v.strip() for v in raw_ids.split(",") if v.strip()]
+                team=query.get("team",[""])[0].strip() or None
+                league=query.get("league",[None])[0]
+                return self.send_json(suggest_double_pairs(ids, team=team, league=league))
             if parsed.path=="/api/spieltyp":
                 raw_ids=query.get("pass_ids",[""])[0]
                 pass_ids=[v.strip() for v in raw_ids.split(",") if v.strip()] if raw_ids else None
@@ -178,7 +184,26 @@ class Handler(BaseHTTPRequestHandler):
                 if raw_home in ("1","true","home","yes"): own_is_home=True
                 elif raw_home in ("0","false","away","no"): own_is_home=False
                 use_spieltyp=query.get("use_spieltyp",["0"])[0].strip().lower() in {"1","true","yes","on"}
-                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0]),own_is_home=own_is_home,use_spieltyp=use_spieltyp))
+                raw_pairs=query.get("own_double_pairs",[""])[0].strip()
+                own_double_pairs=None
+                if raw_pairs:
+                    own_double_pairs=[]
+                    for chunk in raw_pairs.split(";"):
+                        chunk=chunk.strip()
+                        if not chunk:
+                            continue
+                        pair=[v.strip() for v in chunk.split(",") if v.strip()]
+                        if len(pair)!=2:
+                            return self.send_json({"ok":False,"error":"own_double_pairs must be two pairs of two ids, e.g. id1,id2;id3,id4"},400)
+                        own_double_pairs.append(pair)
+                    if len(own_double_pairs)!=2:
+                        return self.send_json({"ok":False,"error":"own_double_pairs must contain exactly two pairs"},400)
+                try:
+                    stronger_double_pair=int(query.get("stronger_double_pair",["1"])[0].strip())
+                except ValueError:
+                    return self.send_json({"ok":False,"error":"stronger_double_pair must be 1 or 2"},400)
+                own_team=query.get("own_team",[""])[0].strip() or None
+                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0]),own_is_home=own_is_home,use_spieltyp=use_spieltyp,own_double_pairs=own_double_pairs,stronger_double_pair=stronger_double_pair,own_team=own_team))
             if parsed.path=="/api/xttv/debug":return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch":return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
             if parsed.path=="/api/xttv/inspect":
