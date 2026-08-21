@@ -13,7 +13,7 @@ from sqlalchemy import text
 from .db import SessionLocal, create_all
 from .models import XttvPlayer
 from .rc_fallback import fallback_candidates
-from .rc_index import import_index as rc_index_import
+from .rc_index import ensure_indexed_candidates, import_index as rc_index_import
 from .rc_index import local_candidates, to_rc_search_name
 from .rc_manual_overrides import RC_PLAYER_OVERRIDES
 
@@ -178,24 +178,9 @@ def _parse_rc_search_results(html: str) -> list[dict]:
 
 
 def search_rc(name: str, limit: int = 20) -> list[dict]:
-    indexed = local_candidates(name, limit=100)
-    if indexed:
-        candidates = []
-        for candidate in indexed:
-            score = score_name(name, candidate.get("name", ""))
-            if score:
-                candidates.append({**candidate, "score": score})
-        return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
-
-    search_name = to_rc_search_name(name)
-    params = {"PlayerName": search_name, "PlayerID": "", "PlayerUSATT_ID": "", "PlayerTTA_ID": "", "PlayerSport": "Any", "MinRating": "", "MaxRating": "", "MaxCurrentStDev": "", "MaxLastPlayedStDev": "", "MinLastPlayed": "", "MaxLastPlayed": "", "MinLastPlayedDate": "", "MaxLastPlayedDate": ""}
-    url = f"{RC_BASE}/PlayerList.php?{urlencode(params)}"
-    request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
-    with urlopen(request, timeout=20) as response:
-        html = response.read().decode("utf-8", errors="replace")
     candidates = []
-    for candidate in _parse_rc_search_results(html):
-        score = score_name(name, candidate["name"])
+    for candidate in ensure_indexed_candidates(name, allow_network=True, limit=100):
+        score = score_name(name, candidate.get("name", ""))
         if score:
             candidates.append({**candidate, "score": score})
     return sorted(candidates, key=lambda c: (-c["score"], c["rc_player_id"]))[:limit]
@@ -208,8 +193,15 @@ def _manual_override_candidate(external_id: str, name: str) -> dict | None:
     return {"rc_player_id": rc_id, "name": name, "name_norm": " ".join(norm_tokens(name)), "score": 100, "name_score": 100, "recency_score": 0.0, "match_score": 100.0, "last_played": None, "manual_override": True}
 
 
-def _resolve_player(external_id: str, name: str, club: str | None = None, *, allow_network_fallback: bool = False) -> dict:
-    """Evaluate RC match status for one XTTV player using the local index."""
+def _resolve_player(
+    external_id: str,
+    name: str,
+    club: str | None = None,
+    *,
+    allow_network_fallback: bool = False,
+    allow_live_fetch: bool = True,
+) -> dict:
+    """Evaluate RC match status for one XTTV player (local index + optional live RC fetch)."""
     override = _manual_override_candidate(external_id, name)
     if override is not None:
         return {
@@ -221,7 +213,7 @@ def _resolve_player(external_id: str, name: str, club: str | None = None, *, all
             "candidates": [override],
             "match_reason": "manual override",
         }
-    candidates = local_candidates(name, limit=100)
+    candidates = ensure_indexed_candidates(name, allow_network=allow_live_fetch, limit=100)
     status, candidate, ranked = resolve_candidates(name, candidates)
     disambiguated = False
     if status == "ambiguous":
@@ -301,7 +293,7 @@ def apply_matches(limit: int = 500, offset: int = 0, import_history: bool = True
     results: list[dict] = []
     for external_id, name, club in targets:
         try:
-            resolved = _resolve_player(external_id, name, club, allow_network_fallback=False)
+            resolved = _resolve_player(external_id, name, club, allow_network_fallback=False, allow_live_fetch=True)
             status = resolved["status"]
             if status == "ambiguous":
                 ambiguous += 1
@@ -418,19 +410,16 @@ def apply_matches_all(batch_size: int = 200, import_history: bool = True, only_u
         if remaining == 0:
             break
         result = apply_matches(
-            limit=min(batch_size, remaining),
+            limit=remaining,
             offset=0,
             import_history=import_history,
             only_unmapped=only_unmapped,
         )
         batch = {k: result[k] for k in totals}
-        batches.append({"offset": 0, "limit": batch_size, "remaining_before": remaining, **batch})
+        batches.append({"offset": 0, "limit": remaining, "remaining_before": remaining, **batch})
         for key in totals:
             totals[key] += batch[key]
-        if batch["requested"] == 0:
-            break
-        # Stop when nothing mappable left (only ambiguous/not_found/conflicts remain).
-        if batch["applied"] == 0:
+        if batch["requested"] == 0 or batch["applied"] == 0:
             break
 
     with SessionLocal() as session:
@@ -490,7 +479,7 @@ def dry_run_all() -> dict:
             if override is not None:
                 matched += 1
                 continue
-            candidates = local_candidates(name, limit=100)
+            candidates = ensure_indexed_candidates(name, allow_network=True, limit=100)
             status, candidate, ranked = resolve_candidates(name, candidates)
             if status == "matched":
                 matched += 1

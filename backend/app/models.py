@@ -26,6 +26,7 @@ class XttvPlayer(Base):
     rc_player_id: Mapped[int | None] = mapped_column(Integer, unique=True, index=True)
     name: Mapped[str] = mapped_column(String(200))
     club: Mapped[str | None] = mapped_column(String(200))
+    spieltyp: Mapped[str | None] = mapped_column(String(20))
     birth_year: Mapped[int | None] = mapped_column(Integer)
     source: Mapped[str] = mapped_column(String(50), default="xttv")
     first_seen_at: Mapped[datetime | None] = mapped_column(DateTime)

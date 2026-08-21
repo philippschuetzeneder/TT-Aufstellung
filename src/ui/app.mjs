@@ -10,6 +10,7 @@ const state = {
   ownTeam: '',
   opponentTeam: '',
   ownIsHome: true,
+  useSpieltyp: false,
   ownPlayers: [],
   opponentPlayers: [],
   selectedOwn: [],
@@ -116,7 +117,7 @@ async function loadTeamPlayers() {
 function setupPanelHtml(own, opp, opponents) {
   const analyzeDisabled = state.selectedOwn.length !== 4 || state.analysisLoading || state.loadingPlayers;
   const analyzeLabel = state.analysisLoading ? 'Berechnung läuft …' : 'Optimale Aufstellung berechnen';
-  return `<h2>1. Match Setup</h2><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}<h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3><p class="muted">Wähle genau vier Spieler.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}<button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button><h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3><p class="muted">Optional: bis zu vier Gegner, die sicher spielen.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}`;
+  return `<h2>1. Match Setup</h2><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}<label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp in Gewichtung miteinbeziehen</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv mit gewichtet (ähnlich Trend).</p><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3><p class="muted">Wähle genau vier Spieler.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}<button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button><h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3><p class="muted">Optional: bis zu vier Gegner, die sicher spielen.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}`;
 }
 
 function venueSelect() {
@@ -327,6 +328,14 @@ function bind() {
     await loadTeamPlayers();
     render();
   }));
+  app.querySelectorAll('input[type="checkbox"][data-field]').forEach((el) => el.addEventListener('change', (e) => {
+    const field = e.currentTarget.dataset.field;
+    if (field === 'useSpieltyp') {
+      state.useSpieltyp = e.currentTarget.checked;
+      state.result = null;
+      render();
+    }
+  }));
   app.querySelectorAll('[data-player]').forEach((el) => el.addEventListener('click', (e) => {
     const group = e.currentTarget.dataset.group;
     const key = group === 'own' ? 'selectedOwn' : 'selectedOpp';
@@ -352,7 +361,8 @@ async function runAnalysis() {
   try {
     const known = state.selectedOpp.length ? '&actual_opponent_ids=' + encodeURIComponent(state.selectedOpp.join(',')) : '';
     const home = '&own_is_home=' + (state.ownIsHome ? 'true' : 'false');
-    state.result = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}`);
+    const spieltyp = state.useSpieltyp ? '&use_spieltyp=true' : '';
+    state.result = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${spieltyp}`);
   } catch (e) {
     state.result = { recommendations: [], message: e.message };
   } finally {

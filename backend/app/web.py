@@ -21,6 +21,7 @@ from .rc_matching import apply_matches as rc_apply_matches, apply_matches_all as
 from .rc_index import import_index as rc_index_import, debug_search as rc_index_debug_search, sync_current_ratings_from_index
 from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
+from .spieltyp_service import bulk_import_text, list_spieltyp
 ROOT=Path(__file__).resolve().parents[2]
 RUNTIME_VERSION = "no-region-filter-v2"
 SOURCE_COMMIT = "7a59946ecd9a531cf0f7aa81154b93dce0a5fda0"
@@ -80,6 +81,22 @@ def rc_snapshot_check(player_id:int):
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
         data=json.dumps(payload,ensure_ascii=False,default=str).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
+    def do_POST(self):
+        parsed=urlparse(self.path)
+        try:
+            length=int(self.headers.get("Content-Length","0") or 0)
+            raw=self.rfile.read(length).decode("utf-8") if length else ""
+            body=json.loads(raw) if raw.strip() else {}
+            if parsed.path=="/api/spieltyp/bulk":
+                text=body.get("text") or body.get("lines") or ""
+                if isinstance(text,list):
+                    text="\n".join(str(x) for x in text)
+                return self.send_json(bulk_import_text(str(text)))
+            return self.send_json({"ok":False,"error":"not found"},404)
+        except json.JSONDecodeError:
+            return self.send_json({"ok":False,"error":"invalid JSON body"},400)
+        except Exception as exc:
+            return self.send_json({"ok":False,"error":f"{type(exc).__name__}: {exc}"},500)
     def do_GET(self):
         parsed=urlparse(self.path); query=parse_qs(parsed.query)
         try: meid=int(query.get("meid",["437757"])[0])
@@ -151,12 +168,17 @@ class Handler(BaseHTTPRequestHandler):
             team_prefix="/api/teams/"
             if parsed.path.startswith(team_prefix) and parsed.path.endswith("/players"):
                 team_name=unquote(parsed.path[len(team_prefix):-len("/players")]); return self.send_json(list_players(team_name))
+            if parsed.path=="/api/spieltyp":
+                raw_ids=query.get("pass_ids",[""])[0]
+                pass_ids=[v.strip() for v in raw_ids.split(",") if v.strip()] if raw_ids else None
+                return self.send_json(list_spieltyp(pass_ids))
             if parsed.path=="/api/analysis":
                 own=[v.strip() for v in query.get("own_player_ids",[""])[0].split(",") if v.strip()]; opponent=query.get("opponent_team",[""])[0].strip(); raw=query.get("actual_opponent_ids",[""])[0]; actual=[v.strip() for v in raw.split(",") if v.strip()] if raw else None
                 raw_home=query.get("own_is_home",[""])[0].strip().lower(); own_is_home=None
                 if raw_home in ("1","true","home","yes"): own_is_home=True
                 elif raw_home in ("0","false","away","no"): own_is_home=False
-                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0]),own_is_home=own_is_home))
+                use_spieltyp=query.get("use_spieltyp",["0"])[0].strip().lower() in {"1","true","yes","on"}
+                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0]),own_is_home=own_is_home,use_spieltyp=use_spieltyp))
             if parsed.path=="/api/xttv/debug":return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch":return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
             if parsed.path=="/api/xttv/inspect":

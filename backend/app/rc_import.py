@@ -137,7 +137,8 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, xt
 
 def match_and_import_rc(limit: int = 30, offset: int = 0) -> dict:
     """Resolve eligible XTTV players and immediately persist RC identities/history."""
-    from .rc_matching import _manual_override_candidate, local_candidates, resolve_candidates
+    from .rc_index import ensure_indexed_candidates
+    from .rc_matching import _manual_override_candidate, resolve_candidates
     create_all()
     with SessionLocal() as session:
         players = (session.query(XttvPlayer).filter(XttvPlayer.rc_player_id.is_(None)).order_by(XttvPlayer.id).offset(offset).limit(limit).all())
@@ -149,7 +150,7 @@ def match_and_import_rc(limit: int = 30, offset: int = 0) -> dict:
             if override is not None:
                 rc_id = int(override["rc_player_id"]); reason = "manual override"
             else:
-                candidates = local_candidates(name, limit=100)
+                candidates = ensure_indexed_candidates(name, allow_network=True, limit=100)
                 status, candidate, ranked = resolve_candidates(name, candidates)
                 if status != "matched" or candidate is None:
                     results.append({"xttv_player_id": external_id, "name": name, "status": status, "candidates": ranked[:10]}); continue

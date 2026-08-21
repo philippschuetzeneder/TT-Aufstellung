@@ -30,6 +30,11 @@ WIN_TARGET = 8
 MAX_ANALYSIS_SECONDS = 5.0
 STATS_YEARS = 3
 OPPONENT_POOL_YEARS = 2
+TREND_YEARS = 1
+TREND_MAX_COMPONENT = 0.08
+SPIELTYP_MAX_COMPONENT = TREND_MAX_COMPONENT
+SPIELTYP_MIN_GAMES = 2
+TREND_FULL_RC_DELTA = 80.0
 RC_BASELINE = 1400.0
 RC_SCALE = 400.0
 H2H_MAX_WEIGHT = 0.85
@@ -73,21 +78,73 @@ def _empty_profile():
         'wins': 0, 'games': 0,
         'home_wins': 0, 'home_games': 0,
         'away_wins': 0, 'away_games': 0,
-        'rc_rating': None, 'rc_trend': 0.0,
+        'rc_rating': None, 'rc_trend': 0.0, 'trend_component': 0.0,
+        'spieltyp': None, 'style_matchups': {}, 'style_component': 0.0,
     }
+
+
+def _weighted_rc_momentum(snapshots):
+    """Recency-weighted sum of RC point changes (recent updates weigh more)."""
+    if len(snapshots) < 2:
+        return 0.0
+    ref = snapshots[-1]['observed_at']
+    total = 0.0
+    for index in range(1, len(snapshots)):
+        prev, cur = snapshots[index - 1], snapshots[index]
+        delta = float(cur['rc_rating']) - float(prev['rc_rating'])
+        days_ago = max(0, (ref - cur['observed_at']).days)
+        weight = max(0.15, 1.0 - 0.85 * days_ago / 365.25)
+        total += delta * weight
+    return total
+
+
+def _recent_rc_delta(snapshots, max_steps: int = 3) -> float:
+    """RC rating change across the last N RC observations."""
+    if len(snapshots) < 2:
+        return 0.0
+    window = min(len(snapshots), max_steps + 1)
+    subset = snapshots[-window:]
+    return float(subset[-1]['rc_rating']) - float(subset[0]['rc_rating'])
+
+
+def _recent_singles_all_3_0(recent_singles: list[dict]) -> bool:
+    if len(recent_singles) < 3:
+        return False
+    for row in recent_singles[:3]:
+        if int(row['own_score']) != 3 or int(row['opp_score']) != 0:
+            return False
+    return True
+
+
+def _compute_trend_metrics(snapshots_1y: list[dict], recent_singles: list[dict]) -> tuple[float, float]:
+    """Return (rc_trend display value, trend_component for strength)."""
+    if not snapshots_1y:
+        return 0.0, 0.0
+
+    momentum = _weighted_rc_momentum(snapshots_1y)
+    recent_delta = _recent_rc_delta(snapshots_1y, 3)
+
+    if _recent_singles_all_3_0(recent_singles):
+        return momentum, TREND_MAX_COMPONENT
+    if recent_delta >= TREND_FULL_RC_DELTA:
+        return momentum, TREND_MAX_COMPONENT
+    if recent_delta <= -TREND_FULL_RC_DELTA:
+        return momentum, -TREND_MAX_COMPONENT
+
+    component = max(
+        -TREND_MAX_COMPONENT,
+        min(TREND_MAX_COMPONENT, momentum / TREND_FULL_RC_DELTA * TREND_MAX_COMPONENT),
+    )
+    return momentum, component
+
+
+def _rc_trend_from_snapshots(snapshots):
+    """Recency-weighted RC momentum (1-year window expected by caller)."""
+    return _weighted_rc_momentum(snapshots)
 
 
 def _win_rate(wins, games):
     return (wins + 5.0) / (games + 10.0)
-
-
-def _rc_trend_from_snapshots(snapshots):
-    if len(snapshots) < 2:
-        return 0.0
-    first, last = snapshots[0], snapshots[-1]
-    delta = float(last['rc_rating']) - float(first['rc_rating'])
-    days = max(1, (last['observed_at'].date() - first['observed_at'].date()).days)
-    return max(-120.0, min(120.0, delta * 365.25 / days))
 
 
 def _combined_strength(profile, side='overall'):
@@ -100,7 +157,7 @@ def _combined_strength(profile, side='overall'):
         wins, games = profile.get('wins', 0), profile.get('games', 0)
 
     win_component = (_win_rate(wins, games) - 0.5) * 0.45
-    trend_component = max(-0.08, min(0.08, profile.get('rc_trend', 0.0) / 150.0))
+    trend_component = float(profile.get('trend_component', 0.0))
 
     if rc is not None:
         rc_component = (float(rc) - RC_BASELINE) / RC_SCALE
@@ -109,11 +166,33 @@ def _combined_strength(profile, side='overall'):
     return win_component * 2.2 + trend_component
 
 
+def _style_match_rate(profile, opponent_style):
+    if not opponent_style:
+        return None
+    wins, games = profile.get('style_matchups', {}).get(opponent_style, (0, 0))
+    if games < SPIELTYP_MIN_GAMES:
+        return None
+    return (wins + 1.5) / (games + 3.0)
+
+
+def _style_component(own_profile, opp_profile):
+    opp_style = opp_profile.get('spieltyp')
+    if not opp_style:
+        return 0.0
+    rate = _style_match_rate(own_profile, opp_style)
+    if rate is None:
+        return 0.0
+    baseline = _win_rate(own_profile.get('wins', 0), own_profile.get('games', 0))
+    delta = rate - baseline
+    scale = SPIELTYP_MAX_COMPONENT / 0.25
+    return max(-SPIELTYP_MAX_COMPONENT, min(SPIELTYP_MAX_COMPONENT, delta * scale))
+
+
 def _logistic(delta, scale=4.0):
     return 1.0 / (1.0 + math.exp(-scale * delta))
 
 
-def _matchup_probability(a, b, profiles, matchups, own_is_home=True):
+def _matchup_probability(a, b, profiles, matchups, own_is_home=True, use_spieltyp=False):
     own_profile = profiles.get(a, _empty_profile())
     opp_profile = profiles.get(b, _empty_profile())
     if own_is_home:
@@ -122,6 +201,10 @@ def _matchup_probability(a, b, profiles, matchups, own_is_home=True):
     else:
         own_strength = _combined_strength(own_profile, 'away')
         opp_strength = _combined_strength(opp_profile, 'home')
+
+    if use_spieltyp:
+        own_strength += _style_component(own_profile, opp_profile)
+        opp_strength += _style_component(opp_profile, own_profile)
 
     base = _logistic(own_strength - opp_strength)
     wins, games = matchups.get((a, b), (0, 0))
@@ -412,6 +495,7 @@ def _load_player_profiles(db, ids, ref_date):
             'away_games': int(r['away_games'] or 0),
             'rc_rating': None,
             'rc_trend': 0.0,
+            'trend_component': 0.0,
         }
 
     name_stmt = text("""
@@ -443,7 +527,7 @@ def _load_player_profiles(db, ids, ref_date):
         profiles.setdefault(pid, _empty_profile())
         profiles[pid]['rc_rating'] = float(r['rc_rating']) if r['rc_rating'] is not None else None
 
-    trend_cutoff = datetime.combine(stats_cutoff, datetime.min.time())
+    trend_cutoff = datetime.combine(_cutoff(ref_date, TREND_YEARS), datetime.min.time())
     trend_stmt = text("""
         SELECT xp.external_player_id::text AS player_id, s.observed_at, s.rc_rating
         FROM xttv_players xp
@@ -455,9 +539,54 @@ def _load_player_profiles(db, ids, ref_date):
     trend_rows = defaultdict(list)
     for r in db.execute(trend_stmt, {**params, 'cutoff': trend_cutoff}).mappings():
         trend_rows[str(r['player_id'])].append({'observed_at': r['observed_at'], 'rc_rating': r['rc_rating']})
+
+    recent_singles_stmt = text("""
+        WITH all_singles AS (
+            SELECT hp.external_player_id::text AS player_id,
+                   to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') AS match_day,
+                   split_part(trim(g.result),':',1)::int AS own_score,
+                   split_part(trim(g.result),':',2)::int AS opp_score
+            FROM match_games g
+            JOIN match_players hp ON hp.match_id=g.match_id AND hp.side='home' AND hp.position=g.home_position
+            JOIN xttv_matches m ON m.id = g.match_id
+            WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+              AND hp.external_player_id::text IN :ids
+              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+            UNION ALL
+            SELECT ap.external_player_id::text,
+                   to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY'),
+                   split_part(trim(g.result),':',2)::int,
+                   split_part(trim(g.result),':',1)::int
+            FROM match_games g
+            JOIN match_players ap ON ap.match_id=g.match_id AND ap.side='away' AND ap.position=g.away_position
+            JOIN xttv_matches m ON m.id = g.match_id
+            WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+              AND ap.external_player_id::text IN :ids
+              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+        ),
+        ranked AS (
+            SELECT player_id, own_score, opp_score, match_day,
+                   ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY match_day DESC) AS rn
+            FROM all_singles
+        )
+        SELECT player_id, own_score, opp_score, match_day
+        FROM ranked
+        WHERE rn <= 3
+        ORDER BY player_id, match_day DESC
+    """).bindparams(bindparam('ids', expanding=True))
+    recent_singles_rows = defaultdict(list)
+    for r in db.execute(recent_singles_stmt, params).mappings():
+        recent_singles_rows[str(r['player_id'])].append({
+            'own_score': int(r['own_score']),
+            'opp_score': int(r['opp_score']),
+            'match_day': r['match_day'],
+        })
+
     for pid, snapshots in trend_rows.items():
         profiles.setdefault(pid, _empty_profile())
-        profiles[pid]['rc_trend'] = _rc_trend_from_snapshots(snapshots)
+        momentum, component = _compute_trend_metrics(snapshots, recent_singles_rows.get(pid, []))
+        profiles[pid]['rc_trend'] = momentum
+        profiles[pid]['trend_component'] = component
 
     h2h_stmt = text("""
         WITH base AS (
@@ -485,6 +614,64 @@ def _load_player_profiles(db, ids, ref_date):
     return names, profiles, matchups
 
 
+def _augment_profiles_spieltyp(db, ids, profiles, ref_date):
+    ids = [str(x) for x in ids]
+    if not ids:
+        return
+    params = {'ids': ids, 'cutoff': _cutoff(ref_date, STATS_YEARS)}
+    spieltyp_stmt = text("""
+        SELECT external_player_id::text AS player_id, spieltyp
+        FROM xttv_players
+        WHERE external_player_id::text IN :ids
+    """).bindparams(bindparam('ids', expanding=True))
+    for r in db.execute(spieltyp_stmt, params).mappings():
+        pid = str(r['player_id'])
+        profiles.setdefault(pid, _empty_profile())
+        profiles[pid]['spieltyp'] = r['spieltyp']
+
+    style_stmt = text("""
+        WITH base AS (
+            SELECT hp.external_player_id::text AS player_id,
+                   xp_opp.spieltyp AS opp_style,
+                   CASE WHEN split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int THEN 1 ELSE 0 END AS win
+            FROM match_games g
+            JOIN match_players hp ON hp.match_id=g.match_id AND hp.side='home' AND hp.position=g.home_position
+            JOIN match_players op ON op.match_id=g.match_id AND op.side='away' AND op.position=g.away_position
+            LEFT JOIN xttv_players xp_opp ON xp_opp.external_player_id = op.external_player_id::text
+            JOIN xttv_matches m ON m.id = g.match_id
+            WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+              AND hp.external_player_id::text IN :ids
+              AND xp_opp.spieltyp IS NOT NULL
+              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+            UNION ALL
+            SELECT ap.external_player_id::text,
+                   xp_opp.spieltyp,
+                   CASE WHEN split_part(trim(g.result),':',2)::int > split_part(trim(g.result),':',1)::int THEN 1 ELSE 0 END
+            FROM match_games g
+            JOIN match_players ap ON ap.match_id=g.match_id AND ap.side='away' AND ap.position=g.away_position
+            JOIN match_players op ON op.match_id=g.match_id AND op.side='home' AND op.position=g.home_position
+            LEFT JOIN xttv_players xp_opp ON xp_opp.external_player_id = op.external_player_id::text
+            JOIN xttv_matches m ON m.id = g.match_id
+            WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+              AND ap.external_player_id::text IN :ids
+              AND xp_opp.spieltyp IS NOT NULL
+              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+        )
+        SELECT player_id, opp_style, sum(win) AS wins, count(*) AS games
+        FROM base
+        GROUP BY player_id, opp_style
+    """).bindparams(bindparam('ids', expanding=True))
+    style_rows = defaultdict(dict)
+    for r in db.execute(style_stmt, params).mappings():
+        pid = str(r['player_id'])
+        style_rows[pid][str(r['opp_style'])] = (int(r['wins'] or 0), int(r['games'] or 0))
+
+    for pid in ids:
+        profile = profiles.setdefault(pid, _empty_profile())
+        profile['style_matchups'] = style_rows.get(pid, {})
+        profile['style_component'] = 0.0
+
+
 def _filter_scenarios(scenarios, opponent_pool):
     filtered = []
     for probability, order in scenarios:
@@ -498,7 +685,7 @@ def _filter_scenarios(scenarios, opponent_pool):
     return [(probability / total, order) for probability, order in filtered]
 
 
-def _load_analysis_data(own, opponent_team, actual):
+def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
     db = SessionLocal()
     try:
         db.execute(text("SET statement_timeout = '5000ms'")); db.execute(text("SET lock_timeout = '500ms'"))
@@ -537,6 +724,8 @@ def _load_analysis_data(own, opponent_team, actual):
             relevant.update(order)
         ids = list(relevant)
         names, profiles, matchups = _load_player_profiles(db, ids, ref_date)
+        if use_spieltyp:
+            _augment_profiles_spieltyp(db, ids, profiles, ref_date)
         names.update({k: v for k, v in fallback_names.items() if v})
         for pid in ids:
             profiles.setdefault(pid, _empty_profile()); names.setdefault(pid, f'Spieler {pid}')
@@ -547,19 +736,19 @@ def _load_analysis_data(own, opponent_team, actual):
         db.close()
 
 
-def _build_matchup_table(relevant, profiles, matchups, own_is_home):
+def _build_matchup_table(relevant, profiles, matchups, own_is_home, use_spieltyp=False):
     return {
-        (a, b): _matchup_probability(a, b, profiles, matchups, own_is_home=own_is_home)
+        (a, b): _matchup_probability(a, b, profiles, matchups, own_is_home=own_is_home, use_spieltyp=use_spieltyp)
         for a in relevant for b in relevant if a != b
     }
 
 
-def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, started):
+def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, started, use_spieltyp=False):
     schedule = _schedule_for_orientation(own_is_home)
     relevant = set(own)
     for _, order in scenarios:
         relevant.update(order)
-    matchup_p = _build_matchup_table(relevant, profiles, matchups, own_is_home)
+    matchup_p = _build_matchup_table(relevant, profiles, matchups, own_is_home, use_spieltyp=use_spieltyp)
     evaluated = []
     for own_order in permutations(own):
         expected_win = expected_draw = expected_loss = 0.0
@@ -951,7 +1140,7 @@ def _build_info_summary(
     }
 
 
-def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, opponent_limit=24, own_is_home=None):
+def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, opponent_limit=24, own_is_home=None, use_spieltyp=False):
     started = time.monotonic(); own = [str(x) for x in own_player_ids]
     if len(own) != 4 or len(set(own)) != 4:
         raise ValueError('exactly four different own_player_ids are required')
@@ -964,18 +1153,18 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         if not actual:
             actual = None
 
-    names, profiles, matchups, scenarios, source, ref_date, opponent_pool = _load_analysis_data(own, opponent_team, actual)
+    names, profiles, matchups, scenarios, source, ref_date, opponent_pool = _load_analysis_data(own, opponent_team, actual, use_spieltyp=use_spieltyp)
     if not scenarios:
         return {'ok': True, 'phase': 'B' if actual else 'A', 'recommendations': [], 'warnings': [f'Keine passende Gegner-Aufstellung für {opponent_team} gefunden.']}
 
     if own_is_home is None:
-        home_eval, home_matchups = _evaluate_lineups(own, scenarios, profiles, matchups, names, True, started)
-        away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started)
+        home_eval, home_matchups = _evaluate_lineups(own, scenarios, profiles, matchups, names, True, started, use_spieltyp=use_spieltyp)
+        away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started, use_spieltyp=use_spieltyp)
         evaluated = _merge_orientations(home_eval, away_eval)
         matchup_p = home_matchups
         orientation_note = 'home-and-away-averaged'
     else:
-        evaluated, matchup_p = _evaluate_lineups(own, scenarios, profiles, matchups, names, bool(own_is_home), started)
+        evaluated, matchup_p = _evaluate_lineups(own, scenarios, profiles, matchups, names, bool(own_is_home), started, use_spieltyp=use_spieltyp)
         orientation_note = 'home' if own_is_home else 'away'
 
     evaluated.sort(key=lambda x: (-x['team_win_probability'], x['own_player_ids']))
@@ -1001,6 +1190,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         'known_opponent_ids': actual or [],
         'known_opponent_count': len(actual or []),
         'own_is_home': own_is_home,
+        'use_spieltyp': use_spieltyp,
         'opponent_team': opponent_team,
         'own_player_ids': own,
         'opponent_set_source': source,
@@ -1021,7 +1211,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             'special_results': ['9:1', '10:0'],
             'singles_schedule': 'D-2, A-3, C-4, B-1, D, A-2, D-3, C-1, B-4, D, A-1, B-2, C-3, D-4',
             'doubles_pairing': 'game 5: two strongest together; game 10: two weakest together',
-            'strength_priority': 'RC rating, then wins/games (3y), then RC trend (ascending stronger)',
+            'strength_priority': 'RC rating, then wins/games (3y), then recency-weighted RC trend (1y)',
             'h2h_weight': f'up to {int(H2H_MAX_WEIGHT * 100)}% when direct singles exist',
             'home_away': 'separate home/away singles records; orientation averaged unless own_is_home is set',
             'opponent_lineups': f'historical position orders from last {STATS_YEARS} years; player pool last {OPPONENT_POOL_YEARS} years',

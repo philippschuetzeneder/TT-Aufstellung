@@ -162,12 +162,78 @@ def import_index_all(batch_size: int = 500, force: bool = False) -> dict:
     return {"ok": totals["errors"] == 0, "mode": "rc_index_all", "total_players_at_start": total_players, "batch_size": batch_size, "batches_processed": len(batches), **totals, "batches": batches}
 
 
-def local_candidates(name: str, limit: int = 20) -> list[dict]:
-    search_name = to_rc_search_name(name)
-    key = f"name:{norm(search_name)}"
+def _index_key(search_name: str) -> str:
+    return f"name:{norm(search_name)}"
+
+
+def surname_search_token(name: str) -> str | None:
+    """First token / surname for RC PlayerSearch-style lookup (e.g. Winter Philipp -> Winter)."""
+    value = clean_text(name)
+    if "," in value:
+        surname = value.split(",", 1)[0].strip()
+        return surname or None
+    parts = [part for part in re.split(r"\s+", value) if part]
+    return parts[0] if parts else None
+
+
+def _store_search_result(search_name: str, html: str, url: str) -> list[dict]:
+    found = parse_rc_players(html)
+    key = _index_key(search_name)
+    with SessionLocal.begin() as session:
+        entry = session.query(RcPlayerIndex).filter_by(search_key=key).one_or_none()
+        if entry is None:
+            entry = RcPlayerIndex(search_key=key)
+            session.add(entry)
+        entry.url = url
+        entry.fetched_at = datetime.utcnow()
+        entry.player_count = len(found)
+        entry.players_json = found
+    return found
+
+
+def _indexed_candidates_for_search_name(search_name: str, limit: int = 100) -> list[dict]:
+    key = _index_key(search_name)
     with SessionLocal() as session:
         entry = session.query(RcPlayerIndex).filter_by(search_key=key).one_or_none()
         return list(entry.players_json or [])[:limit] if entry else []
+
+
+def ensure_indexed_candidates(name: str, *, allow_network: bool = True, limit: int = 100) -> list[dict]:
+    """Return RC candidates from the local index, fetching PlayerList from RC when missing."""
+    search_name = to_rc_search_name(name)
+    cached = _indexed_candidates_for_search_name(search_name, limit=limit)
+    if cached:
+        return cached
+    if not allow_network:
+        return []
+
+    merged: dict[int, dict] = {}
+    try:
+        html, url = fetch_search(name)
+        for candidate in _store_search_result(search_name, html, url):
+            merged[int(candidate["rc_player_id"])] = candidate
+    except (socket.timeout, TimeoutError, URLError, OSError):
+        pass
+
+    surname = surname_search_token(name)
+    if surname and norm(surname) != norm(search_name):
+        surname_cached = _indexed_candidates_for_search_name(surname, limit=limit)
+        if surname_cached:
+            for candidate in surname_cached:
+                merged[int(candidate["rc_player_id"])] = candidate
+        elif allow_network:
+            try:
+                html, url = fetch_search(surname)
+                for candidate in _store_search_result(surname, html, url):
+                    merged[int(candidate["rc_player_id"])] = candidate
+            except (socket.timeout, TimeoutError, URLError, OSError):
+                pass
+
+    return list(merged.values())[:limit]
+
+
+def local_candidates(name: str, limit: int = 20) -> list[dict]:
+    return _indexed_candidates_for_search_name(to_rc_search_name(name), limit=limit)
 
 
 def parse_rating_from_cells(cells: list | None) -> tuple[float, float] | None:
