@@ -6,6 +6,7 @@ from datetime import date
 from app.analysis_service import (
     RC_BASELINE,
     RC_SCALE,
+    RC_COMPONENT_WEIGHT,
     TREND_YEARS,
     _combined_strength,
     _cutoff,
@@ -43,7 +44,10 @@ def profile_for(external_id: str) -> dict:
     profile["rc_rating"] = float(latest.rc_rating) if latest else None
     strength = _combined_strength(profile)
     strength_no_trend = _combined_strength({**profile, "trend_component": 0.0})
-    rc_component = (profile["rc_rating"] - RC_BASELINE) / RC_SCALE if profile["rc_rating"] else None
+    rc_component = (
+        (profile["rc_rating"] - RC_BASELINE) / RC_SCALE * RC_COMPONENT_WEIGHT
+        if profile["rc_rating"] else None
+    )
 
     return {
         "name": player.name,

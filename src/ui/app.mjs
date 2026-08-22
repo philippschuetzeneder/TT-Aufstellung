@@ -10,6 +10,7 @@ const state = {
   ownTeam: '',
   opponentTeam: '',
   ownIsHome: true,
+  opponentDirection: '',
   useSpieltyp: false,
   doublePair1Ids: [],
   strongerDoublePair: 1,
@@ -19,6 +20,10 @@ const state = {
   selectedOwn: [],
   selectedOpp: [],
   result: null,
+  optimalResult: null,
+  editMode: false,
+  editOwnOrder: [],
+  editDoubles: null,
   loadingPlayers: false,
   analysisLoading: false,
   uiExpanded: {
@@ -67,6 +72,8 @@ async function onLeagueChange(leagueId) {
   state.league = leagueId;
   storeLeague(state.league);
   state.result = null;
+  state.optimalResult = null;
+  state.editMode = false;
   syncHeader();
   await loadTeams();
   state.ownTeam = pickOwnTeam(state.teams);
@@ -120,9 +127,12 @@ async function loadTeamPlayers() {
     state.opponentPlayers = opp.players;
     state.selectedOwn = [];
     state.selectedOpp = [];
+    state.opponentDirection = '';
     state.doublePair1Ids = [];
     state.doublesSuggestion = null;
     state.result = null;
+    state.optimalResult = null;
+    state.editMode = false;
   } finally {
     state.loadingPlayers = false;
     syncHeader();
@@ -196,7 +206,7 @@ function doublesSetupHtml() {
   const p1 = state.doublePair1Ids;
   const p2 = state.selectedOwn.filter((id) => !p1.includes(String(id)));
   const chip = (id, label) => `<button type="button" class="double-chip" data-double-toggle="${escapeHtml(id)}" ${state.analysisLoading ? 'disabled' : ''}><span>${escapeHtml(ownNameById(id))}</span><small>${label}</small></button>`;
-  return `<h3>Doppel</h3><div class="double-pair-row"><div class="double-pair-col"><strong>Doppel 1</strong><div class="double-chips">${p1.map((id) => chip(id, 'D1')).join('')}</div></div><div class="double-pair-col"><strong>Doppel 2</strong><div class="double-chips">${p2.map((id) => chip(id, 'D2')).join('')}</div></div></div><div class="double-placement"><span class="double-placement-label">Stärkeres Paar</span><label class="option-check"><input type="radio" name="strongerDoublePair" value="1" ${state.strongerDoublePair === 1 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>Doppel 1</span></label><label class="option-check"><input type="radio" name="strongerDoublePair" value="2" ${state.strongerDoublePair === 2 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>Doppel 2</span></label></div>`;
+  return `<h3>Doppel</h3><div class="double-pair-row" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px"><div class="double-pair-col"><strong>Doppel 1</strong><div class="double-chips">${p1.map((id) => chip(id, 'D1')).join('')}</div></div><div class="double-pair-col"><strong>Doppel 2</strong><div class="double-chips">${p2.map((id) => chip(id, 'D2')).join('')}</div></div></div><div class="double-placement" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px"><span class="double-placement-label" style="grid-column:1/-1">Stärkeres Paar</span><label class="option-check"><input type="radio" name="strongerDoublePair" value="1" ${state.strongerDoublePair === 1 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>Doppel 1</span></label><label class="option-check"><input type="radio" name="strongerDoublePair" value="2" ${state.strongerDoublePair === 2 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>Doppel 2</span></label></div>`;
 }
 
 function pairNames(players, nameFn) {
@@ -231,7 +241,7 @@ function resolveOwnDoubles() {
 function doublesPlayerRows(doubles, nameFn) {
   if (!doubles?.game5?.players?.length || !doubles?.game10?.players?.length) return '';
   const row = (badge, game) => `<div class="optimal-player"><span>${badge}</span><strong>${pairNames(game.players, nameFn)}</strong></div>`;
-  return row('5', doubles.game5) + row('10', doubles.game10);
+  return `<div class="doubles-lineup" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">${row('5', doubles.game5)}${row('10', doubles.game10)}</div>`;
 }
 
 function ownDoublesLineupHtml() {
@@ -239,9 +249,15 @@ function ownDoublesLineupHtml() {
 }
 
 function setupPanelHtml(own, opp, opponents) {
-  const analyzeDisabled = state.selectedOwn.length !== 4 || state.analysisLoading || state.loadingPlayers;
+  const directionRequired = state.selectedOpp.length === 4 && !state.opponentDirection;
+  const analyzeDisabled = state.selectedOwn.length !== 4 || directionRequired || state.analysisLoading || state.loadingPlayers;
   const analyzeLabel = state.analysisLoading ? 'Berechnung läuft …' : 'Optimale Aufstellung berechnen';
-  return `<h2>1. Match Setup</h2><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}<label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp in Gewichtung miteinbeziehen</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3><p class="muted">Wähle genau vier Spieler.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}<button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button><h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3><p class="muted">Optional: bis zu vier Gegner, die sicher spielen.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}`;
+  return `<h2>1. Match Setup</h2><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}<label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp in Gewichtung miteinbeziehen</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3><p class="muted">Wähle genau vier Spieler.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}<h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3><p class="muted">Optional: bis zu vier Gegner, die sicher spielen.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}${opponentDirectionHtml()}<button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button>`;
+}
+
+function opponentDirectionHtml() {
+  if (state.selectedOpp.length !== 4) return '';
+  return `<div class="direction-select" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px"><span class="direction-label" style="grid-column:1/-1">Gegnerische Aufstellungsrichtung</span><label class="option-check"><input type="checkbox" data-direction="letters" ${state.opponentDirection === 'letters' ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>A–D (waagrecht)</span></label><label class="option-check"><input type="checkbox" data-direction="numbers" ${state.opponentDirection === 'numbers' ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>1–4 (senkrecht)</span></label></div>`;
 }
 
 function venueSelect() {
@@ -252,7 +268,7 @@ function render() {
   const own = state.ownPlayers;
   const opp = state.opponentPlayers;
   const opponents = state.teams.filter((t) => t.id !== state.ownTeam);
-  app.innerHTML = `<section class="grid two"><div class="card">${setupPanelHtml(own, opp, opponents)}</div><div class="card highlight"><h2>2. Optimale Aufstellung</h2>${resultHtml()}</div></section>`;
+  app.innerHTML = `<section class="grid two"><div class="card">${setupPanelHtml(own, opp, opponents)}</div><div class="card highlight"><div class="result-card-heading"><h2>2. Optimale Aufstellung</h2>${state.result?.recommendation ? `<button type="button" class="secondary edit-button" data-action="toggle-edit" ${state.analysisLoading ? 'disabled' : ''}>${state.editMode ? 'Neu berechnen' : 'Ändern'}</button>` : ''}</div>${resultHtml()}</div></section>`;
   scheduleDoublesSuggestion();
   bind();
 }
@@ -272,7 +288,16 @@ function rcLabel(p) {
 }
 
 function players(list, selected, group) {
-  return `<div class="players">${list.map((p) => {
+  const sorted = [...(list || [])].sort((a, b) => {
+    const aRating = Number(a.rc_rating);
+    const bRating = Number(b.rc_rating);
+    const aHasRating = a.rc_rating != null && Number.isFinite(aRating);
+    const bHasRating = b.rc_rating != null && Number.isFinite(bRating);
+    if (aHasRating !== bHasRating) return aHasRating ? -1 : 1;
+    if (aHasRating && aRating !== bRating) return bRating - aRating;
+    return String(a.name || '').localeCompare(String(b.name || ''), 'de');
+  });
+  return `<div class="players">${sorted.map((p) => {
     const label = rcLabel(p);
     const small = label === 'unmatched' ? 'unmatched' : `RC ${label}`;
     return `<button class="player ${selected.includes(p.id) ? 'selected' : ''}" data-player="${p.id}" data-group="${group}" ${state.analysisLoading ? 'disabled' : ''}><span><strong>${escapeHtml(p.name)}</strong></span><small>${escapeHtml(small)}</small></button>`;
@@ -290,7 +315,21 @@ function opponentNameById(id) {
 }
 
 function ownLineup(ids, backendNames) {
-  return (ids || []).map((id, i) => `<div class="optimal-player"><span>${i + 1}</span><strong>${escapeHtml(ownNameById(id) || backendNames?.[i] || `Spieler ${id}`)}</strong></div>`).join('');
+  const labels = state.opponentDirection === 'numbers' ? ['A', 'B', 'C', 'D'] : ['1', '2', '3', '4'];
+  return (ids || []).map((id, i) => `<div class="optimal-player"><span>${labels[i] || i + 1}</span><strong>${escapeHtml(ownNameById(id) || backendNames?.[i] || `Spieler ${id}`)}</strong></div>`).join('');
+}
+
+function editableLineupHtml() {
+  const ids = state.editOwnOrder;
+  const labels = state.opponentDirection === 'numbers' ? ['A', 'B', 'C', 'D'] : ['1', '2', '3', '4'];
+  return `<div class="optimal-players editable-lineup">${ids.map((id, i) => `<div class="optimal-player edit-player" draggable="${state.analysisLoading ? 'false' : 'true'}" data-edit-player="${escapeHtml(id)}" data-edit-index="${i}"><span>${labels[i]}</span><strong>${escapeHtml(ownNameById(id))}</strong></div>`).join('')}</div><div class="edit-hint muted">Spieler per Drag & Drop verschieben.</div>`;
+}
+
+function editableDoublesHtml() {
+  const doubles = state.editDoubles;
+  if (!doubles?.game5 || !doubles?.game10) return '';
+  const row = (game, ids) => `<div class="optimal-player edit-double" draggable="${state.analysisLoading ? 'false' : 'true'}" data-edit-double="${game}"><span>${game}</span><strong>${ids.map((id) => escapeHtml(ownNameById(id))).join(' / ')}</strong></div>`;
+  return `<div class="doubles-lineup editable-doubles">${row('5', doubles.game5)}${row('10', doubles.game10)}</div><div class="edit-hint muted">Doppel 5 und 10 können als Paar getauscht werden.</div>`;
 }
 
 function opponentLineup(pred, { includeDoubles = true } = {}) {
@@ -317,24 +356,33 @@ function explanationBody(explanation) {
 function infoSummaryHtml(summary) {
   if (!summary) return '<p class="muted">Keine Zusatzinfos verfügbar.</p>';
   const metaRows = [];
+  if (summary.own_rc_sum != null && summary.opponent_top_lineup_rc_sum != null) {
+    metaRows.push([
+      'Spielstärke RC-Summen',
+      `${Math.round(Number(summary.own_rc_sum))} gegen ${Math.round(Number(summary.opponent_top_lineup_rc_sum))}`,
+    ]);
+  }
   if (summary.expected_first_doubles_probability != null) {
-    metaRows.push(['Doppel (1. / 2.)', `${pct(summary.expected_first_doubles_probability)} / ${pct(summary.expected_second_doubles_probability)}`]);
+    metaRows.push(['Doppel-Siegchancen', `Doppel 1: ${pct(summary.expected_first_doubles_probability)} · Doppel 2: ${pct(summary.expected_second_doubles_probability)}`]);
   }
   if (summary.top_lineup_margin_pp != null && summary.top_lineup_margin_pp >= 0.5) {
     metaRows.push(['Abstand zur 2. Aufstellung', `${summary.top_lineup_margin_pp.toFixed(1).replace('.', ',')} PP`]);
   }
   if (summary.h2h_pairs_with_data != null) {
-    metaRows.push(['Direktduelle', `${summary.h2h_pairs_with_data} Paare (${summary.stats_window_years} Jahre)`]);
+    metaRows.push(['Direkte Duelle', `${summary.h2h_pairs_with_data} · Datenbasis ${summary.stats_window_years} Jahre`]);
   }
+  const opponentBasis = state.selectedOpp.length === 4
+    ? `${state.selectedOpp.length} feste Gegner`
+    : `${summary.opponent_pool_size || 0} mögliche Gegner`;
   metaRows.push([
-    'Modell',
-    `${summary.opponent_pool_size || 0} Gegner · ${summary.scenario_variants || 0} Szenarien · ${summary.orientation || '—'}`,
+    'Berechnungsgrundlage',
+    `${opponentBasis} · ${summary.scenario_variants || 0} historische Varianten · ${summary.orientation === 'opponent-A-D' ? 'Gegner A–D' : summary.orientation === 'opponent-1-4' ? 'Gegner 1–4' : (summary.orientation || '—')}`,
   ]);
 
   const playerCards = (summary.own_players || []).map((p) => {
     const expectedLabel = p.expected_singles_wins != null
-      ? `Erw. ${p.expected_singles_wins} Einzel`
-      : 'Erw. — Einzel';
+      ? `${p.expected_singles_wins} erwartete Einzel`
+      : '— erwartete Einzel';
     const rawHint = p.expected_singles_wins_raw != null && p.expected_singles_wins_raw !== p.expected_singles_wins
       ? ` <span class="info-expected-raw">(Ø ${String(p.expected_singles_wins_raw).replace('.', ',')})</span>`
       : '';
@@ -348,27 +396,16 @@ function infoSummaryHtml(summary) {
   return `<div class="info-meta-grid">${metaRows.map(([label, value]) => `<div class="info-meta-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}</div><div class="info-player-cards">${playerCards}</div>`;
 }
 
-function altLineupsHtml(recommendations) {
-  const items = (recommendations || []).slice(1);
+function altLineupsHtml(recommendations, optimalProbability) {
+  const items = (recommendations || []).slice(1, 6);
   if (!items.length) return '<p class="muted">Keine weiteren Aufstellungen.</p>';
-  return `<ol class="prediction-list">${items.map((x) => `<li><div class="recommendation-rank">#${x.rank}</div><div class="recommendation-names">${ownLineup(x.own_player_ids, x.players)}</div><strong>${pct(x.team_win_probability)}</strong></li>`).join('')}</ol>`;
+  return `<ol class="prediction-list">${items.map((x) => { const loss = Math.max(0, (Number(optimalProbability) - Number(x.team_win_probability)) * 100); return `<li><div class="recommendation-rank">#${x.rank}</div><div class="recommendation-names">${ownLineup(x.own_player_ids, x.players)}</div><strong style="color:#b42318">-${loss.toFixed(1).replace('.', ',')} %</strong></li>`; }).join('')}</ol>`;
 }
 
 function opponentLineupsHtml(predictions, skipFirst = true) {
   const items = skipFirst ? (predictions || []).slice(1) : (predictions || []);
   if (!items.length) return '<p class="muted">Keine weiteren Gegner-Aufstellungen im Modell.</p>';
   return `<ol class="prediction-list opponent-lineup-list">${items.map((p, i) => `<li><div class="recommendation-rank">#${skipFirst ? i + 2 : i + 1}</div><div class="recommendation-names">${opponentLineup(p)}</div><strong>${pct(p.probability)}</strong></li>`).join('')}</ol>`;
-}
-
-function resultContextText() {
-  const venue = state.ownIsHome ? 'Heimspiel' : 'Auswärts';
-  if (state.selectedOpp.length === 0) {
-    return `${venue}: Gegnerische Aufstellungen werden aus historischen XTTV-Daten gewichtet.`;
-  }
-  if (state.selectedOpp.length === 4) {
-    return `${venue}: Berechnung mit den vier ausgewählten Gegnern.`;
-  }
-  return `${venue}: Berechnung mit ${state.selectedOpp.length} bekannten Gegner(n); fehlende Positionen aus historischen Szenarien ergänzt.`;
 }
 
 function explanationHtml(explanation) {
@@ -378,6 +415,7 @@ function explanationHtml(explanation) {
 
 function resultHtml() {
   if (state.analysisLoading) return '<div class="analysis-loading" role="status" aria-live="polite"><div class="loading-title">Berechnung läuft …</div><div class="loading-track"><div class="loading-bar"></div></div><div class="loading-text">Die Analyse berücksichtigt Spielstärken, direkte Duelle und historische gegnerische Positionierungen.</div></div>';
+  if (state.selectedOpp.length === 4 && !state.opponentDirection) return '<div class="empty">Phase 2: Die vier Gegner sind bekannt. Wähle noch, ob der Gegner A–D (waagrecht) oder 1–4 (senkrecht) spielt.</div>';
   if (!state.result) return '<div class="empty">Wähle vier eigene Spieler und starte die Berechnung.</div>';
   if (!state.result.recommendation) {
     const warning = (state.result.warnings || []).join(' | ');
@@ -385,14 +423,18 @@ function resultHtml() {
   }
   const b = state.result.recommendation;
   const opp = state.result.most_likely_opponent;
-  const altCount = Math.max(0, (state.result.recommendations?.length || 1) - 1);
-  const oppAltCount = Math.max(0, (state.result.opponent_predictions?.length || 1) - 1);
   const summary = state.result.info_summary;
   const rcHint = summary?.own_rc_sum != null && summary?.opponent_top_lineup_rc_sum != null
-    ? `RC ${summary.own_rc_sum} vs ${summary.opponent_top_lineup_rc_sum}`
-    : 'RC & Modelldetails';
+    ? 'Spielstärkevergleich'
+    : 'Modelldetails';
 
-  return `<p class="muted">${escapeHtml(resultContextText())}</p><div class="optimal-result"><div class="optimal-label">Empfohlene Eigene Aufstellung</div><div class="optimal-players">${ownLineup(b.own_player_ids, b.players)}${ownDoublesLineupHtml()}</div>${resultMetricsHtml(b)}<div class="probability-breakdown"><span>Sieg ${pct(b.team_win_probability)}</span><span>Unentschieden ${pct(b.team_draw_probability)}</span><span>Niederlage ${pct(b.team_loss_probability)}</span></div></div>${explanationHtml(state.result.explanation)}${collapsible('moreInfo', 'Mehr Info', infoSummaryHtml(summary), rcHint)}${opp ? `<div class="opponent-prediction"><div class="optimal-label">Wahrscheinlichste gegnerische Aufstellung</div><div class="muted small-text">${pct(opp.probability)} Wahrscheinlichkeit</div><div class="optimal-players">${opponentLineup(opp)}</div></div>` : ''}${oppAltCount ? collapsible('oppLineups', 'Nächstmögliche gegnerische Aufstellungen', opponentLineupsHtml(state.result.opponent_predictions), `${oppAltCount} weitere`) : ''}${altCount ? collapsible('altLineups', 'Weitere eigene Aufstellungen', altLineupsHtml(state.result.recommendations), `${altCount} Alternativen`) : ''}`;
+  const alternatives = (state.result.recommendations?.length || 1) > 1
+    ? collapsible('altLineups', 'Alternative Aufstellungen', altLineupsHtml(state.result.recommendations, b.team_win_probability), `${Math.min(5, state.result.recommendations.length - 1)} weitere`)
+    : '';
+  const lineupHtml = state.editMode ? `${editableLineupHtml()}${editableDoublesHtml()}` : `<div class="optimal-players">${ownLineup(b.own_player_ids, b.players)}${ownDoublesLineupHtml()}</div>`;
+  const comparison = state.editMode && state.result?.optimal_recommendation && state.optimalResult?.recommendation ? `<div class="edit-comparison">Optimal: ${pct(state.optimalResult.recommendation.team_win_probability)} · <span class="edit-deviation">Abweichung zu Optimal: ${((Number(b.team_win_probability) - Number(state.optimalResult.recommendation.team_win_probability)) * 100).toFixed(1).replace('.', ',')} %</span></div><button type="button" class="secondary reset-edit-button" data-action="reset-edit">Zurück zur optimalen Aufstellung</button>` : '';
+  const resultClass = state.editMode ? 'fixed' : (state.result?.optimal_recommendation ? 'fixed' : '');
+  return `<div class="optimal-result ${resultClass}"><div class="optimal-label">Empfohlene Eigene Aufstellung</div>${lineupHtml}${resultMetricsHtml(b)}<div class="probability-breakdown"><span>Sieg ${pct(b.team_win_probability)}</span><span>Unentschieden ${pct(b.team_draw_probability)}</span><span>Niederlage ${pct(b.team_loss_probability)}</span></div>${comparison}</div>${!state.editMode ? explanationHtml(state.result.explanation) : ''}${!state.editMode ? collapsible('moreInfo', 'Mehr Info', infoSummaryHtml(summary), rcHint) : ''}${opp ? `<div class="opponent-prediction"><div class="optimal-label">Wahrscheinlichste gegnerische Aufstellung</div><div class="muted small-text">${pct(opp.probability)} Wahrscheinlichkeit</div><div class="optimal-players">${opponentLineup(opp)}</div></div>` : ''}${alternatives}`;
 }
 
 function pct(v) {
@@ -444,11 +486,23 @@ function bind() {
     if (field === 'ownIsHome') {
       state.ownIsHome = e.target.value === 'home';
       state.result = null;
+      state.optimalResult = null;
+      state.editMode = false;
+      render();
+      return;
+    }
+    if (field === 'opponentDirection') {
+      state.opponentDirection = e.target.value;
+      state.result = null;
+      state.optimalResult = null;
+      state.editMode = false;
       render();
       return;
     }
     state[field] = e.target.value;
     state.result = null;
+    state.optimalResult = null;
+    state.editMode = false;
     if (field === 'ownTeam' && state.opponentTeam === state.ownTeam) {
       state.opponentTeam = pickOpponentTeam(state.teams, state.ownTeam);
     }
@@ -460,23 +514,99 @@ function bind() {
     if (field === 'useSpieltyp') {
       state.useSpieltyp = e.currentTarget.checked;
       state.result = null;
+      state.optimalResult = null;
+      state.editMode = false;
       render();
     }
+  }));
+  app.querySelectorAll('input[type="checkbox"][data-direction]').forEach((el) => el.addEventListener('change', (e) => {
+    if (e.currentTarget.checked) {
+      state.opponentDirection = e.currentTarget.dataset.direction;
+    } else if (state.opponentDirection === e.currentTarget.dataset.direction) {
+      state.opponentDirection = '';
+    }
+    state.result = null;
+    state.optimalResult = null;
+    state.editMode = false;
+    render();
   }));
   app.querySelectorAll('input[type="radio"][name="strongerDoublePair"]').forEach((el) => el.addEventListener('change', (e) => {
     state.strongerDoublePair = Number(e.target.value) === 2 ? 2 : 1;
     state.result = null;
+    state.optimalResult = null;
+    state.editMode = false;
     render();
   }));
   app.querySelectorAll('[data-double-toggle]').forEach((el) => el.addEventListener('click', (e) => {
     toggleDoublePair(e.currentTarget.dataset.doubleToggle);
   }));
+  app.querySelector('[data-action="toggle-edit"]')?.addEventListener('click', () => {
+    if (state.editMode) {
+      runAnalysis();
+      return;
+    }
+    const recommendation = state.result?.recommendation;
+    if (!recommendation) return;
+    state.optimalResult = state.optimalResult || state.result;
+    state.editMode = true;
+    state.editOwnOrder = [...recommendation.own_player_ids];
+    const doubles = recommendation.doubles || state.result.doubles_advice;
+    state.editDoubles = doubles?.game5?.players && doubles?.game10?.players
+      ? { game5: doubles.game5.players.map((p) => String(p.id)), game10: doubles.game10.players.map((p) => String(p.id)) }
+      : null;
+    render();
+  });
+  app.querySelector('[data-action="reset-edit"]')?.addEventListener('click', () => {
+    state.result = state.optimalResult;
+    state.editMode = false;
+    state.editOwnOrder = [];
+    state.editDoubles = null;
+    render();
+  });
+  app.querySelectorAll('[data-edit-player]').forEach((el) => {
+    el.addEventListener('dragstart', (e) => {
+      if (state.analysisLoading) return;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', el.dataset.editIndex);
+    });
+    el.addEventListener('dragover', (e) => e.preventDefault());
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const from = Number(e.dataTransfer.getData('text/plain'));
+      const to = Number(el.dataset.editIndex);
+      if (!Number.isInteger(from) || from === to) return;
+      const next = [...state.editOwnOrder];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      state.editOwnOrder = next;
+      render();
+    });
+  });
+  app.querySelectorAll('[data-edit-double]').forEach((el) => {
+    el.addEventListener('dragstart', (e) => {
+      if (state.analysisLoading) return;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', el.dataset.editDouble);
+    });
+    el.addEventListener('dragover', (e) => e.preventDefault());
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const from = e.dataTransfer.getData('text/plain');
+      const to = el.dataset.editDouble;
+      if (!state.editDoubles || from === to) return;
+      const next = { ...state.editDoubles, game5: [...state.editDoubles.game5], game10: [...state.editDoubles.game10] };
+      [next.game5, next.game10] = [next.game10, next.game5];
+      state.editDoubles = next;
+      render();
+    });
+  });
   app.querySelectorAll('[data-player]').forEach((el) => el.addEventListener('click', async (e) => {
     const group = e.currentTarget.dataset.group;
     const key = group === 'own' ? 'selectedOwn' : 'selectedOpp';
     const id = e.currentTarget.dataset.player;
     state[key] = state[key].includes(id) ? state[key].filter((x) => x !== id) : state[key].length < 4 ? [...state[key], id] : state[key];
     state.result = null;
+    if (group === 'opp' && state.selectedOpp.length !== 4) state.opponentDirection = '';
     if (group === 'own') {
       if (state.selectedOwn.length === 4) {
         // Load the historical pair suggestion in the background. It must
@@ -506,13 +636,32 @@ async function runAnalysis() {
   try {
     const known = state.selectedOpp.length ? '&actual_opponent_ids=' + encodeURIComponent(state.selectedOpp.join(',')) : '';
     const home = '&own_is_home=' + (state.ownIsHome ? 'true' : 'false');
+    const direction = state.opponentDirection ? '&opponent_on_letters=' + (state.opponentDirection === 'letters' ? 'true' : 'false') : '';
     const spieltyp = state.useSpieltyp ? '&use_spieltyp=true' : '';
     ensureDoublePairs();
     const p2 = state.selectedOwn.filter((id) => !state.doublePair1Ids.includes(String(id)));
-    const pairs = `&own_double_pairs=${encodeURIComponent(`${state.doublePair1Ids.join(',')};${p2.join(',')}`)}`;
-    const strongerPair = `&stronger_double_pair=${state.strongerDoublePair}`;
+    let pairs;
+    let strongerPair;
+    let fixedDoublesOn = '';
+    let fixedOrder = '';
+    if (state.editMode && state.editDoubles) {
+      pairs = `&own_double_pairs=${encodeURIComponent(`${state.editDoubles.game5.join(',')};${state.editDoubles.game10.join(',')}`)}`;
+      strongerPair = '&stronger_double_pair=1';
+      fixedDoublesOn = '&fixed_doubles_on=5';
+      fixedOrder = `&fixed_own_order=${encodeURIComponent(state.editOwnOrder.join(','))}`;
+    } else {
+      pairs = `&own_double_pairs=${encodeURIComponent(`${state.doublePair1Ids.join(',')};${p2.join(',')}`)}`;
+      strongerPair = `&stronger_double_pair=${state.strongerDoublePair}`;
+    }
     const ownTeam = `&own_team=${encodeURIComponent(state.ownTeam)}`;
-    state.result = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${spieltyp}${pairs}${strongerPair}${ownTeam}`);
+    const nextResult = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${direction}${spieltyp}${pairs}${strongerPair}${ownTeam}${fixedOrder}${fixedDoublesOn}`);
+    if (state.editMode) {
+      state.result = nextResult;
+      state.optimalResult = state.optimalResult || nextResult;
+    } else {
+      state.result = nextResult;
+      state.optimalResult = nextResult;
+    }
   } catch (e) {
     state.result = { recommendations: [], message: e.message };
   } finally {

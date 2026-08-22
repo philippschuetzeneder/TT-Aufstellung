@@ -1,0 +1,15 @@
+.ranking-card{overflow:hidden}
+.ranking-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}
+.ranking-heading h2{margin-bottom:4px}
+.ranking-back{background:#102033;border-color:#102033}
+.table-scroll{overflow-x:auto;margin:0 -4px;padding:0 4px}
+.ranking-table{width:100%;min-width:850px;border-collapse:separate;border-spacing:0;font-size:.9rem}
+.ranking-table th,.ranking-table td{padding:12px 10px;border-bottom:1px solid #e7eef4;text-align:left;white-space:nowrap}
+.ranking-table thead th{background:#f8fbfd;color:#526a7d;font-size:.75rem;text-transform:uppercase;letter-spacing:.03em;position:sticky;top:0}
+.ranking-table tbody th{font-weight:850}
+.ranking-table .number{text-align:right;font-variant-numeric:tabular-nums}
+.table-sort{border:0;background:none;color:inherit;font:inherit;font-weight:850;cursor:pointer;padding:0;text-align:inherit}
+.table-sort:hover,.table-sort.active{color:#087058}
+.ranking-note{font-size:.78rem;margin:14px 0 0}
+.trend-up{color:#087058;font-weight:900}.trend-down{color:#b42318;font-weight:900}.trend-flat{color:#627487;font-weight:900}
+@media (max-width:519px){.ranking-heading{display:block}.ranking-back{margin-top:8px}.ranking-table th,.ranking-table td{padding:11px 8px}.ranking-card{padding:16px}}

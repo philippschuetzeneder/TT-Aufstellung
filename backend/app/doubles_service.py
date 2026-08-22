@@ -277,8 +277,18 @@ def predict_opponent_doubles_lineup(
 def doubles_matchup_probability(own_pair, opp_pair, stats, profiles, combined_strength_fn, logistic_fn):
     own_rate = pair_doubles_win_rate(_pair_key(*own_pair), stats)
     opp_rate = pair_doubles_win_rate(_pair_key(*opp_pair), stats)
+    own_strength = (
+        combined_strength_fn(profiles.get(own_pair[0], {}))
+        + combined_strength_fn(profiles.get(own_pair[1], {}))
+    ) / 2.0
+    opp_strength = (
+        combined_strength_fn(profiles.get(opp_pair[0], {}))
+        + combined_strength_fn(profiles.get(opp_pair[1], {}))
+    ) / 2.0
+    strength_probability = logistic_fn(own_strength - opp_strength)
     if own_rate is not None and opp_rate is not None:
-        return logistic_fn(own_rate - opp_rate, scale=3.0)
-    left = (combined_strength_fn(profiles.get(own_pair[0], {})) + combined_strength_fn(profiles.get(own_pair[1], {}))) / 2.0
-    right = (combined_strength_fn(profiles.get(opp_pair[0], {})) + combined_strength_fn(profiles.get(opp_pair[1], {}))) / 2.0
-    return logistic_fn(left - right)
+        history_probability = logistic_fn(own_rate - opp_rate, scale=3.0)
+        # Pair history is useful, but must not hide the current strength of
+        # the four players. RC/strength therefore receives the larger share.
+        return 0.65 * strength_probability + 0.35 * history_probability
+    return strength_probability

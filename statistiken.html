@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Statistiken · TT-Aufstellung</title>
     <link rel="stylesheet" href="/src/ui/styles.css">
+    <link rel="stylesheet" href="/src/ui/ranking.css">
   </head>
   <body>
     <main class="app-shell">
@@ -12,17 +13,13 @@
         <div class="hero-inner">
           <div class="hero-copy">
             <h1>Statistiken</h1>
-            <p>Auswertungen und Übersichten — folgen in Kürze.</p>
+            <p>Spieler-Rangliste der ausgewählten Liga.</p>
           </div>
-          <div id="header-controls" class="hero-controls">
-            <a class="header-btn" href="/">Zurück</a>
-          </div>
+          <div id="header-controls" class="hero-controls"></div>
         </div>
       </section>
-      <section class="card">
-        <h2>In Vorbereitung</h2>
-        <p class="muted">Hier entstehen später detaillierte Statistiken zu Spielern, Mannschaften und Aufstellungen.</p>
-      </section>
+      <div id="app"></div>
     </main>
+    <script type="module" src="/src/ui/statistiken.mjs"></script>
   </body>
 </html>

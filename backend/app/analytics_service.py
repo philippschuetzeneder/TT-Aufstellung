@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from datetime import timedelta
 from itertools import combinations
 import re
 
 from sqlalchemy.orm import selectinload
 
 from .db import SessionLocal, create_all
-from .models import MatchGame, MatchPlayer, XttvMatch
+from .models import MatchGame, MatchPlayer, PlayerRatingSnapshot, XttvMatch, XttvPlayer
+from .analysis_service import _compute_trend_metrics, _parse_match_date, _win_rate
+from .player_analysis_service import resolve_latest_league_season, _season_label
 
 
 def _score(result: str | None) -> tuple[int, int] | None:
@@ -79,6 +82,139 @@ def player_stats() -> dict:
         return {"ok": True, "players": out, "count": len(out)}
     finally:
         db.close()
+
+
+def league_player_stats(league: str | None = None) -> dict:
+    """Return one batch of player metrics for the selected, latest league season.
+
+    The RC trend and venue rates deliberately use the same helpers and
+    smoothing thresholds as the lineup analysis, but are calculated only from
+    matches in this league and from a league-specific reference date.
+    """
+    create_all()
+    with SessionLocal() as db:
+        resolved = resolve_latest_league_season(db, league or "")
+        if not resolved:
+            return {"ok": True, "league": league, "latest_league": None, "season": None, "players": [], "count": 0}
+
+        matches = (
+            db.query(XttvMatch)
+            .options(selectinload(XttvMatch.players), selectinload(XttvMatch.games))
+            .filter(XttvMatch.league == resolved)
+            .order_by(XttvMatch.id)
+            .all()
+        )
+        if not matches:
+            return {"ok": True, "league": league, "latest_league": resolved, "season": _season_label(resolved), "players": [], "count": 0}
+
+        def match_day(match):
+            return _parse_match_date(match.match_date)
+
+        ref_date = max((match_day(m) for m in matches if match_day(m)), default=None)
+        stats_cutoff = ref_date - timedelta(days=round(3 * 365.25)) if ref_date else None
+        stats = {}
+        recent_singles = defaultdict(list)
+        names = {}
+        teams = defaultdict(set)
+
+        for match in matches:
+            day = match_day(match)
+            if stats_cutoff and (day is None or day < stats_cutoff):
+                continue
+            by_position = {(p.side, p.position): p for p in match.players}
+            for player in match.players:
+                if not player.external_player_id:
+                    continue
+                pid = str(player.external_player_id)
+                names[pid] = player.name
+                team = match.home_team if player.side == "home" else match.away_team
+                if team:
+                    teams[pid].add(team)
+                stats.setdefault(pid, {
+                    "games": 0, "wins": 0, "home_games": 0, "home_wins": 0,
+                    "away_games": 0, "away_wins": 0,
+                })
+            for game in match.games:
+                score = re.fullmatch(r"\s*(\d+)\s*:\s*(\d+)\s*", game.result or "")
+                if game.game_type != "singles" or not score:
+                    continue
+                home = by_position.get(("home", game.home_position))
+                away = by_position.get(("away", game.away_position))
+                if not home or not away or not home.external_player_id or not away.external_player_id:
+                    continue
+                home_score, away_score = map(int, score.groups())
+                for player, side, won in (
+                    (home, "home", home_score > away_score),
+                    (away, "away", away_score > home_score),
+                ):
+                    pid = str(player.external_player_id)
+                    entry = stats.setdefault(pid, {
+                        "games": 0, "wins": 0, "home_games": 0, "home_wins": 0,
+                        "away_games": 0, "away_wins": 0,
+                    })
+                    entry["games"] += 1
+                    entry["wins"] += int(won)
+                    entry[f"{side}_games"] += 1
+                    entry[f"{side}_wins"] += int(won)
+                    if day:
+                        recent_singles[pid].append({
+                            "own_score": home_score if side == "home" else away_score,
+                            "opp_score": away_score if side == "home" else home_score,
+                            "match_day": day,
+                        })
+
+        player_ids = set(names)
+        db_players = db.query(XttvPlayer).filter(XttvPlayer.external_player_id.in_(player_ids)).all()
+        player_by_db_id = {p.id: p for p in db_players}
+        snapshot_rows = []
+        if db_players:
+            snapshot_rows = (
+                db.query(PlayerRatingSnapshot)
+                .filter(
+                    PlayerRatingSnapshot.player_id.in_([p.id for p in db_players]),
+                    PlayerRatingSnapshot.source == "ratingscentral",
+                )
+                .order_by(PlayerRatingSnapshot.observed_at)
+                .all()
+            )
+        snapshots = defaultdict(list)
+        for snapshot in snapshot_rows:
+            player = player_by_db_id.get(snapshot.player_id)
+            if not player or (ref_date and snapshot.observed_at.date() > ref_date):
+                continue
+            snapshots[str(player.external_player_id)].append({
+                "observed_at": snapshot.observed_at,
+                "rc_rating": snapshot.rc_rating,
+            })
+
+        output = []
+        for pid, name in names.items():
+            entry = stats.get(pid, {"games": 0, "wins": 0, "home_games": 0, "home_wins": 0, "away_games": 0, "away_wins": 0})
+            series = snapshots.get(pid, [])
+            trend_series = [row for row in series if not ref_date or row["observed_at"].date() >= ref_date - timedelta(days=round(365.25))]
+            trend, _ = _compute_trend_metrics(trend_series, sorted(recent_singles.get(pid, []), key=lambda row: row["match_day"], reverse=True)[:3])
+            current_rc = series[-1]["rc_rating"] if series else None
+            output.append({
+                "id": pid,
+                "name": name,
+                "team": ", ".join(sorted(teams.get(pid, set()))) or None,
+                "rc_rating": float(current_rc) if current_rc is not None else None,
+                "rc_trend": round(trend, 1) if series else None,
+                "home_strength": round(_win_rate(entry["home_wins"], entry["home_games"]) * 100, 1) if entry["home_games"] else None,
+                "away_strength": round(_win_rate(entry["away_wins"], entry["away_games"]) * 100, 1) if entry["away_games"] else None,
+                "games": entry["games"],
+                "wins": entry["wins"],
+            })
+        output.sort(key=lambda row: (row["rc_rating"] is None, -(row["rc_rating"] or 0), row["name"]))
+        return {
+            "ok": True,
+            "league": league,
+            "latest_league": resolved,
+            "season": _season_label(resolved),
+            "reference_date": ref_date.isoformat() if ref_date else None,
+            "players": output,
+            "count": len(output),
+        }
 
 
 def lineup_stats(team: str | None = None) -> dict:

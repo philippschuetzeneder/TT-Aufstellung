@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from bs4 import BeautifulSoup
-from .analytics_service import lineup_stats, matchup_matrix, matchup_stats, player_stats
+from .analytics_service import league_player_stats, lineup_stats, matchup_matrix, matchup_stats, player_stats
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
 from .analysis_cache import start_background_refresh, refresh_analysis_cache
@@ -23,7 +23,7 @@ from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
 from .doubles_service import suggest_pairs as suggest_double_pairs
 ROOT=Path(__file__).resolve().parents[2]
-RUNTIME_VERSION = "doubles-v4-fast-local"
+RUNTIME_VERSION = "orientation-v4-balanced-strength-signals"
 SOURCE_COMMIT = "7a59946ecd9a531cf0f7aa81154b93dce0a5fda0"
 
 def http_fetch(url,timeout=20):
@@ -108,7 +108,9 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/db/validate": return self.send_json(validate_database())
             if parsed.path=="/api/analytics/validate": return self.send_json(validate_analytics())
             if parsed.path=="/api/db/match": return self.send_json(get_match(meid))
-            if parsed.path=="/api/analytics/players": return self.send_json(player_stats())
+            if parsed.path=="/api/analytics/players":
+                league = query.get("league", [None])[0]
+                return self.send_json(league_player_stats(league) if league else player_stats())
             if parsed.path=="/api/analytics/lineups": return self.send_json(lineup_stats(query.get("team",[None])[0]))
             if parsed.path=="/api/analytics/matchups": return self.send_json(matchup_stats(query.get("player_id",[None])[0],query.get("opponent_id",[None])[0]))
             if parsed.path=="/api/analytics/matchup-matrix": return self.send_json(matchup_matrix())
@@ -183,6 +185,9 @@ class Handler(BaseHTTPRequestHandler):
                 raw_home=query.get("own_is_home",[""])[0].strip().lower(); own_is_home=None
                 if raw_home in ("1","true","home","yes"): own_is_home=True
                 elif raw_home in ("0","false","away","no"): own_is_home=False
+                raw_direction=query.get("opponent_on_letters",[""])[0].strip().lower(); opponent_on_letters=None
+                if raw_direction in ("1","true","letters","a-d","abcd","horizontal"): opponent_on_letters=True
+                elif raw_direction in ("0","false","numbers","1-4","vertical"): opponent_on_letters=False
                 use_spieltyp=query.get("use_spieltyp",["0"])[0].strip().lower() in {"1","true","yes","on"}
                 raw_pairs=query.get("own_double_pairs",[""])[0].strip()
                 own_double_pairs=None
@@ -203,7 +208,11 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     return self.send_json({"ok":False,"error":"stronger_double_pair must be 1 or 2"},400)
                 own_team=query.get("own_team",[""])[0].strip() or None
-                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0]),own_is_home=own_is_home,use_spieltyp=use_spieltyp,own_double_pairs=own_double_pairs,stronger_double_pair=stronger_double_pair,own_team=own_team))
+                raw_fixed=query.get("fixed_own_order",[""])[0].strip()
+                fixed_own_order=[v.strip() for v in raw_fixed.split(",") if v.strip()] if raw_fixed else None
+                raw_doubles_on=query.get("fixed_doubles_on",[""])[0].strip()
+                fixed_doubles_on=int(raw_doubles_on) if raw_doubles_on else None
+                return self.send_json(analyze_lineup(own,opponent,actual,int(query.get("opponent_limit",["24"])[0]),own_is_home=own_is_home,use_spieltyp=use_spieltyp,own_double_pairs=own_double_pairs,stronger_double_pair=stronger_double_pair,own_team=own_team,opponent_on_letters=opponent_on_letters,fixed_own_order=fixed_own_order,fixed_doubles_on=fixed_doubles_on))
             if parsed.path=="/api/xttv/debug":return self.send_json(debug_xttv(meid))
             if parsed.path=="/api/xttv/fetch":return self.send_json({"meid":meid,**http_fetch(MATCH_URL.format(meid=meid))})
             if parsed.path=="/api/xttv/inspect":
