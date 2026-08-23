@@ -55,11 +55,16 @@ def refresh_analysis_cache() -> dict:
                     FROM match_games g JOIN match_players hp ON hp.match_id=g.match_id AND hp.side='home' AND hp.position=g.home_position
                     JOIN match_players ap ON ap.match_id=g.match_id AND ap.side='away' AND ap.position=g.away_position
                     WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+                ),
+                directed AS (
+                    SELECT home_id AS player_id, away_id AS opponent_id, home_name AS player_name, away_name AS opponent_name, home_win AS win FROM base
+                    UNION ALL
+                    SELECT away_id, home_id, away_name, home_name, 1 - home_win FROM base
                 )
-                SELECT home_id,away_id,max(home_name),max(away_name),sum(home_win),count(*) FROM base WHERE home_id IS NOT NULL AND away_id IS NOT NULL GROUP BY home_id,away_id
-                UNION ALL
-                SELECT away_id,home_id,max(away_name),max(home_name),sum(1-home_win),count(*) FROM base WHERE home_id IS NOT NULL AND away_id IS NOT NULL GROUP BY away_id,home_id
-                ON CONFLICT (player_id,opponent_id) DO UPDATE SET player_name=EXCLUDED.player_name,opponent_name=EXCLUDED.opponent_name,wins=analysis_matchups.wins+EXCLUDED.wins,games=analysis_matchups.games+EXCLUDED.games
+                SELECT player_id, opponent_id, max(player_name), max(opponent_name), sum(win), count(*)
+                FROM directed
+                WHERE player_id IS NOT NULL AND opponent_id IS NOT NULL
+                GROUP BY player_id, opponent_id
             """))
             db.execute(text("""
                 INSERT INTO analysis_lineup_orders(team,lineup_key,order_key,p1,p2,p3,p4,appearances)

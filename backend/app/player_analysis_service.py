@@ -10,6 +10,7 @@ from .models import MatchPlayer, XttvMatch
 from .opponent_prediction_service import predict_opponent_lineups
 
 WIN_TARGET = 8
+CURRENT_SEASON = "2025/2026"
 _LEAGUE_SEASON_SUFFIX = re.compile(r"\s+(20\d{2}/20\d{2})\s*$")
 
 
@@ -33,7 +34,7 @@ def _season_sort_key(league: str) -> tuple[int, int]:
 
 
 def resolve_latest_league_season(session, league_group: str) -> str | None:
-    """Resolve a league group (without season suffix) to the newest season row in DB."""
+    """Resolve a league group (without season suffix) to the active season row in DB."""
     pattern = league_group.strip() + "%"
     rows = session.execute(
         text("SELECT league FROM xttv_matches WHERE league LIKE :pattern GROUP BY league ORDER BY league"),
@@ -41,17 +42,23 @@ def resolve_latest_league_season(session, league_group: str) -> str | None:
     ).scalars().all()
     if not rows:
         return None
-    return max(rows, key=_season_sort_key)
+    group = league_group.strip()
+    for row in rows:
+        if _league_group(row) == group and _season_label(row) == CURRENT_SEASON:
+            return row
+    return None
 
 
 def list_leagues():
-    """Distinct league groups with counts for the latest available season only."""
+    """Distinct league groups with counts for the active season only."""
     with SessionLocal() as session:
         rows = session.execute(text(
             "SELECT league, COUNT(*) AS c FROM xttv_matches WHERE league IS NOT NULL GROUP BY league ORDER BY league"
         )).mappings()
         by_group: dict[str, list[tuple[str, int]]] = {}
         for row in rows:
+            if _season_label(row["league"]) != CURRENT_SEASON:
+                continue
             group = _league_group(row["league"])
             if not group:
                 continue

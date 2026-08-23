@@ -1,4 +1,4 @@
-import { bindHeaderLeague, escapeHtml, readStoredLeague, renderHeaderLeague, storeLeague } from './header.mjs';
+import { bindHeaderLeague, bindHeaderRefresh, escapeHtml, fetchRefreshApi, readStoredLeague, renderHeaderLeague, renderRefreshReport, storeLeague } from './header.mjs';
 
 const DEFAULT_LEAGUE = '411 RK Linz Umg. / MV Mitte';
 const DEFAULT_OWN_TEAM = 'Tragwein/Kamig 3';
@@ -26,6 +26,7 @@ const state = {
   editDoubles: null,
   loadingPlayers: false,
   analysisLoading: false,
+  dataRefreshRunning: false,
   uiExpanded: {
     why: false,
     moreInfo: false,
@@ -64,8 +65,60 @@ function pickOpponentTeam(teams, ownId) {
 }
 
 function syncHeader() {
-  renderHeaderLeague(state.leagues, state.league, { disabled: state.loadingPlayers || state.analysisLoading });
+  renderHeaderLeague(state.leagues, state.league, {
+    disabled: state.loadingPlayers || state.analysisLoading,
+    showDataRefresh: true,
+    dataRefreshRunning: state.dataRefreshRunning,
+    backHref: '/statistiken.html',
+    backLabel: 'Statistiken',
+  });
   bindHeaderLeague(onLeagueChange);
+  bindHeaderRefresh(runDataRefresh);
+}
+
+async function runDataRefresh() {
+  if (state.dataRefreshRunning) return;
+  const confirmed = window.confirm(
+    'Daten-Refresh starten? Sucht neue XTTV-Spielberichte und aktualisiert RC nur bei neuen Daten. In der Sommerpause meist schnell. Bei neuen Spielen dauert es länger. Server-Neustart nur wenn etwas importiert wurde.',
+  );
+  if (!confirmed) return;
+  state.dataRefreshRunning = true;
+  syncHeader();
+  app.innerHTML = '<section class="card"><p class="muted">Daten-Refresh läuft … XTTV, RC-Index, RC-Historie, Analyse-Cache. Bitte warten.</p></section>';
+  try {
+    const data = await fetchRefreshApi(true);
+    state.dataRefreshRunning = false;
+    syncHeader();
+    renderRefreshReport(app, data, {
+      onBack: () => {
+        if (data.restart_scheduled) {
+          window.location.href = '/';
+          return;
+        }
+        render();
+      },
+    });
+  } catch (error) {
+    state.dataRefreshRunning = false;
+    syncHeader();
+    if (String(error?.message || '').includes('Failed to fetch') || error?.name === 'TypeError') {
+      renderRefreshReport(app, {
+        ok: false,
+        error: 'Refresh läuft bzw. Server wurde neu gestartet. Bitte in ein paar Sekunden erneut zur Hauptseite wechseln.',
+      }, {
+        onBack: () => { window.location.href = '/'; },
+      });
+      return;
+    }
+    renderRefreshReport(app, {
+      ok: false,
+      error: error.message,
+    }, {
+      onBack: () => {
+        render();
+      },
+    });
+  }
 }
 
 async function onLeagueChange(leagueId) {
@@ -205,12 +258,18 @@ function doublesSetupHtml() {
   ensureDoublePairs();
   const p1 = state.doublePair1Ids;
   const p2 = state.selectedOwn.filter((id) => !p1.includes(String(id)));
-  const chip = (id, label) => `<button type="button" class="double-chip" data-double-toggle="${escapeHtml(id)}" ${state.analysisLoading ? 'disabled' : ''}><span>${escapeHtml(ownNameById(id))}</span><small>${label}</small></button>`;
-  return `<h3>Doppel</h3><div class="double-pair-row" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px"><div class="double-pair-col"><strong>Doppel 1</strong><div class="double-chips">${p1.map((id) => chip(id, 'D1')).join('')}</div></div><div class="double-pair-col"><strong>Doppel 2</strong><div class="double-chips">${p2.map((id) => chip(id, 'D2')).join('')}</div></div></div><div class="double-placement" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px"><span class="double-placement-label" style="grid-column:1/-1">Stärkeres Paar</span><label class="option-check"><input type="radio" name="strongerDoublePair" value="1" ${state.strongerDoublePair === 1 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>Doppel 1</span></label><label class="option-check"><input type="radio" name="strongerDoublePair" value="2" ${state.strongerDoublePair === 2 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>Doppel 2</span></label></div>`;
+  const chip = (id) => `<button type="button" class="double-chip-compact" data-double-toggle="${escapeHtml(id)}" ${state.analysisLoading ? 'disabled' : ''}>${escapeHtml(displaySurname(ownNameById(id)))}</button>`;
+  return `<div class="doubles-setup-compact"><div class="doubles-setup-head"><span class="doubles-setup-label">Doppel</span><span class="doubles-strong-inline"><span class="muted">Stärker</span><label class="doubles-strong-opt"><input type="radio" name="strongerDoublePair" value="1" ${state.strongerDoublePair === 1 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>1</span></label><label class="doubles-strong-opt"><input type="radio" name="strongerDoublePair" value="2" ${state.strongerDoublePair === 2 ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>2</span></label></span></div><div class="doubles-compact-pairs"><div class="doubles-compact-pair"><span class="pair-tag">1</span><div class="double-chips-compact">${p1.map((id) => chip(id)).join('')}</div></div><div class="doubles-compact-pair"><span class="pair-tag">2</span><div class="double-chips-compact">${p2.map((id) => chip(id)).join('')}</div></div></div><p class="muted doubles-setup-hint">Tippen zum Tauschen zwischen den Paaren</p></div>`;
+}
+
+/** XTTV names are usually „Nachname Vorname“ — first token is the surname. */
+function displaySurname(full) {
+  const parts = String(full || '').trim().split(/\s+/).filter(Boolean);
+  return parts[0] || '';
 }
 
 function pairNames(players, nameFn) {
-  return (players || []).map((p) => escapeHtml(nameFn(p.id) || p.name || `Spieler ${p.id}`)).join(' / ');
+  return (players || []).map((p) => escapeHtml(nameFn(p.id) || displaySurname(p.name) || `Spieler ${p.id}`)).join(' / ');
 }
 
 function buildOwnDoublesFromSetup() {
@@ -244,15 +303,23 @@ function doublesPlayerRows(doubles, nameFn) {
   return `<div class="doubles-lineup" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">${row('5', doubles.game5)}${row('10', doubles.game10)}</div>`;
 }
 
+function ownSurnameById(id) {
+  return displaySurname(ownNameById(id));
+}
+
+function opponentSurnameById(id) {
+  return displaySurname(opponentNameById(id));
+}
+
 function ownDoublesLineupHtml() {
-  return doublesPlayerRows(resolveOwnDoubles(), ownNameById);
+  return doublesPlayerRows(resolveOwnDoubles(), ownSurnameById);
 }
 
 function setupPanelHtml(own, opp, opponents) {
   const directionRequired = state.selectedOpp.length === 4 && !state.opponentDirection;
   const analyzeDisabled = state.selectedOwn.length !== 4 || directionRequired || state.analysisLoading || state.loadingPlayers;
   const analyzeLabel = state.analysisLoading ? 'Berechnung läuft …' : 'Optimale Aufstellung berechnen';
-  return `<h2>1. Match Setup</h2><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}<label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp in Gewichtung miteinbeziehen</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3><p class="muted">Wähle genau vier Spieler.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}<h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3><p class="muted">Optional: bis zu vier Gegner, die sicher spielen.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}${opponentDirectionHtml()}<button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button>`;
+  return `<h2 class="section-title">1. Match Setup</h2><div class="setup-teams-block"><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div><div class="setup-opponent">${select('Gegner', 'opponentTeam', opponents)}</div></div><label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp inkludieren</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3><p class="muted setup-hint">Wähle genau vier Spieler.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}<h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3><p class="muted setup-hint">Optional: bis zu vier Gegner wählen</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}${opponentDirectionHtml()}<button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button>`;
 }
 
 function opponentDirectionHtml() {
@@ -268,7 +335,7 @@ function render() {
   const own = state.ownPlayers;
   const opp = state.opponentPlayers;
   const opponents = state.teams.filter((t) => t.id !== state.ownTeam);
-  app.innerHTML = `<section class="grid two"><div class="card">${setupPanelHtml(own, opp, opponents)}</div><div class="card highlight"><div class="result-card-heading"><h2>2. Optimale Aufstellung</h2>${state.result?.recommendation ? `<button type="button" class="secondary edit-button" data-action="toggle-edit" ${state.analysisLoading ? 'disabled' : ''}>${state.editMode ? 'Neu berechnen' : 'Ändern'}</button>` : ''}</div>${resultHtml()}</div></section>`;
+  app.innerHTML = `<section class="grid two"><div class="card setup-card">${setupPanelHtml(own, opp, opponents)}</div><div class="card highlight"><div class="result-card-heading"><h2 class="section-title">2. Optimale Aufstellung</h2>${state.result?.recommendation ? `<button type="button" class="secondary edit-button" data-action="toggle-edit" ${state.analysisLoading ? 'disabled' : ''}>${state.editMode ? 'Neu berechnen' : 'Ändern'}</button>` : ''}</div>${resultHtml()}</div></section>`;
   scheduleDoublesSuggestion();
   bind();
 }
@@ -338,7 +405,7 @@ function opponentLineup(pred, { includeDoubles = true } = {}) {
     const name = typeof p === 'object' ? p.name : null;
     return `<div class="optimal-player"><span>${i + 1}</span><strong>${escapeHtml(opponentNameById(id) || name || `Spieler ${id}`)}</strong></div>`;
   }).join('');
-  const doubles = includeDoubles ? doublesPlayerRows(pred?.doubles, opponentNameById) : '';
+  const doubles = includeDoubles ? doublesPlayerRows(pred?.doubles, opponentSurnameById) : '';
   return singles + doubles;
 }
 
@@ -357,9 +424,11 @@ function infoSummaryHtml(summary) {
   if (!summary) return '<p class="muted">Keine Zusatzinfos verfügbar.</p>';
   const metaRows = [];
   if (summary.own_rc_sum != null && summary.opponent_top_lineup_rc_sum != null) {
+    const ownCount = summary.own_rc_count != null && summary.own_rc_count < 4 ? ` (${summary.own_rc_count}/4)` : '';
+    const oppCount = summary.opponent_rc_count != null && summary.opponent_rc_count < 4 ? ` (${summary.opponent_rc_count}/4)` : '';
     metaRows.push([
       'Spielstärke RC-Summen',
-      `${Math.round(Number(summary.own_rc_sum))} gegen ${Math.round(Number(summary.opponent_top_lineup_rc_sum))}`,
+      `${Math.round(Number(summary.own_rc_sum))}${ownCount} gegen ${Math.round(Number(summary.opponent_top_lineup_rc_sum))}${oppCount}`,
     ]);
   }
   if (summary.expected_first_doubles_probability != null) {
@@ -473,6 +542,117 @@ function scoreText(recommendation) {
   return formatMatchScoreDisplay(recommendation);
 }
 
+function reorderEditOwnOrder(from, to) {
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from === to) return;
+  const next = [...state.editOwnOrder];
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  state.editOwnOrder = next;
+  render();
+}
+
+function swapEditDoubles() {
+  if (!state.editDoubles) return;
+  const next = { ...state.editDoubles, game5: [...state.editDoubles.game5], game10: [...state.editDoubles.game10] };
+  [next.game5, next.game10] = [next.game10, next.game5];
+  state.editDoubles = next;
+  render();
+}
+
+function bindEditableLineupControls() {
+  app.querySelectorAll('[data-edit-player]').forEach((el) => {
+    el.addEventListener('dragstart', (e) => {
+      if (state.analysisLoading) return;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', el.dataset.editIndex);
+    });
+    el.addEventListener('dragover', (e) => e.preventDefault());
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      reorderEditOwnOrder(Number(e.dataTransfer.getData('text/plain')), Number(el.dataset.editIndex));
+    });
+
+    let touchFrom = null;
+    el.addEventListener('touchstart', (e) => {
+      if (state.analysisLoading) return;
+      touchFrom = Number(el.dataset.editIndex);
+      el.classList.add('edit-touch-active');
+    }, { passive: true });
+    el.addEventListener('touchmove', (e) => {
+      if (touchFrom === null) return;
+      const touch = e.touches[0];
+      const hit = document.elementFromPoint(touch.clientX, touch.clientY);
+      app.querySelectorAll('[data-edit-player].edit-touch-target').forEach((node) => node.classList.remove('edit-touch-target'));
+      hit?.closest('[data-edit-player]')?.classList.add('edit-touch-target');
+    }, { passive: true });
+    el.addEventListener('touchend', (e) => {
+      if (touchFrom === null) return;
+      const touch = e.changedTouches[0];
+      const hit = document.elementFromPoint(touch.clientX, touch.clientY);
+      const target = hit?.closest('[data-edit-player]');
+      app.querySelectorAll('[data-edit-player].edit-touch-active, [data-edit-player].edit-touch-target').forEach((node) => {
+        node.classList.remove('edit-touch-active', 'edit-touch-target');
+      });
+      if (target) {
+        reorderEditOwnOrder(touchFrom, Number(target.dataset.editIndex));
+      }
+      touchFrom = null;
+    });
+    el.addEventListener('touchcancel', () => {
+      touchFrom = null;
+      el.classList.remove('edit-touch-active', 'edit-touch-target');
+    });
+  });
+
+  app.querySelectorAll('[data-edit-double]').forEach((el) => {
+    el.addEventListener('dragstart', (e) => {
+      if (state.analysisLoading) return;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', el.dataset.editDouble);
+    });
+    el.addEventListener('dragover', (e) => e.preventDefault());
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const from = e.dataTransfer.getData('text/plain');
+      const to = el.dataset.editDouble;
+      if (!state.editDoubles || from === to) return;
+      swapEditDoubles();
+    });
+
+    // HTML5 drag/drop is not available reliably on touch devices. Keep the
+    // same drag interaction as the singles editor and swap only on release
+    // over the other doubles row.
+    let touchFrom = null;
+    el.addEventListener('touchstart', () => {
+      if (state.analysisLoading) return;
+      touchFrom = el.dataset.editDouble;
+      el.classList.add('edit-touch-active');
+    }, { passive: true });
+    el.addEventListener('touchmove', (e) => {
+      if (touchFrom === null) return;
+      const touch = e.touches[0];
+      const hit = document.elementFromPoint(touch.clientX, touch.clientY);
+      app.querySelectorAll('[data-edit-double].edit-touch-target').forEach((node) => node.classList.remove('edit-touch-target'));
+      hit?.closest('[data-edit-double]')?.classList.add('edit-touch-target');
+    }, { passive: true });
+    el.addEventListener('touchend', (e) => {
+      if (touchFrom === null) return;
+      const touch = e.changedTouches[0];
+      const hit = document.elementFromPoint(touch.clientX, touch.clientY);
+      const target = hit?.closest('[data-edit-double]');
+      app.querySelectorAll('[data-edit-double].edit-touch-active, [data-edit-double].edit-touch-target').forEach((node) => {
+        node.classList.remove('edit-touch-active', 'edit-touch-target');
+      });
+      if (target && target.dataset.editDouble !== touchFrom) swapEditDoubles();
+      touchFrom = null;
+    });
+    el.addEventListener('touchcancel', () => {
+      touchFrom = null;
+      el.classList.remove('edit-touch-active', 'edit-touch-target');
+    });
+  });
+}
+
 function resultMetricsHtml(recommendation) {
   const expectedHtml = recommendation
     ? `<div class="expected-score">${escapeHtml(scoreText(recommendation))} <span>Erwartetes Ergebnis</span></div>`
@@ -563,43 +743,7 @@ function bind() {
     state.editDoubles = null;
     render();
   });
-  app.querySelectorAll('[data-edit-player]').forEach((el) => {
-    el.addEventListener('dragstart', (e) => {
-      if (state.analysisLoading) return;
-      e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', el.dataset.editIndex);
-    });
-    el.addEventListener('dragover', (e) => e.preventDefault());
-    el.addEventListener('drop', (e) => {
-      e.preventDefault();
-      const from = Number(e.dataTransfer.getData('text/plain'));
-      const to = Number(el.dataset.editIndex);
-      if (!Number.isInteger(from) || from === to) return;
-      const next = [...state.editOwnOrder];
-      const [moved] = next.splice(from, 1);
-      next.splice(to, 0, moved);
-      state.editOwnOrder = next;
-      render();
-    });
-  });
-  app.querySelectorAll('[data-edit-double]').forEach((el) => {
-    el.addEventListener('dragstart', (e) => {
-      if (state.analysisLoading) return;
-      e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', el.dataset.editDouble);
-    });
-    el.addEventListener('dragover', (e) => e.preventDefault());
-    el.addEventListener('drop', (e) => {
-      e.preventDefault();
-      const from = e.dataTransfer.getData('text/plain');
-      const to = el.dataset.editDouble;
-      if (!state.editDoubles || from === to) return;
-      const next = { ...state.editDoubles, game5: [...state.editDoubles.game5], game10: [...state.editDoubles.game10] };
-      [next.game5, next.game10] = [next.game10, next.game5];
-      state.editDoubles = next;
-      render();
-    });
-  });
+  bindEditableLineupControls();
   app.querySelectorAll('[data-player]').forEach((el) => el.addEventListener('click', async (e) => {
     const group = e.currentTarget.dataset.group;
     const key = group === 'own' ? 'selectedOwn' : 'selectedOpp';

@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TT-Aufstellung</title>
     <link rel="stylesheet" href="/src/ui/styles.css">
+    <link rel="stylesheet" href="/src/ui/header.css">
     <link rel="stylesheet" href="/src/ui/edit.css">
   </head>
   <body>
@@ -12,10 +13,13 @@
       <section class="hero card">
         <div class="hero-inner">
           <div class="hero-copy">
-            <h1>TT-Aufstellung</h1>
-            <p>Optimale eigene Aufstellung auf historischen XTTV-Daten.</p>
+            <div class="hero-title-row">
+              <h1>TT-Aufstellung</h1>
+              <div id="header-refresh" class="hero-refresh"></div>
+              <div id="header-nav" class="hero-nav"></div>
+            </div>
           </div>
-          <div id="header-controls" class="hero-controls"></div>
+          <div id="header-controls" class="hero-controls hero-controls-league"></div>
         </div>
       </section>
       <div id="app"></div>

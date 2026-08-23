@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from bs4 import BeautifulSoup
-from .analytics_service import league_player_stats, lineup_stats, matchup_matrix, matchup_stats, player_stats
+from .analytics_service import league_player_stats, lineup_stats, matchup_matrix, matchup_stats, player_stats, player_profile
 from .analytics_validation_service import validate_analytics
 from .analysis_service import analyze_lineup
 from .analysis_cache import start_background_refresh, refresh_analysis_cache
@@ -13,7 +13,7 @@ from .db import database_health, SessionLocal, create_all
 from .db_routes import get_match
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
-from .xttv_db_import import DEFAULT_LIMIT, DEFAULT_RADIUS, REFERENCE_MEID, import_one, scan_and_import, rebuild_player_master, player_master_status
+from .xttv_db_import import DEFAULT_LIMIT, REFERENCE_MEID, import_one, import_new_reports, player_master_status
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
 from .rc_matching import dry_run as rc_matching_dry_run, dry_run_all as rc_matching_dry_run_all
@@ -21,9 +21,11 @@ from .rc_matching import apply_matches as rc_apply_matches, apply_matches_all as
 from .rc_index import import_index as rc_index_import, debug_search as rc_index_debug_search, sync_current_ratings_from_index
 from .rc_events import debug_event as rc_event_debug
 from .models import XttvPlayer, PlayerRatingSnapshot
+from .data_refresh_service import run_data_refresh
 from .doubles_service import suggest_pairs as suggest_double_pairs
+from .spieltyp_service import bulk_import_text, list_spieltyp
 ROOT=Path(__file__).resolve().parents[2]
-RUNTIME_VERSION = "orientation-v4-balanced-strength-signals"
+RUNTIME_VERSION = "orientation-v9-incremental-frontier"
 SOURCE_COMMIT = "7a59946ecd9a531cf0f7aa81154b93dce0a5fda0"
 
 def http_fetch(url,timeout=20):
@@ -81,8 +83,13 @@ def rc_snapshot_check(player_id:int):
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,payload,status=200):
         data=json.dumps(payload,ensure_ascii=False,default=str).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
+    def _api_not_found(self):
+        return self.send_json({"ok": False, "error": "API endpoint not found"}, 404)
+    def _handle_data_refresh(self, query):
+        restart = query.get("restart", ["1"])[0].strip().lower() in {"1", "true", "yes", "on"}
+        return self.send_json(run_data_refresh(restart_server=restart))
     def do_POST(self):
-        parsed=urlparse(self.path)
+        parsed=urlparse(self.path); query=parse_qs(parsed.query)
         try:
             length=int(self.headers.get("Content-Length","0") or 0)
             raw=self.rfile.read(length).decode("utf-8") if length else ""
@@ -92,6 +99,10 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(text,list):
                     text="\n".join(str(x) for x in text)
                 return self.send_json(bulk_import_text(str(text)))
+            if parsed.path=="/api/data/refresh":
+                return self._handle_data_refresh(query)
+            if parsed.path.startswith("/api/"):
+                return self._api_not_found()
             return self.send_json({"ok":False,"error":"not found"},404)
         except json.JSONDecodeError:
             return self.send_json({"ok":False,"error":"invalid JSON body"},400)
@@ -111,19 +122,22 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/analytics/players":
                 league = query.get("league", [None])[0]
                 return self.send_json(league_player_stats(league) if league else player_stats())
+            if parsed.path=="/api/analytics/player-profile":
+                league = query.get("league", [None])[0]
+                player_id = query.get("player_id", [None])[0]
+                if not league or not player_id:
+                    return self.send_json({"ok": False, "error": "league und player_id sind erforderlich"}, 400)
+                return self.send_json(player_profile(league, player_id, query.get("opponent_id", [None])[0]))
             if parsed.path=="/api/analytics/lineups": return self.send_json(lineup_stats(query.get("team",[None])[0]))
             if parsed.path=="/api/analytics/matchups": return self.send_json(matchup_stats(query.get("player_id",[None])[0],query.get("opponent_id",[None])[0]))
             if parsed.path=="/api/analytics/matchup-matrix": return self.send_json(matchup_matrix())
             if parsed.path=="/api/analysis/cache-refresh": return self.send_json(refresh_analysis_cache())
+            if parsed.path=="/api/data/refresh": return self._handle_data_refresh(query)
             if parsed.path=="/api/leagues": return self.send_json(list_leagues())
             if parsed.path=="/api/teams": return self.send_json(list_teams(query.get("league",[None])[0]))
             if parsed.path=="/api/teams/players": return self.send_json(list_players(query.get("team",[""])[0], query.get("league",[None])[0]))
             if parsed.path=="/api/xttv/player-find": return self.send_json(find_xttv_players(query.get("name",[None])[0],query.get("team",[None])[0]))
             if parsed.path=="/api/xttv/player-master-status": return self.send_json(player_master_status())
-            if parsed.path=="/api/xttv/player-master-rebuild":
-                try: limit=min(max(int(query.get("limit",["5000"])[0]),1),10000); offset=max(int(query.get("offset",["0"])[0]),0)
-                except ValueError:return self.send_json({"ok":False,"error":"limit and offset must be integers"},400)
-                return self.send_json(rebuild_player_master(limit=limit,offset=offset))
             if parsed.path=="/api/rc/events/debug":
                 raw=query.get("event_id",[""])[0].strip()
                 if not raw.isdigit(): return self.send_json({"ok":False,"error":"event_id must be numeric"},400)
@@ -221,12 +235,18 @@ class Handler(BaseHTTPRequestHandler):
                 html,status,content_type,url=fetch_match(meid); return self.send_json({"meid":meid,"status":status,"content_type":content_type,"url":url,**parse_match(html,meid)})
             if parsed.path=="/api/xttv/import":return self.send_json({"meid":meid,**import_one(meid)})
             if parsed.path=="/api/xttv/scan-import":
-                start=int(query.get("start",[str(REFERENCE_MEID-DEFAULT_RADIUS)])[0]); end=int(query.get("end",[str(REFERENCE_MEID+DEFAULT_RADIUS)])[0]); limit=int(query.get("limit",[str(DEFAULT_LIMIT)])[0]); delay=float(query.get("delay",["0.05"])[0]); return self.send_json(scan_and_import(start,end,limit=limit,delay=delay))
+                try:
+                    limit=int(query.get("limit",[str(DEFAULT_LIMIT)])[0])
+                except ValueError:
+                    return self.send_json({"ok":False,"error":"limit must be an integer"},400)
+                return self.send_json(import_new_reports(limit=limit))
             if parsed.path=="/api/rc/import":
                 raw_rc_id=query.get("player_id",[""])[0].strip()
                 if not raw_rc_id or not raw_rc_id.isdigit():return self.send_json({"ok":False,"error":"player_id must be a numeric RatingsCentral player ID"},400)
                 return self.send_json(import_rc_player(int(raw_rc_id),xttv_player_id=query.get("xttv_player_id",[None])[0],xttv_external_player_id=query.get("xttv_external_player_id",[None])[0],xttv_name=query.get("xttv_name",[None])[0],xttv_club=query.get("xttv_club",[None])[0]))
         except Exception as exc:return self.send_json({"ok":False,"error":f"{type(exc).__name__}: {exc}"},500)
+        if parsed.path.startswith("/api/"):
+            return self._api_not_found()
         rel="index.html" if parsed.path in ("","/") else parsed.path.lstrip("/"); target=(ROOT/rel).resolve()
         if not str(target).startswith(str(ROOT.resolve())) or not target.is_file():return self.send_error(404)
         content=target.read_bytes(); types={".html":"text/html",".css":"text/css",".mjs":"text/javascript",".js":"text/javascript"}; self.send_response(200); self.send_header("Content-Type",types.get(target.suffix,"application/octet-stream")+"; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(content))); self.end_headers(); self.wfile.write(content)

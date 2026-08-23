@@ -36,11 +36,31 @@ WIN_TARGET = 8
 MAX_ANALYSIS_SECONDS = 5.0
 STATS_YEARS = 3
 OPPONENT_POOL_YEARS = 2
-TREND_YEARS = 1
+# Pseudo-observations blended with joint quartet history; n=5 -> 5/6 joint weight (~83%).
+KNOWN_QUARTET_JOINT_PRIOR_STRENGTH = 1.0
+POSITION_PRIOR_SMOOTHING = 0.35
+# Global strength-lineup prior: strongest RC on A/1, weakest on D/4 (measured across all matches).
+GLOBAL_STRENGTH_MIN_SAMPLE = 100
+GLOBAL_STRENGTH_MIN_TOP_RATE = 0.52
+GLOBAL_STRENGTH_MIN_BOTTOM_RATE = 0.50
+STRENGTH_PRIOR_BLEND_WEIGHT = 0.3
+STRENGTH_RC_SCALE = 500.0
+STRENGTH_POSITION_WEIGHTS = (4.0, 3.0, 2.0, 1.0)
+_global_strength_support_cache: dict[str, tuple[float, float, float, int]] = {}
+DEFAULT_RC_RATING = 1500.0
+TREND_MIN_RC = -100.0
+TREND_MAX_RC = 100.0
+TREND_WINDOW_DAYS = 365.25
+TREND_LEVEL_WEIGHT_FLOOR = 0.35
+TREND_LEVEL_WEIGHT_DECAY = 0.65
+TREND_RECENT_SNAPSHOT_MULTIPLIER = 1.25
 TREND_MAX_COMPONENT = 0.12
+TREND_MAX_SINGLES = 25
+TREND_MIN_SINGLES = 5
+TREND_RECENT_SINGLES = 10
 SPIELTYP_MAX_COMPONENT = TREND_MAX_COMPONENT
 SPIELTYP_MIN_GAMES = 2
-TREND_FULL_RC_DELTA = 80.0
+TREND_COMPONENT_FULL_SCALE = 80.0
 # RC is the primary current-strength signal.  The singles record is only a
 # deliberately small corroborating signal; trend gets a comparable bounded
 # contribution so recent form can matter without dominating the model.
@@ -53,7 +73,7 @@ HOME_AWAY_MIN_GAMES = 8
 HOME_AWAY_MIN_OVERALL_GAMES = 12
 HOME_AWAY_COMPONENT_SCALE = 0.32
 H2H_MAX_WEIGHT = 0.85
-MODEL_VERSION = 'rc-h2h-homeaway-v27-balanced-signals'
+MODEL_VERSION = 'rc-h2h-homeaway-v29-net-level-trend'
 
 # Home index 0=A..3=D; away index 0=1..3=4 on the guest row.
 SINGLES_SCHEDULE = (
@@ -93,33 +113,92 @@ def _empty_profile():
         'wins': 0, 'games': 0,
         'home_wins': 0, 'home_games': 0,
         'away_wins': 0, 'away_games': 0,
-        'rc_rating': None, 'rc_trend': 0.0, 'trend_component': 0.0,
+        'rc_rating': None, 'rc_trend': None, 'rc_trend_momentum': None, 'trend_component': 0.0,
         'spieltyp': None, 'style_matchups': {}, 'style_component': 0.0,
     }
 
 
-def _weighted_rc_momentum(snapshots):
-    """Recency-weighted sum of RC point changes (recent updates weigh more)."""
-    if len(snapshots) < 2:
+def _valid_rc_snapshots(snapshots):
+    """Return RC snapshots with usable ratings, ordered by observation time."""
+    return sorted(
+        (snapshot for snapshot in snapshots if snapshot.get('rc_rating') is not None),
+        key=lambda snapshot: snapshot['observed_at'],
+    )
+
+
+def _weighted_rc_momentum(snapshots, recent_boundary=None):
+    """Return a recency-weighted mean of RC level deviations from the opening.
+
+    Each valid level is compared with the oldest valid level, so intermediate
+    moves are not accidentally added together. A shallow age decay keeps older
+    evidence useful, while the newest-ten-singles segment receives a modest,
+    separately named boost. A sign guard preserves a positive/negative net
+    trajectory when a late pullback would otherwise reverse the level average.
+    ``recent_boundary`` is a date/datetime and is inclusive because all games
+    on the boundary day belong to that segment.
+    """
+    ordered = _valid_rc_snapshots(snapshots)
+    if len(ordered) < 2:
         return 0.0
-    ref = snapshots[-1]['observed_at']
-    total = 0.0
-    for index in range(1, len(snapshots)):
-        prev, cur = snapshots[index - 1], snapshots[index]
-        delta = float(cur['rc_rating']) - float(prev['rc_rating'])
-        days_ago = max(0, (ref - cur['observed_at']).days)
-        weight = max(0.15, 1.0 - 0.85 * days_ago / 365.25)
-        total += delta * weight
-    return total
+    opening = ordered[0]
+    current = ordered[-1]
+
+    def day(value):
+        return value.date() if hasattr(value, 'date') else value
+
+    weighted_deviation = 0.0
+    total_weight = 0.0
+    for snapshot in ordered:
+        age_days = max(
+            0.0,
+            (day(current['observed_at']) - day(snapshot['observed_at'])).days,
+        )
+        age_ratio = min(1.0, age_days / TREND_WINDOW_DAYS)
+        age_weight = max(
+            TREND_LEVEL_WEIGHT_FLOOR,
+            1.0 - TREND_LEVEL_WEIGHT_DECAY * age_ratio,
+        )
+        segment_weight = (
+            TREND_RECENT_SNAPSHOT_MULTIPLIER
+            if recent_boundary is not None and day(snapshot['observed_at']) >= day(recent_boundary)
+            else 1.0
+        )
+        weight = age_weight * segment_weight
+        weighted_deviation += weight * (
+            float(snapshot['rc_rating']) - float(opening['rc_rating'])
+        )
+        total_weight += weight
+
+    level_trend = weighted_deviation / total_weight if total_weight else 0.0
+    net_change = float(current['rc_rating']) - float(opening['rc_rating'])
+    # A late pullback may reduce a positive level history, but must not turn
+    # an actually positive net trajectory negative. This also makes a
+    # rise-and-return series neutral instead of rewarding the temporary peak.
+    if net_change == 0:
+        trend = 0.0
+    elif net_change > 0:
+        trend = max(level_trend, 0.5 * net_change)
+    else:
+        trend = min(level_trend, 0.5 * net_change)
+    return max(TREND_MIN_RC, min(TREND_MAX_RC, trend))
 
 
 def _recent_rc_delta(snapshots, max_steps: int = 3) -> float:
     """RC rating change across the last N RC observations."""
-    if len(snapshots) < 2:
+    ordered = _valid_rc_snapshots(snapshots)
+    if len(ordered) < 2:
         return 0.0
-    window = min(len(snapshots), max_steps + 1)
-    subset = snapshots[-window:]
+    window = min(len(ordered), max_steps + 1)
+    subset = ordered[-window:]
     return float(subset[-1]['rc_rating']) - float(subset[0]['rc_rating'])
+
+
+def _net_rc_change(snapshots):
+    """Net RC change between the first and last valid observation."""
+    ordered = _valid_rc_snapshots(snapshots)
+    if len(ordered) < 2:
+        return None
+    return float(ordered[-1]['rc_rating']) - float(ordered[0]['rc_rating'])
 
 
 def _recent_singles_all_3_0(recent_singles: list[dict]) -> bool:
@@ -131,30 +210,104 @@ def _recent_singles_all_3_0(recent_singles: list[dict]) -> bool:
     return True
 
 
-def _compute_trend_metrics(snapshots_1y: list[dict], recent_singles: list[dict]) -> tuple[float, float]:
-    """Return (rc_trend display value, trend_component for strength)."""
-    if not snapshots_1y:
-        return 0.0, 0.0
+def _trend_snapshot_window(snapshots: list[dict], recent_singles: list[dict]) -> list[dict]:
+    """Select snapshots spanning the latest <=25 singles, stichtag-safe.
 
-    momentum = _weighted_rc_momentum(snapshots_1y)
-    recent_delta = _recent_rc_delta(snapshots_1y, 3)
+    The latest snapshot on or before the first selected game is retained as
+    the opening level. This supplies the actual start level without allowing
+    a snapshot from after the first game to leak backwards.
+    """
+    ordered_singles = _recent_singles_window(recent_singles)
+    if not ordered_singles:
+        return []
+    def day(value):
+        return value.date() if hasattr(value, 'date') else value
 
-    if _recent_singles_all_3_0(recent_singles):
-        return momentum, TREND_MAX_COMPONENT
-    if recent_delta >= TREND_FULL_RC_DELTA:
-        return momentum, TREND_MAX_COMPONENT
-    if recent_delta <= -TREND_FULL_RC_DELTA:
-        return momentum, -TREND_MAX_COMPONENT
+    first_game = min(day(row['match_day']) for row in ordered_singles)
+    ref_date = max(day(row['match_day']) for row in ordered_singles)
+    eligible = [
+        snapshot for snapshot in snapshots
+        if day(snapshot['observed_at']) <= ref_date
+    ]
+    before_start = [
+        snapshot for snapshot in eligible
+        if day(snapshot['observed_at']) <= first_game
+    ]
+    opening = max(before_start, key=lambda snapshot: snapshot['observed_at'], default=None)
+    in_window = [
+        snapshot for snapshot in eligible
+        if day(snapshot['observed_at']) >= first_game
+    ]
+    result = ([opening] if opening is not None else []) + in_window
+    return sorted(
+        {id(snapshot): snapshot for snapshot in result}.values(),
+        key=lambda snapshot: snapshot['observed_at'],
+    )
+
+
+def _recent_segment_boundary(recent_singles: list[dict]):
+    """Return the inclusive date boundary of the newest ten singles."""
+    ordered = _recent_singles_window(recent_singles)
+    if not ordered:
+        return None
+    ordered = sorted(ordered, key=lambda row: row['match_day'], reverse=True)
+    return ordered[min(TREND_RECENT_SINGLES, len(ordered)) - 1]['match_day']
+
+
+def _snapshot_level_at_or_before(snapshots, boundary):
+    """Return the latest valid RC level at or before a segment boundary."""
+    def day(value):
+        return value.date() if hasattr(value, 'date') else value
+
+    candidates = [
+        snapshot for snapshot in _valid_rc_snapshots(snapshots)
+        if day(snapshot['observed_at']) <= day(boundary)
+    ]
+    return candidates[-1] if candidates else None
+
+
+def _recent_singles_window(recent_singles: list[dict]) -> list[dict]:
+    """Return the latest 25 singles, retaining all games on the boundary day."""
+    ordered = sorted(recent_singles, key=lambda row: row['match_day'], reverse=True)
+    if len(ordered) <= TREND_MAX_SINGLES:
+        return ordered
+    boundary = ordered[TREND_MAX_SINGLES - 1]['match_day']
+    return [row for row in ordered if row['match_day'] >= boundary]
+
+
+def _compute_trend_metrics(snapshots_1y: list[dict], recent_singles: list[dict]) -> tuple[float | None, float]:
+    """Return (bounded RC trend for display, model component).
+
+    Trend is based on the latest at most 25 singles; fewer than five singles
+    makes it unavailable (None, 0.0). RC snapshots are restricted to the
+    inclusive date span from the earliest selected single through the
+    reference date. The trend is a shallow time-weighted mean of level
+    deviations from the oldest valid snapshot, with a modest boost for the
+    latest ten singles. The model component remains capped separately.
+    """
+    recent_singles = _recent_singles_window(recent_singles)
+    if len(recent_singles) < TREND_MIN_SINGLES:
+        return None, 0.0
+
+    trend_snapshots = _trend_snapshot_window(snapshots_1y, recent_singles)
+    if len(_valid_rc_snapshots(trend_snapshots)) < 2:
+        return None, 0.0
+    valid = _valid_rc_snapshots(trend_snapshots)
+    if len(valid) < 2:
+        return None, 0.0
+    boundary = _recent_segment_boundary(recent_singles)
+    momentum = _weighted_rc_momentum(valid, recent_boundary=boundary)
+    momentum = max(TREND_MIN_RC, min(TREND_MAX_RC, momentum))
 
     component = max(
         -TREND_MAX_COMPONENT,
-        min(TREND_MAX_COMPONENT, momentum / TREND_FULL_RC_DELTA * TREND_MAX_COMPONENT),
+        min(TREND_MAX_COMPONENT, momentum / TREND_COMPONENT_FULL_SCALE * TREND_MAX_COMPONENT),
     )
     return momentum, component
 
 
 def _rc_trend_from_snapshots(snapshots):
-    """Recency-weighted RC momentum (1-year window expected by caller)."""
+    """Recency-weighted RC momentum for an already selected snapshot window."""
     return _weighted_rc_momentum(snapshots)
 
 
@@ -577,25 +730,32 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None, ref_date=None, oppon
     return [(count / top_total, order) for order, count in common], names
 
 
-def _known_quartet_lineup_scenarios(db, team, player_ids, ref_date=None):
-    """Load only historical matches containing exactly the known quartet."""
+def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
+    """Historical position orders for an exact known quartet (optionally team-scoped)."""
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
     ids = [str(x) for x in player_ids]
     bind_names = [f'known_id_{i}' for i in range(len(ids))]
     id_params = {name: value for name, value in zip(bind_names, ids)}
     placeholders = ','.join(f':{name}' for name in bind_names)
+    team_clause = ""
+    params = {'cutoff': stats_cutoff, **id_params}
+    if team:
+        team_clause = (
+            "AND ((m.home_team=:team AND mp.side='home') OR (m.away_team=:team AND mp.side='away'))"
+        )
+        params['team'] = team
     rows = db.execute(text(f"""
-        SELECT m.id AS match_id, m.match_date, mp.external_player_id AS player_id,
+        SELECT m.id AS match_id, mp.side, mp.external_player_id AS player_id,
                mp.name AS player_name, mp.position
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id=m.id
-        WHERE ((m.home_team=:team AND mp.side='home') OR (m.away_team=:team AND mp.side='away'))
-          AND mp.external_player_id IS NOT NULL
+        WHERE mp.external_player_id IS NOT NULL
           AND mp.external_player_id::text IN ({placeholders})
+          {team_clause}
           AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
         ORDER BY m.match_date DESC NULLS LAST, m.id DESC
-    """), {'team': team, 'cutoff': stats_cutoff, **id_params}).mappings()
+    """), params).mappings()
     matches = defaultdict(list)
     names = {}
     required = set(ids)
@@ -605,24 +765,356 @@ def _known_quartet_lineup_scenarios(db, team, player_ids, ref_date=None):
 
     counts = Counter()
     for players in matches.values():
-        by_id = {str(row['player_id']): row for row in players}
-        if set(by_id) != required:
-            continue
-        order = [None] * 4
-        valid = True
-        for pid in ids:
-            idx = _position_index(by_id[pid]['position'])
-            if idx is None or order[idx] is not None:
-                valid = False
-                break
-            order[idx] = pid
-        if valid and all(order):
-            counts[tuple(order)] += 1
+        by_side = defaultdict(dict)
+        for row in players:
+            by_side[row['side']][str(row['player_id'])] = row
+        for side_players in by_side.values():
+            if set(side_players) != required:
+                continue
+            order = [None] * 4
+            valid = True
+            for pid in ids:
+                idx = _position_index(side_players[pid]['position'])
+                if idx is None or order[idx] is not None:
+                    valid = False
+                    break
+                order[idx] = pid
+            if valid and all(order):
+                counts[tuple(order)] += 1
 
     total = sum(counts.values())
     if not total:
-        return [], names
-    return [(count / total, order) for order, count in counts.most_common(24)], names
+        return [], names, 0
+    return [(count / total, order) for order, count in counts.most_common(24)], names, total
+
+
+def _load_player_position_priors(db, player_ids, ref_date=None, team=None):
+    """Smoothed per-player singles position rates (team-scoped or cross-team)."""
+    ref_date = ref_date or _reference_date(db)
+    stats_cutoff = _cutoff(ref_date, STATS_YEARS)
+    ids = [str(x) for x in player_ids]
+    bind_names = [f'pid_{i}' for i in range(len(ids))]
+    id_params = {name: value for name, value in zip(bind_names, ids)}
+    placeholders = ','.join(f':{name}' for name in bind_names)
+    team_clause = ""
+    params = {'cutoff': stats_cutoff, **id_params}
+    if team:
+        team_clause = (
+            "AND ((m.home_team=:team AND mp.side='home') OR (m.away_team=:team AND mp.side='away'))"
+        )
+        params['team'] = team
+    rows = db.execute(text(f"""
+        SELECT mp.external_player_id::text AS player_id, mp.position
+        FROM xttv_matches m
+        JOIN match_players mp ON mp.match_id = m.id
+        WHERE mp.external_player_id IS NOT NULL
+          AND mp.external_player_id::text IN ({placeholders})
+          {team_clause}
+          AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+    """), params).mappings()
+    counts = {pid: [0.0, 0.0, 0.0, 0.0] for pid in ids}
+    for row in rows:
+        pid = str(row['player_id'])
+        idx = _position_index(row['position'])
+        if pid in counts and idx is not None:
+            counts[pid][idx] += 1.0
+    alpha = POSITION_PRIOR_SMOOTHING
+    priors = {}
+    for pid in ids:
+        c = counts[pid]
+        denom = sum(c) + 4 * alpha
+        priors[pid] = [(x + alpha) / denom for x in c]
+    return priors
+
+
+def _measure_global_strength_lineup_support(db, ref_date=None):
+    """How often strongest RC is on A/1 and weakest on D/4 across all four-player lineups."""
+    ref_date = ref_date or _reference_date(db)
+    stats_cutoff = _cutoff(ref_date, STATS_YEARS)
+    cache_key = str(stats_cutoff)
+    cached = _global_strength_support_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    rows = db.execute(text("""
+        WITH side_players AS (
+            SELECT m.id AS match_id, mp.side, mp.external_player_id::text AS player_id, mp.position
+            FROM xttv_matches m
+            JOIN match_players mp ON mp.match_id = m.id
+            WHERE mp.external_player_id IS NOT NULL
+              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+        ),
+        fours AS (
+            SELECT match_id, side
+            FROM side_players
+            GROUP BY match_id, side
+            HAVING count(DISTINCT player_id) = 4
+        )
+        SELECT sp.match_id, sp.side, sp.player_id, sp.position
+        FROM side_players sp
+        JOIN fours f ON f.match_id = sp.match_id AND f.side = sp.side
+    """), {'cutoff': stats_cutoff}).mappings()
+    by_lineup = defaultdict(dict)
+    player_ids: set[str] = set()
+    for row in rows:
+        idx = _position_index(row['position'])
+        if idx is None:
+            continue
+        pid = str(row['player_id'])
+        by_lineup[(row['match_id'], row['side'])][idx] = pid
+        player_ids.add(pid)
+    rc_map = _load_latest_rc_map(db, list(player_ids))
+    strongest_on_top = 0
+    weakest_on_bottom = 0
+    total = 0
+    for slots in by_lineup.values():
+        if len(slots) != 4:
+            continue
+        order = [slots[i] for i in range(4)]
+        rc_vals = [float(rc_map.get(pid) or DEFAULT_RC_RATING) for pid in order]
+        strongest_idx = max(range(4), key=lambda i: rc_vals[i])
+        weakest_idx = min(range(4), key=lambda i: rc_vals[i])
+        if strongest_idx == 0:
+            strongest_on_top += 1
+        if weakest_idx == 3:
+            weakest_on_bottom += 1
+        total += 1
+    if total < GLOBAL_STRENGTH_MIN_SAMPLE:
+        result = (0.0, 0.0, 0.0, total)
+    else:
+        top_rate = strongest_on_top / total
+        bottom_rate = weakest_on_bottom / total
+        support = (top_rate + bottom_rate) / 2.0
+        result = (support, top_rate, bottom_rate, total)
+    _global_strength_support_cache[cache_key] = result
+    return result
+
+
+def _strength_prior_blend_weight(db=None, ref_date=None):
+    """Return the fixed RC strength-prior weight.
+
+    The global evidence check was completed once and is intentionally not
+    repeated during analyses or server starts.
+    """
+    del db, ref_date
+    return STRENGTH_PRIOR_BLEND_WEIGHT, None, None, None, None
+
+
+def _source_includes_strength_prior(source: str | None) -> bool:
+    return bool(source and 'strength-prior' in source)
+
+
+def _measure_strength_lineup_support(db, player_ids, ref_date=None):
+    """Legacy per-quartet strength-lineup rates (diagnostics only)."""
+    ref_date = ref_date or _reference_date(db)
+    stats_cutoff = _cutoff(ref_date, STATS_YEARS)
+    ids = [str(x) for x in player_ids]
+    bind_names = [f'spid_{i}' for i in range(len(ids))]
+    id_params = {name: value for name, value in zip(bind_names, ids)}
+    placeholders = ','.join(f':{name}' for name in bind_names)
+    rows = db.execute(text(f"""
+        WITH side_players AS (
+            SELECT m.id AS match_id, mp.side, mp.external_player_id::text AS player_id, mp.position
+            FROM xttv_matches m
+            JOIN match_players mp ON mp.match_id = m.id
+            WHERE mp.external_player_id IS NOT NULL
+              AND mp.external_player_id::text IN ({placeholders})
+              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+        ),
+        fours AS (
+            SELECT match_id, side
+            FROM side_players
+            GROUP BY match_id, side
+            HAVING count(DISTINCT player_id) = 4
+        )
+        SELECT sp.match_id, sp.side, sp.player_id, sp.position
+        FROM side_players sp
+        JOIN fours f ON f.match_id = sp.match_id AND f.side = sp.side
+    """), {'cutoff': stats_cutoff, **id_params}).mappings()
+    rc_map = _load_latest_rc_map(db, ids)
+    by_lineup = defaultdict(dict)
+    for row in rows:
+        idx = _position_index(row['position'])
+        if idx is None:
+            continue
+        by_lineup[(row['match_id'], row['side'])][idx] = str(row['player_id'])
+    strongest_on_top = 0
+    weakest_on_bottom = 0
+    total = 0
+    for slots in by_lineup.values():
+        if len(slots) != 4:
+            continue
+        order = [slots[i] for i in range(4)]
+        rc_vals = [float(rc_map.get(pid) or DEFAULT_RC_RATING) for pid in order]
+        strongest_idx = max(range(4), key=lambda i: rc_vals[i])
+        weakest_idx = min(range(4), key=lambda i: rc_vals[i])
+        if strongest_idx == 0:
+            strongest_on_top += 1
+        if weakest_idx == 3:
+            weakest_on_bottom += 1
+        total += 1
+    if total < 3:
+        return 0.0, 0.0, 0.0, total
+    top_rate = strongest_on_top / total
+    bottom_rate = weakest_on_bottom / total
+    support = (top_rate + bottom_rate) / 2.0
+    return support, top_rate, bottom_rate, total
+
+
+def _scenarios_from_strength_prior(player_ids, rc_by_player):
+    players = [str(x) for x in player_ids]
+    weighted = []
+    for order in permutations(players):
+        score = sum(
+            STRENGTH_POSITION_WEIGHTS[pos] * float(rc_by_player.get(pid, DEFAULT_RC_RATING))
+            for pos, pid in enumerate(order)
+        )
+        weighted.append((math.exp(score / STRENGTH_RC_SCALE), tuple(order)))
+    total = sum(p for p, _ in weighted)
+    if total <= 0:
+        uniform = 1.0 / 24.0
+        return [(uniform, tuple(o)) for o in permutations(players)]
+    scenarios = [(p / total, o) for p, o in weighted]
+    scenarios.sort(key=lambda item: (-item[0], item[1]))
+    return scenarios
+
+
+def _scenarios_from_position_priors(player_ids, position_priors):
+    players = [str(x) for x in player_ids]
+    uniform = 1.0 / 24.0
+    weighted = []
+    for order in permutations(players):
+        prob = 1.0
+        for pos, pid in enumerate(order):
+            rates = position_priors.get(pid, [0.25, 0.25, 0.25, 0.25])
+            prob *= rates[pos]
+        weighted.append((prob, tuple(order)))
+    total = sum(p for p, _ in weighted)
+    if total <= 0:
+        return [(uniform, tuple(o)) for o in permutations(players)]
+    return [(p / total, o) for p, o in weighted]
+
+
+def _normalize_scenario_map(scenario_map):
+    total = sum(scenario_map.values())
+    if total <= 0:
+        return {}
+    return {order: prob / total for order, prob in scenario_map.items()}
+
+
+def _blend_scenario_maps(joint_map, prior_map, joint_weight):
+    joint_weight = max(0.0, min(1.0, joint_weight))
+    merged = {}
+    for order in set(joint_map) | set(prior_map):
+        merged[order] = (
+            joint_weight * joint_map.get(order, 0.0)
+            + (1.0 - joint_weight) * prior_map.get(order, 0.0)
+        )
+    return _normalize_scenario_map(merged)
+
+
+def _blend_known_quartet_scenarios(joint_scenarios, joint_n, prior_scenarios):
+    if joint_n <= 0 or not joint_scenarios:
+        return prior_scenarios, 0.0
+    joint_weight = joint_n / (joint_n + KNOWN_QUARTET_JOINT_PRIOR_STRENGTH)
+    joint_map = _normalize_scenario_map({order: prob for prob, order in joint_scenarios})
+    prior_map = {order: prob for prob, order in prior_scenarios}
+    blended = _blend_scenario_maps(joint_map, prior_map, joint_weight)
+    scenarios = sorted(
+        [(prob, order) for order, prob in blended.items()],
+        key=lambda item: (-item[0], item[1]),
+    )
+    return scenarios, joint_weight
+
+
+def _load_known_quartet_joint_scenarios(db, player_ids, ref_date):
+    """Joint historical orders for an exact quartet, aggregated across all teams."""
+    actual = [str(x) for x in player_ids]
+    lineup_key = ','.join(sorted(actual))
+    rows = list(db.execute(
+        text(
+            "SELECT p1,p2,p3,p4, SUM(appearances)::bigint AS appearances "
+            "FROM analysis_lineup_orders "
+            "WHERE lineup_key=:key "
+            "GROUP BY p1,p2,p3,p4 ORDER BY appearances DESC LIMIT 24"
+        ),
+        {'key': lineup_key},
+    ).mappings())
+    total = sum(int(r['appearances'] or 0) for r in rows)
+    if total:
+        scenarios = [
+            (int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1', 'p2', 'p3', 'p4')))
+            for r in rows
+        ]
+        _, names, _ = _known_quartet_lineup_scenarios(db, actual, ref_date)
+        return scenarios, total, names, 'cache-cross-team'
+    scenarios, names, joint_n = _known_quartet_lineup_scenarios(db, actual, ref_date)
+    return scenarios, joint_n, names, 'raw-cross-team'
+
+
+def _apply_strength_prior_to_scenarios(scenarios, db, ref_date):
+    """Blend historical opponent orders with global RC strength-lineup prior."""
+    blend_weight, _, _, _, _ = _strength_prior_blend_weight()
+    if blend_weight <= 0 or not scenarios:
+        return scenarios, None
+    by_set = defaultdict(list)
+    for probability, order in scenarios:
+        by_set[frozenset(order)].append((probability, tuple(order)))
+    rc_map = _load_latest_rc_map(db, list({pid for group in by_set for pid in group}))
+    blended_all = []
+    for player_set, group in by_set.items():
+        players = list(player_set)
+        group_total = sum(probability for probability, _ in group)
+        if group_total <= 0:
+            continue
+        hist_map = _normalize_scenario_map({order: probability for probability, order in group})
+        strength_scenarios = _scenarios_from_strength_prior(players, rc_map)
+        strength_map = {order: probability for probability, order in strength_scenarios}
+        inner = _blend_scenario_maps(hist_map, strength_map, 1.0 - blend_weight)
+        for order, inner_prob in inner.items():
+            blended_all.append((group_total * inner_prob, order))
+    total = sum(probability for probability, _ in blended_all)
+    if total <= 0:
+        return scenarios, None
+    result = [(probability / total, order) for probability, order in blended_all]
+    result.sort(key=lambda item: (-item[0], item[1]))
+    meta = f'strength-prior-fixed(w={blend_weight:.2f})'
+    return result, meta
+
+
+def _build_combined_prior_scenarios(db, player_ids, ref_date):
+    """Cross-team position priors blended with global RC strength-lineup prior."""
+    actual = [str(x) for x in player_ids]
+    position_priors = _load_player_position_priors(db, actual, ref_date)
+    position_scenarios = _scenarios_from_position_priors(actual, position_priors)
+    blend_weight, _, _, _, _ = _strength_prior_blend_weight()
+    if blend_weight <= 0:
+        return position_scenarios, 'known-opponent-position-prior-cross-team'
+    rc_map = _load_latest_rc_map(db, actual)
+    strength_scenarios = _scenarios_from_strength_prior(actual, rc_map)
+    prior_map = {order: prob for prob, order in position_scenarios}
+    strength_map = {order: prob for prob, order in strength_scenarios}
+    blended = _blend_scenario_maps(prior_map, strength_map, 1.0 - blend_weight)
+    scenarios = sorted(
+        [(prob, order) for order, prob in blended.items()],
+        key=lambda item: (-item[0], item[1]),
+    )
+    return scenarios, (
+        f'known-opponent-position-strength-prior-cross-team'
+        f'(fixed-w={blend_weight:.2f})'
+    )
+
+
+def _build_known_four_opponent_scenarios(db, opponent_team, player_ids, ref_date):
+    """Blend cross-team quartet history with position/strength priors when joint data is thin."""
+    actual = [str(x) for x in player_ids]
+    joint_scenarios, joint_n, fallback_names, joint_source = _load_known_quartet_joint_scenarios(
+        db, actual, ref_date,
+    )
+    prior_scenarios, prior_source = _build_combined_prior_scenarios(db, actual, ref_date)
+    if joint_n <= 0:
+        return prior_scenarios, fallback_names, prior_source
+    scenarios, _ = _blend_known_quartet_scenarios(joint_scenarios, joint_n, prior_scenarios)
+    return scenarios, fallback_names, f'known-opponent-blended-{joint_source}'
 
 
 def _build_partial_opponent_scenarios(db, team, known_ids, opponent_pool, ref_date):
@@ -709,7 +1201,8 @@ def _load_player_profiles(db, ids, ref_date):
             'away_wins': int(r['away_wins'] or 0),
             'away_games': int(r['away_games'] or 0),
             'rc_rating': None,
-            'rc_trend': 0.0,
+            'rc_trend': None,
+            'rc_trend_momentum': None,
             'trend_component': 0.0,
         }
 
@@ -733,26 +1226,25 @@ def _load_player_profiles(db, ids, ref_date):
             FROM player_rating_snapshots
             WHERE player_id = xp.id
               AND source = 'ratingscentral'
-              AND observed_at < :ref_date_exclusive
             ORDER BY observed_at DESC
             LIMIT 1
         ) snap ON true
         WHERE xp.external_player_id::text IN :ids
     """).bindparams(bindparam('ids', expanding=True))
-    rc_params = {**params, 'ref_date_exclusive': datetime.combine(ref_date + timedelta(days=1), datetime.min.time())}
-    for r in db.execute(rc_stmt, rc_params).mappings():
+    for r in db.execute(rc_stmt, params).mappings():
         pid = str(r['player_id'])
         profiles.setdefault(pid, _empty_profile())
         profiles[pid]['rc_rating'] = float(r['rc_rating']) if r['rc_rating'] is not None else None
 
-    trend_cutoff = datetime.combine(_cutoff(ref_date, TREND_YEARS), datetime.min.time())
+    # Load the statistics horizon; _compute_trend_metrics narrows this to the
+    # date span of the latest <=25 singles (not to a calendar year).
+    trend_cutoff = datetime.combine(stats_cutoff, datetime.min.time())
     trend_stmt = text("""
         SELECT xp.external_player_id::text AS player_id, s.observed_at, s.rc_rating
         FROM xttv_players xp
         JOIN player_rating_snapshots s ON s.player_id = xp.id AND s.source = 'ratingscentral'
         WHERE xp.external_player_id::text IN :ids
           AND s.observed_at >= :cutoff
-          AND s.observed_at < :ref_date_exclusive
         ORDER BY xp.external_player_id, s.observed_at
     """).bindparams(bindparam('ids', expanding=True))
     trend_rows = defaultdict(list)
@@ -761,7 +1253,6 @@ def _load_player_profiles(db, ids, ref_date):
         {
             **params,
             'cutoff': trend_cutoff,
-            'ref_date_exclusive': datetime.combine(ref_date + timedelta(days=1), datetime.min.time()),
         },
     ).mappings():
         trend_rows[str(r['player_id'])].append({'observed_at': r['observed_at'], 'rc_rating': r['rc_rating']})
@@ -794,10 +1285,22 @@ def _load_player_profiles(db, ids, ref_date):
             SELECT player_id, own_score, opp_score, match_day,
                    ROW_NUMBER() OVER (PARTITION BY player_id ORDER BY match_day DESC) AS rn
             FROM all_singles
+        ),
+        bounded AS (
+            SELECT player_id, own_score, opp_score, match_day
+            FROM ranked r
+            WHERE r.match_day >= (
+                SELECT r25.match_day
+                FROM ranked r25
+                WHERE r25.player_id = r.player_id AND r25.rn = 25
+            )
+            OR NOT EXISTS (
+                SELECT 1 FROM ranked r25
+                WHERE r25.player_id = r.player_id AND r25.rn = 25
+            )
         )
         SELECT player_id, own_score, opp_score, match_day
-        FROM ranked
-        WHERE rn <= 3
+        FROM bounded
         ORDER BY player_id, match_day DESC
     """).bindparams(bindparam('ids', expanding=True))
     recent_singles_rows = defaultdict(list)
@@ -810,8 +1313,10 @@ def _load_player_profiles(db, ids, ref_date):
 
     for pid, snapshots in trend_rows.items():
         profiles.setdefault(pid, _empty_profile())
-        momentum, component = _compute_trend_metrics(snapshots, recent_singles_rows.get(pid, []))
-        profiles[pid]['rc_trend'] = momentum
+        net_change, component = _compute_trend_metrics(snapshots, recent_singles_rows.get(pid, []))
+        profiles[pid]['rc_trend'] = net_change
+        trend_snapshots = _trend_snapshot_window(snapshots, recent_singles_rows.get(pid, []))
+        profiles[pid]['rc_trend_momentum'] = net_change
         profiles[pid]['trend_component'] = component
 
     h2h_stmt = text("""
@@ -838,6 +1343,43 @@ def _load_player_profiles(db, ids, ref_date):
     for r in db.execute(h2h_stmt, params).mappings():
         matchups[(str(r['player_id']), str(r['opponent_id']))] = (int(r['wins'] or 0), int(r['games'] or 0))
     return names, profiles, matchups
+
+
+def _load_latest_rc_map(db, ids):
+    """Latest Ratings Central RC per player, aligned with the team player picker."""
+    ids = [str(x) for x in ids]
+    if not ids:
+        return {}
+    stmt = text("""
+        SELECT xp.external_player_id::text AS player_id, snap.rc_rating
+        FROM xttv_players xp
+        JOIN LATERAL (
+            SELECT rc_rating
+            FROM player_rating_snapshots
+            WHERE player_id = xp.id AND source = 'ratingscentral'
+            ORDER BY observed_at DESC
+            LIMIT 1
+        ) snap ON true
+        WHERE xp.external_player_id::text IN :ids
+    """).bindparams(bindparam('ids', expanding=True))
+    out = {}
+    for row in db.execute(stmt, {'ids': ids}).mappings():
+        if row['rc_rating'] is not None:
+            out[str(row['player_id'])] = float(row['rc_rating'])
+    return out
+
+
+def _rc_values_for_ids(player_ids, latest_rc_map, profiles):
+    """Collect RC values for an ordered player list, preferring latest snapshots."""
+    values = []
+    for pid in player_ids:
+        pid = str(pid)
+        rc = latest_rc_map.get(pid)
+        if rc is None:
+            rc = _rc_value(profiles.get(pid, _empty_profile()))
+        if rc is not None:
+            values.append(rc)
+    return values
 
 
 def _augment_profiles_spieltyp(db, ids, profiles, ref_date):
@@ -921,19 +1463,9 @@ def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
         fallback_names = {}
         if actual is not None and len(actual) > 0:
             if len(actual) == 4:
-                lineup_key = ','.join(sorted(actual))
-                rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE lineup_key=:key ORDER BY appearances DESC LIMIT 24"), {'key': lineup_key}).mappings())
-                total = sum(int(r['appearances'] or 0) for r in rows)
-                if total:
-                    scenarios = [(int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1','p2','p3','p4'))) for r in rows]; source = 'known-opponent-historical-cache'
-                else:
-                    scenarios, fallback_names = _known_quartet_lineup_scenarios(db, opponent_team, actual, ref_date)
-                    source = 'known-opponent-historical-raw'
-                    if not scenarios:
-                        # Keep a neutral fallback only when no usable historical
-                        # position order exists for this exact quartet.
-                        scenarios = [(1.0 / 24.0, tuple(order)) for order in permutations(actual)]
-                        source = 'all-24-uniform-fallback'
+                scenarios, fallback_names, source = _build_known_four_opponent_scenarios(
+                    db, opponent_team, actual, ref_date,
+                )
             else:
                 scenarios, fallback_names = _raw_team_lineup_scenarios(db, opponent_team, actual, ref_date, opponent_pool); source = 'known-opponent-historical-raw'
                 if not scenarios:
@@ -947,6 +1479,10 @@ def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
                 scenarios, fallback_names = _raw_team_lineup_scenarios(db, opponent_team, None, ref_date, opponent_pool); source = 'predicted-historical-raw'
                 if not scenarios:
                     return {}, {}, {}, [], source, ref_date, opponent_pool
+        if not _source_includes_strength_prior(source):
+            scenarios, strength_meta = _apply_strength_prior_to_scenarios(scenarios, db, ref_date)
+            if strength_meta:
+                source = f'{source}+{strength_meta}'
         if source != 'all-24-uniform-fallback':
             scenarios = _filter_scenarios(scenarios, opponent_pool)
         relevant = set(own)
@@ -1362,7 +1898,7 @@ def _build_doubles_advice(recommendation, names, own_double_pairs, stronger_doub
 def _build_info_summary(
     own, scenarios, profiles, names, matchups, recommendation, evaluated, explanation,
     opponent_team, ref_date, opponent_pool, source, orientation_note, matchup_p=None, own_is_home=None, own_on_letters=None,
-    own_double_pairs=None, stronger_double_pair=1, doubles_stats=None,
+    own_double_pairs=None, stronger_double_pair=1, doubles_stats=None, actual_opponent_ids=None,
 ):
     own_order = recommendation['own_player_ids']
     expected_singles = {}
@@ -1421,7 +1957,6 @@ def _build_info_summary(
         }
 
     own_players = []
-    own_rc_values = []
     for position, pid in enumerate(own_order):
         profile = profiles.get(pid, _empty_profile())
         rc = _rc_value(profile)
@@ -1434,7 +1969,7 @@ def _build_info_summary(
             'player_name': names.get(pid, f'Spieler {pid}'),
             'lineup_position': 'ABCD'[position],
             'rc_rating': round(rc, 1) if rc is not None else None,
-            'rc_trend': round(profile.get('rc_trend', 0.0), 1),
+            'rc_trend': round(profile['rc_trend'], 1) if profile.get('rc_trend') is not None else None,
             'singles_wins': profile.get('wins', 0),
             'singles_games': profile.get('games', 0),
             'expected_singles_wins': exp_rounded,
@@ -1444,8 +1979,6 @@ def _build_info_summary(
                 pid, position, breakdown, profile, matchups, names, exp_raw, exp_rounded, own_on_letters,
             ),
         })
-        if rc is not None:
-            own_rc_values.append(rc)
 
     opponent_ids = set()
     weighted_opp_rc = 0.0
@@ -1458,9 +1991,18 @@ def _build_info_summary(
             weighted_opp_rc += probability * sum(lineup_rc)
             weighted_opp_rc_mass += probability
 
-    top_order = scenarios[0][1] if scenarios else tuple()
-    top_rc_values = [_rc_value(profiles.get(pid, _empty_profile())) for pid in top_order]
-    top_rc_values = [v for v in top_rc_values if v is not None]
+    if actual_opponent_ids and len(actual_opponent_ids) == 4:
+        opponent_rc_ids = [str(x) for x in actual_opponent_ids]
+    elif scenarios:
+        opponent_rc_ids = list(sorted(scenarios, key=lambda item: -item[0])[0][1])
+    else:
+        opponent_rc_ids = []
+
+    with SessionLocal() as db:
+        latest_rc = _load_latest_rc_map(db, list(own) + opponent_rc_ids)
+
+    own_rc_values = _rc_values_for_ids(own, latest_rc, profiles)
+    top_rc_values = _rc_values_for_ids(opponent_rc_ids, latest_rc, profiles)
 
     h2h_pairs = []
     for a in own:
@@ -1493,6 +2035,7 @@ def _build_info_summary(
         'own_rc_count': len(own_rc_values),
         'opponent_top_lineup_rc_sum': top_sum,
         'opponent_top_lineup_rc_avg': top_avg,
+        'opponent_rc_count': len(top_rc_values),
         'opponent_weighted_rc_avg': weighted_avg,
         'rc_gap_vs_top_lineup': round(own_avg - top_avg, 1) if own_avg is not None and top_avg is not None else None,
         'own_players': own_players,
@@ -1613,7 +2156,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         opponent_team, ref_date, opponent_pool, source, orientation_note,
         matchup_p=matchup_p, own_is_home=own_is_home, own_on_letters=own_on_letters,
         own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair,
-        doubles_stats=doubles_stats,
+        doubles_stats=doubles_stats, actual_opponent_ids=actual,
     )
 
     return {
@@ -1650,7 +2193,10 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             'strength_formula': (
                 f'RC ({RC_COMPONENT_WEIGHT:.2f} * (RC - {RC_BASELINE:.0f}) / {RC_SCALE:.0f}) + '
                 f'singles record ({SINGLES_RECORD_WEIGHT:.2f} * smoothed win-rate delta) + '
-                f'RC trend (max ±{TREND_MAX_COMPONENT:.2f}) + venue adjustment (max ±{HOME_AWAY_MAX_COMPONENT:.2f})'
+                f'time-weighted net-level RC trend (age weight floor {TREND_LEVEL_WEIGHT_FLOOR:.2f}, '
+                f'last {TREND_RECENT_SINGLES} singles ×{TREND_RECENT_SNAPSHOT_MULTIPLIER:.2f}; '
+                f'max ±{TREND_MAX_COMPONENT:.2f}) + '
+                f'venue adjustment (max ±{HOME_AWAY_MAX_COMPONENT:.2f})'
             ),
             'rc_baseline': (
                 f'{RC_BASELINE:.0f} fixed neutral midpoint: snapshots have no league association, '
@@ -1661,7 +2207,11 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
                 f'overall record is the base; smoothed home/away delta is separate and capped at ±{HOME_AWAY_MAX_COMPONENT:.2f} '
                 f'after {HOME_AWAY_MIN_GAMES} venue games ({HOME_AWAY_MIN_OVERALL_GAMES} overall games required)'
             ),
-            'opponent_lineups': f'historical position orders from last {STATS_YEARS} years; player pool last {OPPONENT_POOL_YEARS} years',
+            'opponent_lineups': (
+                f'historical position orders from last {STATS_YEARS} years plus fixed RC strength-lineup '
+                f'prior weight {STRENGTH_PRIOR_BLEND_WEIGHT:.0%}; player pool last '
+                f'{OPPONENT_POOL_YEARS} years'
+            ),
             'player_stats': f'XTTV singles + RC snapshots, last {STATS_YEARS} years',
             'orientation': orientation_note,
         },

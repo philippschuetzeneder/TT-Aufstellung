@@ -56,7 +56,7 @@ def profile_for(external_id: str) -> dict:
         "snap_count": len(snaps),
         "first": snaps[0] if snaps else None,
         "last": latest,
-        "trend_momentum": profile.get("rc_trend", 0.0),
+        "trend_momentum": profile.get("rc_trend_momentum", 0.0),
         "rc_rating": profile["rc_rating"],
         "rc_dev": latest.rc_deviation if latest else None,
         "strength": strength,
@@ -83,7 +83,7 @@ def main() -> None:
             print(f"Trend Start: {r['first'].observed_at.date()} → {r['first'].rc_rating}")
         if r["last"]:
             print(f"Trend Ende:  {r['last'].observed_at.date()} → {r['last'].rc_rating}")
-        print(f"RC-Trend (gewichtete Momentum): {r['trend_momentum']:.1f}")
+        print(f"RC-Trend (netto-orientiert, letzte 10 Spiele stärker, −100 bis +100): {r['trend_momentum']:.1f}")
         print(f"RC-Komponente Stärke: {r['rc_component']:.4f}")
         print(f"Trend-Komponente Stärke: {r['trend_component']:.4f}")
         print(f"Kombinierte Stärke (mit Trend): {r['strength']:.4f}")
@@ -94,7 +94,7 @@ def main() -> None:
     a, b = results["21773"], results["24890"]
     print("=== Vergleich Philipp vs Tobias ===")
     print(f"RC Rating: {a['rc_rating']} vs {b['rc_rating']} (Δ {a['rc_rating'] - b['rc_rating']:.1f})")
-    print(f"Trend-Momentum: {a['trend_momentum']:.1f} vs {b['trend_momentum']:.1f}")
+    print(f"RC-Trend: {a['trend_momentum']:.1f} vs {b['trend_momentum']:.1f}")
     print(f"Stärke: {a['strength']:.4f} vs {b['strength']:.4f} (Δ {a['strength'] - b['strength']:.4f})")
 
 

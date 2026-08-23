@@ -4,6 +4,7 @@ import re
 from bs4 import BeautifulSoup
 
 MATCH_URL = "https://oettv.xttv.at/ed/spielbericht.inc.php?meid={meid}"
+WALKOVER_LABEL = "w.o."
 
 
 def clean(value: str) -> str:
@@ -22,6 +23,10 @@ def _team(cell: str):
     return clean(m.group(1)), clean(m.group(2))
 
 
+def _is_walkover_lineup_cell(cell: str) -> bool:
+    return bool(re.match(r"^[A-D1-4]:\s*w\.o\.?\s*$", cell.strip(), re.I))
+
+
 def _player(cell: str):
     m = re.match(r"([A-D1-4]):\s*PassNr\s+(\d+)\s+(.+)$", cell)
     if not m:
@@ -29,8 +34,37 @@ def _player(cell: str):
     return m.group(1), clean(m.group(3)), m.group(2)
 
 
+def _parse_lineup_cell(cell: str) -> tuple[str, dict]:
+    stripped = cell.strip()
+    if _is_walkover_lineup_cell(stripped):
+        position = stripped.split(":")[0].strip()
+        return position, {
+            "name": WALKOVER_LABEL,
+            "external_player_id": None,
+            "walkover": True,
+            "position": position,
+        }
+    position, name, player_id = _player(stripped)
+    return position, {
+        "name": name,
+        "external_player_id": player_id,
+        "walkover": False,
+        "position": position,
+    }
+
+
+def _slot_label(slot: dict) -> str:
+    return WALKOVER_LABEL if slot.get("walkover") else slot["name"]
+
+
 def _pairs(cell: str):
     result = {}
+    walkover_pattern = re.compile(r"Doppel\s*\((\d+)\):\s*w\.o\.\s*w\.o\.", re.I)
+    for m in walkover_pattern.finditer(cell):
+        result[int(m.group(1))] = {
+            "sequence": int(m.group(1)),
+            "walkover": True,
+        }
     pattern = re.compile(
         r"Doppel\s*\((\d+)\):\s*(\d+)\s*/\s*(\d+)\s+(.+?)(?=\s+Doppel\s*\(|$)", re.I
     )
@@ -39,6 +73,7 @@ def _pairs(cell: str):
             "sequence": int(m.group(1)),
             "pass_numbers": [m.group(2), m.group(3)],
             "players": clean(m.group(4)),
+            "walkover": False,
         }
     return result
 
@@ -91,6 +126,28 @@ def _expected_singles_count(home_wins: int, away_wins: int) -> int:
         "expected one of 10:0, 9:1, 8:2, 8:3, 8:4, 8:5, 8:6 or 7:7, "
         "including mirrored results"
     )
+
+
+def _validate_walkover_game_structure(games: list[dict], home_wins: int, away_wins: int) -> None:
+    """Relaxed validation for reports with walkover lineup slots."""
+    singles = [g for g in games if g.get("game_type") == "singles"]
+    doubles = [g for g in games if g.get("game_type") == "doubles"]
+    if len(singles) < 4:
+        raise ValueError(f"Walkover report needs at least 4 singles, got {len(singles)}")
+    if len(doubles) > 2:
+        raise ValueError(f"Walkover report has too many doubles: {len(doubles)}")
+    sequences = [g["sequence"] for g in games]
+    if len(sequences) != len(set(sequences)):
+        raise ValueError("Duplicate game sequences in walkover report")
+    for game in games:
+        if game.get("winner_side") not in {"home", "away"}:
+            raise ValueError(f"Invalid winner_side in walkover game {game.get('sequence')}")
+    expected_singles = _expected_singles_count(home_wins, away_wins)
+    if len(singles) > expected_singles:
+        raise ValueError(
+            f"Walkover singles count {len(singles)} exceeds expected {expected_singles} "
+            f"for team result {home_wins}:{away_wins}"
+        )
 
 
 def _validate_game_structure(games: list[dict], home_wins: int, away_wins: int) -> None:
@@ -167,33 +224,40 @@ def parse_match(html: str, meid: int) -> dict:
     by_pos = {}
 
     for cell in grid[0]:
-        if re.match(r"^[A-D]:\s*PassNr\s+\d+\s+", cell):
-            pos, name, pid = _player(cell)
-            p = {"name": name, "external_player_id": pid, "side": horizontal_side, "position": pos}
-            players.append(p)
-            by_pos[(horizontal_side, pos)] = p
+        if re.match(r"^[A-D]:", cell):
+            position, slot = _parse_lineup_cell(cell)
+            slot["side"] = horizontal_side
+            by_pos[(horizontal_side, position)] = slot
+            if not slot.get("walkover"):
+                players.append(slot)
 
-    if len([p for p in players if p["side"] == horizontal_side]) != 4:
-        raise ValueError(f"XTTV horizontal lineup does not contain exactly four players: {players!r}")
+    horizontal_slots = [by_pos.get((horizontal_side, pos)) for pos in horizontal_positions]
+    if len([slot for slot in horizontal_slots if slot]) != 4:
+        raise ValueError(f"XTTV horizontal lineup does not contain exactly four slots: {players!r}")
 
     for row in grid[1:5]:
-        if not row:
+        if not row or not re.match(r"^[1-4]:", row[0]):
             continue
-        pos, name, pid = _player(row[0])
-        p = {"name": name, "external_player_id": pid, "side": vertical_side, "position": pos}
-        players.append(p)
-        by_pos[(vertical_side, pos)] = p
+        position, slot = _parse_lineup_cell(row[0])
+        slot["side"] = vertical_side
+        by_pos[(vertical_side, position)] = slot
+        if not slot.get("walkover"):
+            players.append(slot)
 
-    if len([p for p in players if p["side"] == vertical_side]) != 4:
-        raise ValueError("XTTV vertical lineup does not contain exactly four players")
-    if len({(p["side"], p["position"]) for p in players}) != 8:
+    vertical_slots = [by_pos.get((vertical_side, pos)) for pos in vertical_positions]
+    if len([slot for slot in vertical_slots if slot]) != 4:
+        raise ValueError("XTTV vertical lineup does not contain exactly four slots")
+    if len(by_pos) != 8:
         raise ValueError("XTTV report contains duplicate player positions")
-    if len({p["external_player_id"] for p in players}) != 8:
+    real_ids = [p["external_player_id"] for p in players if p.get("external_player_id")]
+    if len(real_ids) != len(set(real_ids)):
         raise ValueError("XTTV report contains duplicate player IDs")
 
     games = []
     for row in grid[1:5]:
-        pos = row[0].split(":", 1)[0].strip()
+        if not row or not re.match(r"^[1-4]:", row[0]):
+            continue
+        position, vertical_slot = _parse_lineup_cell(row[0])
         for idx, cell in enumerate(row[1:5]):
             if not cell or idx >= 4:
                 continue
@@ -205,11 +269,21 @@ def parse_match(html: str, meid: int) -> dict:
             raw_left, raw_right = int(m.group(2)), int(m.group(3))
             winner_code = m.group(4)
             result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code, vertical_side)
-            horizontal_player = by_pos[(horizontal_side, horizontal_pos)]
-            vertical_player = by_pos[(vertical_side, pos)]
-            home_player = horizontal_player if horizontal_side == "home" else vertical_player
-            away_player = vertical_player if vertical_side == "away" else horizontal_player
-            games.append({"sequence": seq, "game_type": "singles", "home_position": home_player["position"], "away_position": away_player["position"], "home_player": home_player["name"], "away_player": away_player["name"], "result": result, "sets": result, "winner_side": winner_side, "raw_row": cell})
+            horizontal_slot = by_pos[(horizontal_side, horizontal_pos)]
+            home_slot = horizontal_slot if horizontal_side == "home" else vertical_slot
+            away_slot = vertical_slot if vertical_side == "away" else horizontal_slot
+            games.append({
+                "sequence": seq,
+                "game_type": "singles",
+                "home_position": home_slot["position"],
+                "away_position": away_slot["position"],
+                "home_player": _slot_label(home_slot),
+                "away_player": _slot_label(away_slot),
+                "result": result,
+                "sets": result,
+                "winner_side": winner_side,
+                "raw_row": cell,
+            })
 
     horizontal_pairs = {}
     for cell in grid[0]:
@@ -228,14 +302,24 @@ def parse_match(html: str, meid: int) -> dict:
             result, winner_side = _result_for_sides(raw_left, raw_right, winner_code, home_code, away_code, vertical_side)
             hp = horizontal_pairs.get(seq)
             vp = vertical_pairs.get(seq)
-            home_pair = hp["players"] if horizontal_side == "home" and hp else vp["players"] if vertical_side == "home" and vp else None
-            away_pair = hp["players"] if horizontal_side == "away" and hp else vp["players"] if vertical_side == "away" and vp else None
+            if horizontal_side == "home":
+                home_pair = WALKOVER_LABEL if hp and hp.get("walkover") else (hp.get("players") if hp else None)
+                away_pair = WALKOVER_LABEL if vp and vp.get("walkover") else (vp.get("players") if vp else None)
+            else:
+                home_pair = WALKOVER_LABEL if vp and vp.get("walkover") else (vp.get("players") if vp else None)
+                away_pair = WALKOVER_LABEL if hp and hp.get("walkover") else (hp.get("players") if hp else None)
             games.append({"sequence": seq, "game_type": "doubles", "home_position": None, "away_position": None, "home_player": home_pair, "away_player": away_pair, "result": result, "sets": result, "winner_side": winner_side, "raw_row": cell})
 
     games.sort(key=lambda g: g["sequence"])
     home_wins = sum(g["winner_side"] == "home" for g in games)
     away_wins = sum(g["winner_side"] == "away" for g in games)
-    _validate_game_structure(games, home_wins, away_wins)
+    has_walkover = any(slot.get("walkover") for slot in by_pos.values()) or any(
+        pair.get("walkover") for pairs in (horizontal_pairs, vertical_pairs) for pair in pairs.values()
+    )
+    if has_walkover:
+        _validate_walkover_game_structure(games, home_wins, away_wins)
+    else:
+        _validate_game_structure(games, home_wins, away_wins)
 
     score_match = re.fullmatch(r"(\d+)\s*:\s*(\d+)", team_result)
     if not score_match:
@@ -246,4 +330,28 @@ def parse_match(html: str, meid: int) -> dict:
     singles = [g for g in games if g["game_type"] == "singles"]
     doubles = [g for g in games if g["game_type"] == "doubles"]
     season = re.search(r"\b(20\d{2}/20\d{2})\b", competition)
-    return {"external_id": str(meid), "source_url": MATCH_URL.format(meid=meid), "title": clean(soup.title.get_text(" ", strip=True)) if soup.title else None, "league": competition, "season": season.group(1) if season else None, "round": int(round_match.group(1)) if round_match else None, "leg": int(round_match.group(2)) if round_match else None, "match_date": date_match.group(1) if date_match else None, "home_team": home_team, "away_team": away_team, "home_code": home_code, "away_code": away_code, "home_scheme": home_scheme, "away_scheme": away_scheme, "team_result": team_result, "players": players, "games": games, "player_count": len(players), "singles_count": len(singles), "doubles_count": len(doubles), "has_doubles": True, "raw_text": clean(soup.get_text(" ", strip=True))}
+    return {
+        "external_id": str(meid),
+        "source_url": MATCH_URL.format(meid=meid),
+        "title": clean(soup.title.get_text(" ", strip=True)) if soup.title else None,
+        "league": competition,
+        "season": season.group(1) if season else None,
+        "round": int(round_match.group(1)) if round_match else None,
+        "leg": int(round_match.group(2)) if round_match else None,
+        "match_date": date_match.group(1) if date_match else None,
+        "home_team": home_team,
+        "away_team": away_team,
+        "home_code": home_code,
+        "away_code": away_code,
+        "home_scheme": home_scheme,
+        "away_scheme": away_scheme,
+        "team_result": team_result,
+        "players": players,
+        "games": games,
+        "player_count": len(players),
+        "singles_count": len(singles),
+        "doubles_count": len(doubles),
+        "has_doubles": len(doubles) > 0,
+        "has_walkover": has_walkover,
+        "raw_text": clean(soup.get_text(" ", strip=True)),
+    }

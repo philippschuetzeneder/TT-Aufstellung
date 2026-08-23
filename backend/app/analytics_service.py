@@ -4,13 +4,153 @@ from collections import Counter, defaultdict
 from datetime import timedelta
 from itertools import combinations
 import re
+import time
 
+from sqlalchemy import text
 from sqlalchemy.orm import selectinload
 
+from .analysis_cache import ensure_analysis_cache, ensure_analysis_schema
 from .db import SessionLocal, create_all
 from .models import MatchGame, MatchPlayer, PlayerRatingSnapshot, XttvMatch, XttvPlayer
-from .analysis_service import _compute_trend_metrics, _parse_match_date, _win_rate
+from .analysis_service import (
+    _compute_trend_metrics,
+    _recent_singles_window,
+    _trend_snapshot_window,
+    _parse_match_date,
+    _weighted_rc_momentum,
+    _win_rate,
+)
 from .player_analysis_service import resolve_latest_league_season, _season_label
+
+MATCHUP_MIN_GAMES = 3
+_LEAGUE_STATS_CACHE: dict[str, tuple[float, dict]] = {}
+_LEAGUE_STATS_TTL_SEC = 120.0
+
+_PLAYER_MATCHUPS_SQL = text("""
+    WITH base AS (
+        SELECT hp.external_player_id::text AS home_id, hp.name AS home_name,
+               ap.external_player_id::text AS away_id, ap.name AS away_name,
+               CASE WHEN split_part(trim(g.result), ':', 1)::int > split_part(trim(g.result), ':', 2)::int THEN 1 ELSE 0 END AS home_win
+        FROM match_games g
+        JOIN match_players hp ON hp.match_id = g.match_id AND hp.side = 'home' AND hp.position = g.home_position
+        JOIN match_players ap ON ap.match_id = g.match_id AND ap.side = 'away' AND ap.position = g.away_position
+        WHERE g.game_type = 'singles'
+          AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+          AND (hp.external_player_id::text = :player_id OR ap.external_player_id::text = :player_id)
+    ),
+    directed AS (
+        SELECT home_id AS player_id, away_id AS opponent_id, home_name AS player_name, away_name AS opponent_name, home_win AS win
+        FROM base
+        UNION ALL
+        SELECT away_id, home_id, away_name, home_name, 1 - home_win
+        FROM base
+    ),
+    agg AS (
+        SELECT opponent_id, max(opponent_name) AS opponent_name, sum(win) AS wins, count(*) AS games
+        FROM directed
+        WHERE player_id = :player_id
+        GROUP BY opponent_id
+    )
+    SELECT opponent_id, opponent_name, wins, games
+    FROM agg
+    WHERE games >= :min_games
+    ORDER BY wins::float / games DESC, games DESC, opponent_name
+""")
+
+_PLAYER_SINGLES_SQL = text("""
+    SELECT
+        m.match_date,
+        m.league,
+        mp.side AS player_side,
+        CASE WHEN mp.side = 'home' THEN ap.external_player_id::text ELSE hp.external_player_id::text END AS opponent_id,
+        CASE WHEN mp.side = 'home' THEN ap.name ELSE hp.name END AS opponent_name,
+        CASE WHEN mp.side = 'home'
+            THEN split_part(trim(g.result), ':', 1)::int
+            ELSE split_part(trim(g.result), ':', 2)::int
+        END AS own_score,
+        CASE WHEN mp.side = 'home'
+            THEN split_part(trim(g.result), ':', 2)::int
+            ELSE split_part(trim(g.result), ':', 1)::int
+        END AS opp_score
+    FROM match_players mp
+    JOIN xttv_matches m ON m.id = mp.match_id
+    JOIN match_games g ON g.match_id = m.id
+        AND g.game_type = 'singles'
+        AND (
+            (mp.side = 'home' AND g.home_position = mp.position)
+            OR (mp.side = 'away' AND g.away_position = mp.position)
+        )
+    JOIN match_players hp ON hp.match_id = m.id AND hp.side = 'home' AND hp.position = g.home_position
+    JOIN match_players ap ON ap.match_id = m.id AND ap.side = 'away' AND ap.position = g.away_position
+    WHERE mp.external_player_id::text = :player_id
+      AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+    ORDER BY m.match_date NULLS LAST, m.id
+""")
+
+
+def _load_player_singles(db, player_id: str) -> list[dict]:
+    rows = db.execute(_PLAYER_SINGLES_SQL, {"player_id": player_id}).mappings().all()
+    singles = []
+    for row in rows:
+        own = int(row["own_score"])
+        opp = int(row["opp_score"])
+        day = _parse_match_date(row["match_date"])
+        singles.append({
+            "date": day.isoformat() if day else None,
+            "opponent_id": str(row["opponent_id"]) if row["opponent_id"] else None,
+            "opponent": row["opponent_name"],
+            "side": row["player_side"],
+            "own_score": own,
+            "opp_score": opp,
+            "win": own > opp,
+            "draw": own == opp,
+            "league": row["league"],
+        })
+    return singles
+
+
+def _load_player_matchups(db, player_id: str, min_games: int = MATCHUP_MIN_GAMES) -> list[dict]:
+    ensure_analysis_schema()
+    if ensure_analysis_cache():
+        rows = db.execute(
+            text(
+                """
+                SELECT opponent_id, opponent_name, wins, games
+                FROM analysis_matchups
+                WHERE player_id = :player_id AND games >= :min_games
+                ORDER BY wins::float / games DESC, games DESC, opponent_name
+                """
+            ),
+            {"player_id": player_id, "min_games": min_games},
+        ).mappings().all()
+        return [
+            {
+                "opponent_id": str(row["opponent_id"]),
+                "opponent": row["opponent_name"],
+                "matches": int(row["games"]),
+                "wins": int(row["wins"]),
+                "losses": int(row["games"]) - int(row["wins"]),
+                "win_rate": round(int(row["wins"]) / int(row["games"]), 4),
+            }
+            for row in rows
+        ]
+
+    # SQL fallback — never scan all matches via matchup_stats().
+    rows = db.execute(
+        _PLAYER_MATCHUPS_SQL,
+        {"player_id": player_id, "min_games": min_games},
+    ).mappings().all()
+    return [
+        {
+            "opponent_id": str(row["opponent_id"]),
+            "opponent": row["opponent_name"],
+            "matches": int(row["games"]),
+            "wins": int(row["wins"]),
+            "losses": int(row["games"]) - int(row["wins"]),
+            "win_rate": round(int(row["wins"]) / int(row["games"]), 4),
+        }
+        for row in rows
+    ]
 
 
 def _score(result: str | None) -> tuple[int, int] | None:
@@ -91,6 +231,18 @@ def league_player_stats(league: str | None = None) -> dict:
     smoothing thresholds as the lineup analysis, but are calculated only from
     matches in this league and from a league-specific reference date.
     """
+    cache_key = league or ""
+    now = time.monotonic()
+    cached = _LEAGUE_STATS_CACHE.get(cache_key)
+    if cached and now - cached[0] < _LEAGUE_STATS_TTL_SEC:
+        return cached[1]
+
+    result = _compute_league_player_stats(league)
+    _LEAGUE_STATS_CACHE[cache_key] = (now, result)
+    return result
+
+
+def _compute_league_player_stats(league: str | None = None) -> dict:
     create_all()
     with SessionLocal() as db:
         resolved = resolve_latest_league_season(db, league or "")
@@ -180,8 +332,11 @@ def league_player_stats(league: str | None = None) -> dict:
         snapshots = defaultdict(list)
         for snapshot in snapshot_rows:
             player = player_by_db_id.get(snapshot.player_id)
-            if not player or (ref_date and snapshot.observed_at.date() > ref_date):
+            if not player:
                 continue
+            # Current RC must reflect the latest Ratings Central observation, not the
+            # league's last match day (stichtag). Lineup analysis keeps stichtag-safe
+            # RC for predictions; the statistics view shows today's RC.
             snapshots[str(player.external_player_id)].append({
                 "observed_at": snapshot.observed_at,
                 "rc_rating": snapshot.rc_rating,
@@ -191,15 +346,17 @@ def league_player_stats(league: str | None = None) -> dict:
         for pid, name in names.items():
             entry = stats.get(pid, {"games": 0, "wins": 0, "home_games": 0, "home_wins": 0, "away_games": 0, "away_wins": 0})
             series = snapshots.get(pid, [])
-            trend_series = [row for row in series if not ref_date or row["observed_at"].date() >= ref_date - timedelta(days=round(365.25))]
-            trend, _ = _compute_trend_metrics(trend_series, sorted(recent_singles.get(pid, []), key=lambda row: row["match_day"], reverse=True)[:3])
+            trend_singles = _recent_singles_window(recent_singles.get(pid, []))
+            trend_series = _trend_snapshot_window(series, trend_singles)
+            trend, _ = _compute_trend_metrics(series, trend_singles)
             current_rc = series[-1]["rc_rating"] if series else None
             output.append({
                 "id": pid,
                 "name": name,
                 "team": ", ".join(sorted(teams.get(pid, set()))) or None,
                 "rc_rating": float(current_rc) if current_rc is not None else None,
-                "rc_trend": round(trend, 1) if series else None,
+                "rc_trend": round(trend, 1) if trend is not None else None,
+                "rc_trend_momentum": round(trend, 1) if trend is not None else None,
                 "home_strength": round(_win_rate(entry["home_wins"], entry["home_games"]) * 100, 1) if entry["home_games"] else None,
                 "away_strength": round(_win_rate(entry["away_wins"], entry["away_games"]) * 100, 1) if entry["away_games"] else None,
                 "games": entry["games"],
@@ -304,3 +461,229 @@ def matchup_matrix() -> dict:
         r["win_rate"] = round(r["wins"] / r["matches"], 4) if r["matches"] else None
     out.sort(key=lambda x: (-x["matches"], x["player"], x["opponent"]))
     return {"ok": True, "matchups": out, "count": len(out)}
+
+
+def _player_name_and_team(db, player_id: str, league: str) -> tuple[str | None, str | None]:
+    name = db.execute(
+        text(
+            """
+            SELECT max(name) FROM match_players
+            WHERE external_player_id::text = :player_id
+            """
+        ),
+        {"player_id": player_id},
+    ).scalar()
+    team = db.execute(
+        text(
+            """
+            SELECT DISTINCT CASE WHEN mp.side = 'home' THEN m.home_team ELSE m.away_team END AS team
+            FROM match_players mp
+            JOIN xttv_matches m ON m.id = mp.match_id
+            WHERE mp.external_player_id::text = :player_id AND m.league = :league
+            LIMIT 1
+            """
+        ),
+        {"player_id": player_id, "league": league},
+    ).scalar()
+    return name, team
+
+
+def _build_player_summary(
+    player_id: str,
+    name: str | None,
+    team: str | None,
+    selected_singles: list[dict],
+    snapshots: list,
+) -> dict:
+    home_games = sum(1 for row in selected_singles if row["side"] == "home")
+    home_wins = sum(1 for row in selected_singles if row["side"] == "home" and row["win"])
+    away_games = sum(1 for row in selected_singles if row["side"] == "away")
+    away_wins = sum(1 for row in selected_singles if row["side"] == "away" and row["win"])
+    series = [
+        {"observed_at": item.observed_at, "rc_rating": item.rc_rating}
+        for item in snapshots
+        if item.rc_rating is not None
+    ]
+    recent_for_trend = [
+        {
+            "own_score": row["own_score"],
+            "opp_score": row["opp_score"],
+            "match_day": _parse_match_date(row["date"]) if row.get("date") else None,
+        }
+        for row in selected_singles
+        if row.get("date")
+    ]
+    trend_singles = _recent_singles_window(recent_for_trend)
+    trend, _ = _compute_trend_metrics(series, trend_singles)
+    current_rc = series[-1]["rc_rating"] if series else None
+    games = len(selected_singles)
+    wins = sum(1 for row in selected_singles if row["win"])
+    return {
+        "id": player_id,
+        "name": name,
+        "team": team,
+        "rc_rating": float(current_rc) if current_rc is not None else None,
+        "rc_trend": round(trend, 1) if trend is not None else None,
+        "rc_trend_momentum": round(trend, 1) if trend is not None else None,
+        "home_strength": round(_win_rate(home_wins, home_games) * 100, 1) if home_games else None,
+        "away_strength": round(_win_rate(away_wins, away_games) * 100, 1) if away_games else None,
+        "games": games,
+        "wins": wins,
+    }
+
+
+def player_profile(league: str | None, player_id: str, opponent_id: str | None = None) -> dict:
+    """Return a complete profile, with optional detail for one opponent."""
+    player_id = str(player_id)
+    create_all()
+    cache_key = league or ""
+    cached_ranking = _LEAGUE_STATS_CACHE.get(cache_key)
+    ranking = cached_ranking[1] if cached_ranking and time.monotonic() - cached_ranking[0] < _LEAGUE_STATS_TTL_SEC else None
+
+    with SessionLocal() as db:
+        db.execute(text("SET statement_timeout = '25000ms'"))
+        db.execute(text("SET lock_timeout = '3000ms'"))
+        resolved = resolve_latest_league_season(db, league or "")
+        if not resolved:
+            return {"ok": False, "error": "Spieler oder Liga nicht gefunden"}
+
+        singles = _load_player_singles(db, player_id)
+        matchups = _load_player_matchups(db, player_id)
+        snapshots = (
+            db.query(PlayerRatingSnapshot)
+            .join(XttvPlayer)
+            .filter(
+                XttvPlayer.external_player_id == player_id,
+                PlayerRatingSnapshot.source == "ratingscentral",
+            )
+            .order_by(PlayerRatingSnapshot.observed_at)
+            .all()
+        )
+        selected_singles = [row for row in singles if row["league"] == resolved]
+        if not selected_singles:
+            return {"ok": False, "error": "Spieler oder Liga nicht gefunden"}
+
+        ranked = ranking.get("players", []) if ranking else []
+        player = next((row for row in ranked if str(row.get("id")) == player_id), None)
+        if player is None:
+            name, team = _player_name_and_team(db, player_id, resolved)
+            player = _build_player_summary(player_id, name, team, selected_singles, snapshots)
+
+    season = ranking.get("season") if ranking else _season_label(resolved)
+    valid_games = len(selected_singles)
+    wins = sum(1 for row in selected_singles if row["win"])
+    draws = sum(1 for row in selected_singles if row["draw"])
+    losses = valid_games - wins - draws
+    recent = list(reversed(selected_singles))
+
+    def form_stats(rows):
+        games = len(rows)
+        row_wins = sum(1 for row in rows if row["win"])
+        row_draws = sum(1 for row in rows if row["draw"])
+        return {
+            "games": games,
+            "wins": row_wins,
+            "losses": games - row_wins - row_draws,
+            "draws": row_draws,
+            "win_rate": round(row_wins / games, 4) if games else None,
+        }
+
+    snapshot_data = [
+        {"date": item.observed_at.isoformat(), "rc_rating": item.rc_rating}
+        for item in snapshots if item.rc_rating is not None
+    ]
+    ranked_position = next(
+        (index + 1 for index, row in enumerate(ranked) if str(row.get("id")) == player_id), None
+    ) if ranked else None
+
+    matchup_by_opponent = {row["opponent_id"]: row for row in matchups}
+    selected_opponent = None
+    if opponent_id:
+        selected_opponent = matchup_by_opponent.get(str(opponent_id))
+        if selected_opponent:
+            selected_opponent = {
+                **selected_opponent,
+                "results": [
+                    row for row in reversed(singles)
+                    if row["opponent_id"] == str(opponent_id)
+                ][:10],
+            }
+
+    league_cutoff = max(
+        (row_date for row_date in (row["date"] for row in singles) if row_date),
+        default=None,
+    )
+    if league_cutoff:
+        league_cutoff = _parse_match_date(league_cutoff) - timedelta(days=round(3 * 365.25))
+    recent_leagues = []
+    for row in reversed(singles):
+        if row["league"] and (not league_cutoff or not row["date"] or row["date"] >= league_cutoff.isoformat()):
+            if row["league"] not in recent_leagues:
+                recent_leagues.append(row["league"])
+
+    current_team = player.get("team")
+    for row in reversed(selected_singles):
+        if row.get("league") == resolved:
+            # Team name is not in singles SQL; keep ranking team unless we add it later.
+            break
+
+    venue_stats = {}
+    for side in ("home", "away"):
+        rows = [row for row in selected_singles if row["side"] == side]
+        side_games = len(rows)
+        side_wins = sum(1 for row in rows if row["win"])
+        venue_stats[side] = {
+            "games": side_games,
+            "wins": side_wins,
+            "losses": side_games - side_wins - sum(1 for row in rows if row["draw"]),
+            "draws": sum(1 for row in rows if row["draw"]),
+            "win_rate": round(side_wins / side_games, 4) if side_games else None,
+            "strength": player.get(f"{side}_strength"),
+        }
+
+    positive_matchups = [row for row in matchups if row["wins"] > row["losses"]]
+    negative_matchups = [row for row in matchups if row["losses"] > row["wins"]]
+    best = sorted(
+        positive_matchups,
+        key=lambda row: (-row["win_rate"], -row["matches"], row["opponent"]),
+    )[:5]
+    difficult = sorted(
+        negative_matchups,
+        key=lambda row: (row["win_rate"], -row["matches"], row["opponent"]),
+    )[:5]
+
+    return {
+        "ok": True,
+        "league": league,
+        "latest_league": resolved,
+        "season": season,
+        "player": {
+            **player,
+            "team": current_team,
+            "rank": ranked_position,
+            "matches": valid_games,
+            "wins": wins,
+            "losses": losses,
+            "draws": draws,
+            "win_rate": round(wins / valid_games, 4) if valid_games else None,
+        },
+        "form": {
+            "last_5": form_stats(recent[:5]),
+            "last_10": form_stats(recent[:10]),
+            "games": list(reversed(recent[:10])),
+        },
+        "current_season": form_stats(selected_singles),
+        "home_away": venue_stats,
+        "rc_history": snapshot_data[-40:],
+        "leagues_last_3_years": [
+            {"name": league_name, "season": _season_label(league_name)}
+            for league_name in recent_leagues
+        ],
+        "matchups": {
+            "minimum_games": MATCHUP_MIN_GAMES,
+            "best": best,
+            "difficult": difficult,
+            "count": len(matchups),
+        },
+        "opponent_detail": selected_opponent,
+    }
