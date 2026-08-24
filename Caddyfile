@@ -1,0 +1,4 @@
+tt-aufstellung.at {
+    encode gzip
+    reverse_proxy app:10000
+}

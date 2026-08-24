@@ -2,7 +2,9 @@
 .hero-inner{align-items:stretch;flex-direction:column;gap:8px}
 .hero-title-row{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:6px;width:100%}
 .hero-copy{flex-basis:auto;width:100%}
+.hero-heading{min-width:0}
 .hero-copy h1{margin:0;font-size:clamp(1.5rem,5.2vw,4rem);line-height:1;letter-spacing:-.04em;justify-self:start;grid-column:1}
+.hero-byline{margin:4px 0 0;color:rgba(255,255,255,.78);font-size:.78rem;font-weight:700;letter-spacing:.02em}
 .hero-refresh{grid-column:2;justify-self:center}
 .hero-nav{grid-column:3;justify-self:end}
 .hero-controls{align-items:stretch;width:100%}
@@ -41,13 +43,18 @@
 @media (max-width:799px){
   .hero{padding:10px 12px}
   .hero-inner{gap:6px}
+  .hero-title-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}
+  .hero-copy h1{font-size:clamp(2rem,9vw,3rem);line-height:.94;letter-spacing:-.055em}
+  .hero-byline{font-size:.7rem;line-height:1.2}
   .header-league select{font-size:.68rem;padding:7px 8px}
   .header-btn-refresh{padding:4px 8px;font-size:.62rem}
 }
 
 @media (min-width:800px){
   .hero-inner{flex-direction:row;align-items:center;gap:14px}
-  .hero-copy{flex:1 1 280px}
+  .hero-copy{flex:1 1 340px}
+  .hero-copy h1{font-size:clamp(2.5rem,4.5vw,3.6rem)}
+  .hero-byline{font-size:.8rem}
   .hero-controls-league{flex:1 1 320px;max-width:520px}
   .header-league select{font-size:.82rem;padding:10px 12px}
 }
