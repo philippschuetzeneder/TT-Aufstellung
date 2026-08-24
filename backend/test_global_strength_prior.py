@@ -4,6 +4,7 @@ from app.analysis_service import (
     _reference_date,
     _strength_prior_blend_weight,
     STRENGTH_PRIOR_BLEND_WEIGHT,
+    _lineup_recency_weight,
 )
 from app.db import SessionLocal
 
@@ -25,12 +26,17 @@ def test_strength_prior_uses_fixed_blend_weight():
     assert total is None
 
 
-def test_apply_strength_prior_runs_when_global_pattern_holds():
+def test_apply_strength_prior_uses_recurrence_adaptive_weight():
     historical = [(1.0, ('a', 'b', 'c', 'd'))]
     with SessionLocal() as db:
         ref_date = _reference_date(db)
         blended, meta = _apply_strength_prior_to_scenarios(historical, db, ref_date)
-    assert meta and 'strength-prior-fixed' in meta
-    assert 'w=0.30' in meta
-    assert sum(probability for probability, _ in blended) == 1.0
+    assert meta and 'strength-prior-adaptive' in meta
+    assert abs(sum(probability for probability, _ in blended) - 1.0) < 1e-9
     assert len(blended) == 24
+
+
+def test_recent_lineup_is_weighted_more_than_two_year_old_lineup():
+    recent = _lineup_recency_weight('24.08.2026', __import__('datetime').date(2026, 8, 24))
+    old = _lineup_recency_weight('24.08.2024', __import__('datetime').date(2026, 8, 24))
+    assert recent > old * 100

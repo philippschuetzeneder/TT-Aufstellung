@@ -348,7 +348,9 @@ def _compute_league_player_stats(league: str | None = None) -> dict:
             series = snapshots.get(pid, [])
             trend_singles = _recent_singles_window(recent_singles.get(pid, []))
             trend_series = _trend_snapshot_window(series, trend_singles)
-            trend, _ = _compute_trend_metrics(series, trend_singles)
+            trend, _ = _compute_trend_metrics(
+                series, trend_singles, include_latest_snapshot=True,
+            )
             current_rc = series[-1]["rc_rating"] if series else None
             output.append({
                 "id": pid,
@@ -514,7 +516,9 @@ def _build_player_summary(
         if row.get("date")
     ]
     trend_singles = _recent_singles_window(recent_for_trend)
-    trend, _ = _compute_trend_metrics(series, trend_singles)
+    trend, _ = _compute_trend_metrics(
+        series, trend_singles, include_latest_snapshot=True,
+    )
     current_rc = series[-1]["rc_rating"] if series else None
     games = len(selected_singles)
     wins = sum(1 for row in selected_singles if row["win"])
@@ -539,6 +543,10 @@ def player_profile(league: str | None, player_id: str, opponent_id: str | None =
     cache_key = league or ""
     cached_ranking = _LEAGUE_STATS_CACHE.get(cache_key)
     ranking = cached_ranking[1] if cached_ranking and time.monotonic() - cached_ranking[0] < _LEAGUE_STATS_TTL_SEC else None
+    if ranking is None:
+        # A profile can be opened directly (or after the ranking cache
+        # expires). Build the same league ranking so the rank is available.
+        ranking = league_player_stats(league)
 
     with SessionLocal() as db:
         db.execute(text("SET statement_timeout = '25000ms'"))

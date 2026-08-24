@@ -132,7 +132,11 @@ function display(value, suffix = '') {
 
 function trend(value) {
   if (value == null || Number.isNaN(Number(value))) return '-';
-  const amount = Number(value);
+  // Keep a small but real directional signal visible. Very small trends
+  // must not become an apparently neutral zero in the statistics view.
+  const numeric = Number(value);
+  const rounded = Math.round(numeric);
+  const amount = rounded === 0 && numeric !== 0 ? Math.sign(numeric) : rounded;
   const icon = amount > 0 ? '↑' : amount < 0 ? '↓' : '→';
   const className = amount > 0 ? 'trend-up' : amount < 0 ? 'trend-down' : 'trend-flat';
   return `<span class="${className}">${icon} ${amount > 0 ? '+' : ''}${escapeHtml(amount)}</span>`;
@@ -182,7 +186,7 @@ function header(label, key) {
 function sortOptionsHtml() {
   const options = [
     ['rc_rating', 'RC'],
-    ['rc_trend', 'RC-Trend'],
+    ['rc_trend', 'RC-Trend (letzte 10 Spiele)'],
     ['home_strength', 'Heimstärke'],
     ['away_strength', 'Auswärtsstärke'],
     ['games', 'Spiele'],
@@ -232,8 +236,8 @@ function render(data) {
       <label>Spieler suchen<input type="search" data-player-search value="${escapeHtml(state.search)}" placeholder="Name oder Verein/Mannschaft"></label>
       <label>Mannschaft/Verein<select data-team-filter><option value="">Alle Mannschaften/Vereine</option>${teams}</select></label>
     </div>
-    ${rows ? `<div class="ranking-desktop"><div class="table-scroll"><table class="ranking-table"><thead><tr>${header('Spieler', 'name')}${header('Verein / Mannschaft', 'team')}${header('Aktueller RC', 'rc_rating')}${header('RC-Trend', 'rc_trend')}${header('Heimstärke', 'home_strength')}${header('Auswärtsstärke', 'away_strength')}${header('Spiele', 'games')}${header('Siege', 'wins')}</tr></thead><tbody>${rows}</tbody></table></div></div><div class="ranking-mobile"><label class="ranking-mobile-sort">Sortierung<select data-mobile-sort>${sortOptionsHtml()}</select><select data-mobile-direction><option value="desc"${state.direction === 'desc' ? ' selected' : ''}>Absteigend</option><option value="asc"${state.direction === 'asc' ? ' selected' : ''}>Aufsteigend</option></select></label><div class="ranking-mobile-list">${mobileCards}</div></div>` : '<div class="empty">Keine Spieler für diese Liga gefunden.</div>'}
-    <p class="muted ranking-note">RC-Trend = zeitgewichteter Netto-Level-Verlauf relativ zum ältesten gültigen Snapshot, letzte 10 Spiele stärker gewichtet (×1,25) aus den letzten bis zu 25 Einzelspielen; mindestens 5 Spiele; −100 bis +100 RC-Punkte. Stärke = geglättete Einzel-Siegquote aus den verfügbaren Ligaspielen. Fehlende Werte werden als „-“ angezeigt.</p>
+    ${rows ? `<div class="ranking-desktop"><div class="table-scroll"><table class="ranking-table"><thead><tr>${header('Spieler', 'name')}${header('Verein / Mannschaft', 'team')}${header('Aktueller RC', 'rc_rating')}${header('RC-Trend (letzte 10 Spiele)', 'rc_trend')}${header('Heimstärke', 'home_strength')}${header('Auswärtsstärke', 'away_strength')}${header('Spiele', 'games')}${header('Siege', 'wins')}</tr></thead><tbody>${rows}</tbody></table></div></div><div class="ranking-mobile"><label class="ranking-mobile-sort">Sortierung<select data-mobile-sort>${sortOptionsHtml()}</select><select data-mobile-direction><option value="desc"${state.direction === 'desc' ? ' selected' : ''}>Absteigend</option><option value="asc"${state.direction === 'asc' ? ' selected' : ''}>Aufsteigend</option></select></label><div class="ranking-mobile-list">${mobileCards}</div></div>` : '<div class="empty">Keine Spieler für diese Liga gefunden.</div>'}
+    <p class="muted ranking-note">RC-Trend (letzte 10 Spiele) = robuste mittlere RC-Veränderung der letzten bis zu 10 RC-Snapshots; einzelne Ausreißer dominieren nicht. Wertebereich: −100 bis +100 RC-Punkte. Stärke = geglättete Einzel-Siegquote aus den verfügbaren Ligaspielen. Fehlende Werte werden als „-“ angezeigt.</p>
   </section>`;
   app.querySelector('[data-toggle-desktop-view]')?.addEventListener('click', () => {
     state.forceDesktopView = !state.forceDesktopView;
@@ -363,7 +367,7 @@ function renderProfile(data) {
     <div class="profile-stats">${statCard('Letzte 5 Spiele', `${profileValue(form.last_5?.wins)} / ${profileValue(form.last_5?.games)}`)}${statCard('Quote letzte 5', profileValue(form.last_5?.win_rate == null ? null : Math.round(form.last_5.win_rate * 100), ' %'))}${statCard('Letzte 10 Spiele', `${profileValue(form.last_10?.wins)} / ${profileValue(form.last_10?.games)}`)}${statCard('Quote letzte 10', profileValue(form.last_10?.win_rate == null ? null : Math.round(form.last_10.win_rate * 100), ' %'))}</div>
     <h4 class="profile-subheading">Letzte Spiele</h4>
     ${formGamesTable(form.games)}
-    <h3>Matchups <span class="muted">(mindestens ${escapeHtml(data.matchups.minimum_games)} Begegnungen · ${profileValue(data.matchups.count)} Gegner)</span></h3>
+    <h3>Matchups <span class="muted">(mindestens 3 Begegnungen)</span></h3>
     ${detail ? `<div class="matchup-detail"><button type="button" class="ranking-back" data-back>← Matchups</button><h4>Gegen ${escapeHtml(detail.opponent)}</h4><p>${profileValue(detail.matches)} Spiele · ${profileValue(detail.wins)} Siege · ${profileValue(detail.losses)} Niederlagen · ${profileValue(detail.win_rate == null ? null : Math.round(detail.win_rate * 100), ' %')}</p>${resultList}</div>` : `<div class="matchup-columns"><div><h4>Beste Matchups</h4><ul>${matchupList(data.matchups.best, 'best')}</ul></div><div><h4>Schwierige Matchups</h4><ul>${matchupList(data.matchups.difficult, 'difficult')}</ul></div></div>`}
   </section>`;
   app.querySelectorAll('[data-back]').forEach((button) => button.addEventListener('click', () => {

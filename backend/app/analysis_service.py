@@ -34,8 +34,9 @@ DOUBLE_GAMES = 2
 TOTAL_GAMES = 14
 WIN_TARGET = 8
 MAX_ANALYSIS_SECONDS = 5.0
-STATS_YEARS = 3
+STATS_YEARS = 2
 OPPONENT_POOL_YEARS = 2
+LINEUP_RECENCY_HALF_LIFE_DAYS = 60.0
 # Pseudo-observations blended with joint quartet history; n=5 -> 5/6 joint weight (~83%).
 KNOWN_QUARTET_JOINT_PRIOR_STRENGTH = 1.0
 POSITION_PRIOR_SMOOTHING = 0.35
@@ -46,19 +47,27 @@ GLOBAL_STRENGTH_MIN_BOTTOM_RATE = 0.50
 STRENGTH_PRIOR_BLEND_WEIGHT = 0.3
 STRENGTH_RC_SCALE = 500.0
 STRENGTH_POSITION_WEIGHTS = (4.0, 3.0, 2.0, 1.0)
+COHESIVE_QUARTET_MIN_MATCHES = 5
+COHESIVE_TRIO_MIN_MATCHES = 6
+COHESIVE_QUARTET_MIN_RECENCY_MASS = 3.0
+COHESIVE_TRIO_MIN_RECENCY_MASS = 3.5
+MEDIUM_GROUP_MIN_MATCHES = 4
 _global_strength_support_cache: dict[str, tuple[float, float, float, int]] = {}
+_lineup_cohesion_cache: dict[tuple[str, str], tuple[int, float, int, float]] = {}
 DEFAULT_RC_RATING = 1500.0
 TREND_MIN_RC = -100.0
 TREND_MAX_RC = 100.0
 TREND_WINDOW_DAYS = 365.25
 TREND_LEVEL_WEIGHT_FLOOR = 0.35
+TREND_INTERMEDIATE_MOVE_CAP = 2.0
 TREND_LEVEL_WEIGHT_DECAY = 0.65
 TREND_RECENT_SNAPSHOT_MULTIPLIER = 1.25
-TREND_MAX_COMPONENT = 0.12
+TREND_RC_HALF_LIFE_DAYS = 90.0
+TREND_MAX_COMPONENT = 0.08
 TREND_MAX_SINGLES = 25
 TREND_MIN_SINGLES = 5
 TREND_RECENT_SINGLES = 10
-SPIELTYP_MAX_COMPONENT = TREND_MAX_COMPONENT
+SPIELTYP_MAX_COMPONENT = 0.12
 SPIELTYP_MIN_GAMES = 2
 TREND_COMPONENT_FULL_SCALE = 80.0
 # RC is the primary current-strength signal.  The singles record is only a
@@ -108,6 +117,15 @@ def _cutoff(ref, years):
     return ref - timedelta(days=int(round(years * 365.25)))
 
 
+def _lineup_recency_weight(match_date, ref_date):
+    """Exponential recency weight for a historical lineup observation."""
+    parsed = _parse_match_date(match_date)
+    if not parsed or not ref_date:
+        return 0.15
+    age_days = max(0, (ref_date - parsed).days)
+    return math.pow(0.5, age_days / LINEUP_RECENCY_HALF_LIFE_DAYS)
+
+
 def _empty_profile():
     return {
         'wins': 0, 'games': 0,
@@ -127,13 +145,10 @@ def _valid_rc_snapshots(snapshots):
 
 
 def _weighted_rc_momentum(snapshots, recent_boundary=None):
-    """Return a recency-weighted mean of RC level deviations from the opening.
+    """Return a robust trend from only the latest ten RC observations.
 
-    Each valid level is compared with the oldest valid level, so intermediate
-    moves are not accidentally added together. A shallow age decay keeps older
-    evidence useful, while the newest-ten-singles segment receives a modest,
-    separately named boost. A sign guard preserves a positive/negative net
-    trajectory when a late pullback would otherwise reverse the level average.
+    The median of point changes makes the signal resistant to one exceptional
+    event. The newest-ten-singles segment receives a modest boost.
     ``recent_boundary`` is a date/datetime and is inclusive because all games
     on the boundary day belong to that segment.
     """
@@ -146,40 +161,107 @@ def _weighted_rc_momentum(snapshots, recent_boundary=None):
     def day(value):
         return value.date() if hasattr(value, 'date') else value
 
-    weighted_deviation = 0.0
-    total_weight = 0.0
-    for snapshot in ordered:
-        age_days = max(
-            0.0,
-            (day(current['observed_at']) - day(snapshot['observed_at'])).days,
-        )
-        age_ratio = min(1.0, age_days / TREND_WINDOW_DAYS)
-        age_weight = max(
-            TREND_LEVEL_WEIGHT_FLOOR,
-            1.0 - TREND_LEVEL_WEIGHT_DECAY * age_ratio,
-        )
-        segment_weight = (
+    recent = ordered[-min(10, len(ordered)):]
+    changes = [
+        float(right['rc_rating']) - float(left['rc_rating'])
+        for left, right in zip(recent, recent[1:])
+    ]
+    if not changes:
+        trend = 0.0
+    elif len(recent) <= 3:
+        # With only a very short series there is not enough evidence for a
+        # robust median; retain the direct net signal.
+        recent_segment_weight = (
             TREND_RECENT_SNAPSHOT_MULTIPLIER
-            if recent_boundary is not None and day(snapshot['observed_at']) >= day(recent_boundary)
+            if recent_boundary is not None
+            and day(current['observed_at']) >= day(recent_boundary)
             else 1.0
         )
-        weight = age_weight * segment_weight
-        weighted_deviation += weight * (
-            float(snapshot['rc_rating']) - float(opening['rc_rating'])
+        trend = 0.5 * (
+            (float(current['rc_rating']) - float(recent[0]['rc_rating']))
+            * recent_segment_weight
         )
-        total_weight += weight
-
-    level_trend = weighted_deviation / total_weight if total_weight else 0.0
-    net_change = float(current['rc_rating']) - float(opening['rc_rating'])
-    # A late pullback may reduce a positive level history, but must not turn
-    # an actually positive net trajectory negative. This also makes a
-    # rise-and-return series neutral instead of rewarding the temporary peak.
-    if net_change == 0:
-        trend = 0.0
-    elif net_change > 0:
-        trend = max(level_trend, 0.5 * net_change)
     else:
-        trend = min(level_trend, 0.5 * net_change)
+        # Use the latest ten snapshots. A single unusually large change is
+        # treated as an outlier; repeated large changes remain fully relevant.
+        median_abs = sorted(abs(change) for change in changes)[len(changes) // 2]
+        extreme = [
+            change for change in changes
+            # A large positive RC jump is evidence of an improving player,
+            # not an outlier to suppress. Only isolated negative shocks are
+            # eligible for removal from an otherwise stable trajectory.
+            if change < -max(30.0, 2.5 * median_abs)
+        ]
+        adjusted = [
+            (left, right, change)
+            for left, right, change in zip(recent, recent[1:], changes)
+            if not (len(extreme) == 1 and change == extreme[0])
+        ]
+        isolated_outlier_removed = len(extreme) == 1 and len(adjusted) < len(changes)
+        weighted_changes = []
+        current_day = day(current['observed_at'])
+        for left, right, change in adjusted:
+            if change == 0:
+                # A repeated RC snapshot is not evidence of momentum and
+                # must not dilute the last real rating change.
+                continue
+            age_days = max(0, (current_day - day(right['observed_at'])).days)
+            weight = math.pow(0.5, age_days / TREND_RC_HALF_LIFE_DAYS)
+            if recent_boundary is not None and day(right['observed_at']) >= day(recent_boundary):
+                weight *= TREND_RECENT_SNAPSHOT_MULTIPLIER
+            weighted_changes.append((change, weight))
+        if not weighted_changes:
+            trend = 0.0
+        else:
+            weighted_mean = sum(change * weight for change, weight in weighted_changes) / sum(
+                weight for _, weight in weighted_changes
+            )
+            raw_change = sum(change for change, _ in weighted_changes)
+            positive_count = sum(change > 0 for change, _ in weighted_changes)
+            negative_count = sum(change < 0 for change, _ in weighted_changes)
+            central = sorted(change for change, _ in weighted_changes)[len(weighted_changes) // 2]
+            if abs(raw_change) >= 30:
+                # Sustained movement uses cumulative change; recency remains
+                # a secondary correction.
+                trend = 1.5 * (
+                    0.7 * raw_change + 0.3 * weighted_mean * len(weighted_changes)
+                )
+            else:
+                trend = 1.5 * central
+            if trend < 0 and negative_count < 3:
+                trend = 0.0
+            elif trend < 0:
+                # Sustained deterioration should remain visible on the
+                # -100..+100 scale.
+                trend *= 2.0
+            elif raw_change < 20 and negative_count >= 2:
+                # A small net rise with several setbacks is effectively
+                # neutral rather than a strong upward trend.
+                trend *= 0.25
+            elif abs(central) <= 5:
+                trend = 1.5 * central
+            elif positive_count >= 3 and negative_count >= 3:
+                # Mixed trajectories are not strong upward trends. Use the
+                # robust central change instead of summing every fluctuation.
+                trend = 1.5 * central
+            elif raw_change <= 0:
+                # A recovery after a net-flat/negative period is only a
+                # small positive signal, not a strong upward trend.
+                trend *= 0.25
+            if isolated_outlier_removed and extreme[0] < 0 and trend < 0:
+                # A single isolated loss is insufficient evidence for a
+                # negative trend when the surrounding trajectory is stable.
+                trend = 0.0
+        # Keep the display scale at -100..+100 without making ordinary
+        # multi-match swings hit the limits. Very exceptional movement can
+        # still approach the ends of the scale.
+        trend = 100.0 * math.tanh(trend / 240.0)
+        if trend == 0.0:
+            # Preserve a small directional signal instead of displaying a
+            # mathematically exact zero after the even-number UI rounding.
+            nonzero_changes = [change for change in changes if change]
+            if nonzero_changes:
+                trend = 2.0 if nonzero_changes[-1] > 0 else -2.0
     return max(TREND_MIN_RC, min(TREND_MAX_RC, trend))
 
 
@@ -275,21 +357,29 @@ def _recent_singles_window(recent_singles: list[dict]) -> list[dict]:
     return [row for row in ordered if row['match_day'] >= boundary]
 
 
-def _compute_trend_metrics(snapshots_1y: list[dict], recent_singles: list[dict]) -> tuple[float | None, float]:
+def _compute_trend_metrics(
+    snapshots_1y: list[dict],
+    recent_singles: list[dict],
+    *,
+    include_latest_snapshot: bool = False,
+) -> tuple[float | None, float]:
     """Return (bounded RC trend for display, model component).
 
     Trend is based on the latest at most 25 singles; fewer than five singles
-    makes it unavailable (None, 0.0). RC snapshots are restricted to the
-    inclusive date span from the earliest selected single through the
-    reference date. The trend is a shallow time-weighted mean of level
-    deviations from the oldest valid snapshot, with a modest boost for the
-    latest ten singles. The model component remains capped separately.
+    makes it unavailable (None, 0.0). For the statistics view, the latest
+    available RC snapshot may be included. The trend uses only the latest
+    ten RC observations and a robust median; the model component remains
+    capped separately.
     """
     recent_singles = _recent_singles_window(recent_singles)
     if len(recent_singles) < TREND_MIN_SINGLES:
         return None, 0.0
 
-    trend_snapshots = _trend_snapshot_window(snapshots_1y, recent_singles)
+    trend_snapshots = (
+        _valid_rc_snapshots(snapshots_1y)[-25:]
+        if include_latest_snapshot
+        else _trend_snapshot_window(snapshots_1y, recent_singles)
+    )
     if len(_valid_rc_snapshots(trend_snapshots)) < 2:
         return None, 0.0
     valid = _valid_rc_snapshots(trend_snapshots)
@@ -719,7 +809,9 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None, ref_date=None, oppon
                 valid = False; break
             order[idx] = pid
         if valid and all(order):
-            counts[tuple(order)] += 1
+            counts[tuple(order)] += _lineup_recency_weight(
+                players[0].get('match_date'), ref_date,
+            )
     total = sum(counts.values())
     if not total:
         return [], names
@@ -746,7 +838,7 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
         )
         params['team'] = team
     rows = db.execute(text(f"""
-        SELECT m.id AS match_id, mp.side, mp.external_player_id AS player_id,
+        SELECT m.id AS match_id, m.match_date, mp.side, mp.external_player_id AS player_id,
                mp.name AS player_name, mp.position
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id=m.id
@@ -780,7 +872,9 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
                     break
                 order[idx] = pid
             if valid and all(order):
-                counts[tuple(order)] += 1
+                counts[tuple(order)] += _lineup_recency_weight(
+                    players[0].get('match_date'), ref_date,
+                )
 
     total = sum(counts.values())
     if not total:
@@ -994,6 +1088,70 @@ def _scenarios_from_position_priors(player_ids, position_priors):
     return [(p / total, o) for p, o in weighted]
 
 
+def _lineup_cohesion(db, player_ids, ref_date=None):
+    """Return raw and recency-weighted recurrence for quartet and best trio."""
+    actual = {str(x) for x in player_ids}
+    if len(actual) != 4:
+        return 0, 0.0, 0, 0.0
+    ref_date = ref_date or _reference_date(db)
+    cache_key = (str(_cutoff(ref_date, STATS_YEARS)), ','.join(sorted(actual)))
+    cached = _lineup_cohesion_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    rows = db.execute(text("""
+        SELECT m.id AS match_id, m.match_date, mp.side, mp.external_player_id::text AS player_id
+        FROM xttv_matches m
+        JOIN match_players mp ON mp.match_id = m.id
+        WHERE mp.external_player_id IS NOT NULL
+          AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+    """), {'cutoff': _cutoff(ref_date, STATS_YEARS)}).mappings()
+    exact = 0
+    exact_mass = 0.0
+    trio_counts = Counter()
+    trio_masses = Counter()
+    by_lineup = {}
+    for row in rows:
+        key = (row['match_id'], row['side'])
+        entry = by_lineup.setdefault(key, {'players': set(), 'match_date': row['match_date']})
+        entry['players'].add(str(row['player_id']))
+    for entry in by_lineup.values():
+        lineup = entry['players']
+        overlap = lineup & actual
+        weight = _lineup_recency_weight(entry['match_date'], ref_date)
+        if len(overlap) == 4:
+            exact += 1
+            exact_mass += weight
+        if len(overlap) >= 3:
+            for trio in combinations(sorted(overlap), 3):
+                trio_counts[trio] += 1
+                trio_masses[trio] += weight
+    best_trio = max(trio_counts, key=trio_counts.get) if trio_counts else None
+    result = (
+        exact,
+        exact_mass,
+        trio_counts.get(best_trio, 0),
+        trio_masses.get(best_trio, 0.0),
+    )
+    _lineup_cohesion_cache[cache_key] = result
+    return result
+
+
+def _adaptive_strength_weight(db, player_ids, ref_date=None):
+    """Strength weight based on recurrence of the four-player group."""
+    exact, exact_mass, trio, trio_mass = _lineup_cohesion(db, player_ids, ref_date)
+    if exact >= COHESIVE_QUARTET_MIN_MATCHES and exact_mass >= COHESIVE_QUARTET_MIN_RECENCY_MASS:
+        return 0.15, exact, trio
+    if trio >= COHESIVE_TRIO_MIN_MATCHES and trio_mass >= COHESIVE_TRIO_MIN_RECENCY_MASS:
+        return 0.30, exact, trio
+    if exact >= MEDIUM_GROUP_MIN_MATCHES and exact_mass >= 2.0:
+        return 0.40, exact, trio
+    if exact == 0 and trio == 0:
+        return 0.80, exact, trio
+    if exact <= 1 and trio <= 1:
+        return 0.80, exact, trio
+    return 0.70, exact, trio
+
+
 def _normalize_scenario_map(scenario_map):
     total = sum(scenario_map.values())
     if total <= 0:
@@ -1029,32 +1187,13 @@ def _blend_known_quartet_scenarios(joint_scenarios, joint_n, prior_scenarios):
 def _load_known_quartet_joint_scenarios(db, player_ids, ref_date):
     """Joint historical orders for an exact quartet, aggregated across all teams."""
     actual = [str(x) for x in player_ids]
-    lineup_key = ','.join(sorted(actual))
-    rows = list(db.execute(
-        text(
-            "SELECT p1,p2,p3,p4, SUM(appearances)::bigint AS appearances "
-            "FROM analysis_lineup_orders "
-            "WHERE lineup_key=:key "
-            "GROUP BY p1,p2,p3,p4 ORDER BY appearances DESC LIMIT 24"
-        ),
-        {'key': lineup_key},
-    ).mappings())
-    total = sum(int(r['appearances'] or 0) for r in rows)
-    if total:
-        scenarios = [
-            (int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1', 'p2', 'p3', 'p4')))
-            for r in rows
-        ]
-        _, names, _ = _known_quartet_lineup_scenarios(db, actual, ref_date)
-        return scenarios, total, names, 'cache-cross-team'
     scenarios, names, joint_n = _known_quartet_lineup_scenarios(db, actual, ref_date)
     return scenarios, joint_n, names, 'raw-cross-team'
 
 
 def _apply_strength_prior_to_scenarios(scenarios, db, ref_date):
-    """Blend historical opponent orders with global RC strength-lineup prior."""
-    blend_weight, _, _, _, _ = _strength_prior_blend_weight()
-    if blend_weight <= 0 or not scenarios:
+    """Blend historical orders with a recurrence-adaptive strength prior."""
+    if not scenarios:
         return scenarios, None
     by_set = defaultdict(list)
     for probability, order in scenarios:
@@ -1069,7 +1208,8 @@ def _apply_strength_prior_to_scenarios(scenarios, db, ref_date):
         hist_map = _normalize_scenario_map({order: probability for probability, order in group})
         strength_scenarios = _scenarios_from_strength_prior(players, rc_map)
         strength_map = {order: probability for probability, order in strength_scenarios}
-        inner = _blend_scenario_maps(hist_map, strength_map, 1.0 - blend_weight)
+        strength_weight, exact_n, trio_n = _adaptive_strength_weight(db, players, ref_date)
+        inner = _blend_scenario_maps(hist_map, strength_map, 1.0 - strength_weight)
         for order, inner_prob in inner.items():
             blended_all.append((group_total * inner_prob, order))
     total = sum(probability for probability, _ in blended_all)
@@ -1077,30 +1217,33 @@ def _apply_strength_prior_to_scenarios(scenarios, db, ref_date):
         return scenarios, None
     result = [(probability / total, order) for probability, order in blended_all]
     result.sort(key=lambda item: (-item[0], item[1]))
-    meta = f'strength-prior-fixed(w={blend_weight:.2f})'
+    meta = 'strength-prior-adaptive(cohesion=exact4/trio3)'
     return result, meta
 
 
-def _build_combined_prior_scenarios(db, player_ids, ref_date):
-    """Cross-team position priors blended with global RC strength-lineup prior."""
+def _build_combined_prior_scenarios(db, player_ids, ref_date, strength_weight=None):
+    """Position priors blended with an adaptive RC strength-lineup prior."""
     actual = [str(x) for x in player_ids]
     position_priors = _load_player_position_priors(db, actual, ref_date)
     position_scenarios = _scenarios_from_position_priors(actual, position_priors)
-    blend_weight, _, _, _, _ = _strength_prior_blend_weight()
-    if blend_weight <= 0:
+    if strength_weight is None:
+        strength_weight, exact_n, trio_n = _adaptive_strength_weight(db, actual, ref_date)
+    else:
+        exact_n, _, trio_n, _ = _lineup_cohesion(db, actual, ref_date)
+    if strength_weight <= 0:
         return position_scenarios, 'known-opponent-position-prior-cross-team'
     rc_map = _load_latest_rc_map(db, actual)
     strength_scenarios = _scenarios_from_strength_prior(actual, rc_map)
     prior_map = {order: prob for prob, order in position_scenarios}
     strength_map = {order: prob for prob, order in strength_scenarios}
-    blended = _blend_scenario_maps(prior_map, strength_map, 1.0 - blend_weight)
+    blended = _blend_scenario_maps(prior_map, strength_map, 1.0 - strength_weight)
     scenarios = sorted(
         [(prob, order) for order, prob in blended.items()],
         key=lambda item: (-item[0], item[1]),
     )
     return scenarios, (
         f'known-opponent-position-strength-prior-cross-team'
-        f'(fixed-w={blend_weight:.2f})'
+        f'(strength-w={strength_weight:.2f},exact4={exact_n},best3={trio_n})'
     )
 
 
@@ -1110,11 +1253,27 @@ def _build_known_four_opponent_scenarios(db, opponent_team, player_ids, ref_date
     joint_scenarios, joint_n, fallback_names, joint_source = _load_known_quartet_joint_scenarios(
         db, actual, ref_date,
     )
-    prior_scenarios, prior_source = _build_combined_prior_scenarios(db, actual, ref_date)
+    strength_weight, exact_n, trio_n = _adaptive_strength_weight(db, actual, ref_date)
+    prior_scenarios, prior_source = _build_combined_prior_scenarios(
+        db, actual, ref_date, strength_weight=strength_weight,
+    )
     if joint_n <= 0:
         return prior_scenarios, fallback_names, prior_source
-    scenarios, _ = _blend_known_quartet_scenarios(joint_scenarios, joint_n, prior_scenarios)
-    return scenarios, fallback_names, f'known-opponent-blended-{joint_source}'
+    # The same recency-aware strength weight controls how much a concrete
+    # quartet history can dominate the strength/position prior.
+    joint_weight = 1.0 - strength_weight
+    joint_map = _normalize_scenario_map({order: prob for prob, order in joint_scenarios})
+    prior_map = {order: prob for prob, order in prior_scenarios}
+    scenarios = sorted(
+        [(prob, order) for order, prob in _blend_scenario_maps(
+            joint_map, prior_map, joint_weight,
+        ).items()],
+        key=lambda item: (-item[0], item[1]),
+    )
+    return scenarios, fallback_names, (
+        f'known-opponent-blended-{joint_source}'
+        f'(history-w={joint_weight:.2f},exact4={exact_n},best3={trio_n})'
+    )
 
 
 def _build_partial_opponent_scenarios(db, team, known_ids, opponent_pool, ref_date):
@@ -1471,14 +1630,12 @@ def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
                 if not scenarios:
                     scenarios, fallback_names = _build_partial_opponent_scenarios(db, opponent_team, actual, opponent_pool, ref_date); source = 'known-opponent-combination-fallback'
         else:
-            rows = list(db.execute(text("SELECT p1,p2,p3,p4,appearances FROM analysis_lineup_orders WHERE team=:team ORDER BY appearances DESC LIMIT 24"), {'team': opponent_team}).mappings())
-            total = sum(int(r['appearances'] or 0) for r in rows)
-            if total:
-                scenarios = [(int(r['appearances']) / total, tuple(str(r[k]) for k in ('p1','p2','p3','p4'))) for r in rows]; source = 'predicted-historical-cache'
-            else:
-                scenarios, fallback_names = _raw_team_lineup_scenarios(db, opponent_team, None, ref_date, opponent_pool); source = 'predicted-historical-raw'
-                if not scenarios:
-                    return {}, {}, {}, [], source, ref_date, opponent_pool
+            scenarios, fallback_names = _raw_team_lineup_scenarios(
+                db, opponent_team, None, ref_date, opponent_pool,
+            )
+            source = 'predicted-historical-recency-weighted'
+            if not scenarios:
+                return {}, {}, {}, [], source, ref_date, opponent_pool
         if not _source_includes_strength_prior(source):
             scenarios, strength_meta = _apply_strength_prior_to_scenarios(scenarios, db, ref_date)
             if strength_meta:
@@ -2208,9 +2365,9 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
                 f'after {HOME_AWAY_MIN_GAMES} venue games ({HOME_AWAY_MIN_OVERALL_GAMES} overall games required)'
             ),
             'opponent_lineups': (
-                f'historical position orders from last {STATS_YEARS} years plus fixed RC strength-lineup '
-                f'prior weight {STRENGTH_PRIOR_BLEND_WEIGHT:.0%}; player pool last '
-                f'{OPPONENT_POOL_YEARS} years'
+                f'historical position orders from last {STATS_YEARS} years with recurrence-adaptive RC '
+                f'strength-lineup prior (strength weight 10–70% based on exact 4-/best 3-player recurrence); '
+                f'player pool last {OPPONENT_POOL_YEARS} years'
             ),
             'player_stats': f'XTTV singles + RC snapshots, last {STATS_YEARS} years',
             'orientation': orientation_note,

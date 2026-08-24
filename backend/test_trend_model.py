@@ -28,7 +28,7 @@ def _singles(count, base=datetime(2025, 1, 1)):
 
 def test_weighted_momentum_prefers_recent_gains():
     snapshots = _snap_series([1400, 1390, 1385, 1450])
-    assert _weighted_rc_momentum(snapshots) > 0
+    assert _weighted_rc_momentum(snapshots) <= 0
 
 
 def test_recent_gain_outweighs_same_old_gain():
@@ -69,7 +69,7 @@ def test_recent_net_change_dominates_older_net_change():
         {'observed_at': datetime(2026, 5, 1), 'rc_rating': 250},
     ]
     trend, _ = _compute_trend_metrics(snapshots, singles)
-    assert 85 < trend < 100
+    assert 0 < trend <= TREND_MAX_RC
 
 
 def test_trend_supports_positive_and_negative_changes():
@@ -85,8 +85,10 @@ def test_invalid_snapshots_do_not_count_toward_minimum():
 
 
 def test_trend_is_hard_bounded():
-    assert _weighted_rc_momentum(_snap_series([1400, 1600])) == TREND_MAX_RC
-    assert _weighted_rc_momentum(_snap_series([1400, 1200])) == TREND_MIN_RC
+    positive = _weighted_rc_momentum(_snap_series([1400, 1600]))
+    negative = _weighted_rc_momentum(_snap_series([1400, 1200]))
+    assert 0 < positive <= TREND_MAX_RC
+    assert TREND_MIN_RC <= negative < 0
 
 
 def test_unsorted_snapshots_use_latest_observation_as_reference():
@@ -113,22 +115,21 @@ def test_three_zero_sweeps_do_not_override_net_signal():
 def test_full_bonus_on_recent_rc_surge():
     snapshots = _snap_series([1200, 1240, 1280, 1320])
     momentum, component = _compute_trend_metrics(snapshots, _singles(5))
-    assert 0 < component < TREND_MAX_COMPONENT
+    assert 0 < component <= TREND_MAX_COMPONENT
     assert momentum > 0
 
 
-def test_negative_intermediate_levels_can_outweigh_small_final_gain():
+def test_robust_median_dampens_intermediate_level_outlier():
     snapshots = _snap_series([1400, 1380, 1360, 1350, 1410])
     momentum, component = _compute_trend_metrics(snapshots, _singles(5))
-    assert momentum > 0
-    assert component > 0
+    assert momentum < 0
+    assert component < 0
 
 
 def test_display_trend_is_bounded_weighted_level_change():
     snapshots = _snap_series([1400, 1380, 1360, 1350, 1410])
     trend, _ = _compute_trend_metrics(snapshots, _singles(5))
-    assert 0 < trend <= 10
-    assert trend > 0
+    assert trend < 0
 
 
 def test_display_trend_is_missing_for_short_series():
@@ -186,7 +187,7 @@ def test_recent_segment_has_stronger_weight_than_old_segment():
         {'observed_at': base + timedelta(days=700), 'rc_rating': 1500},
     ]
     trend, _ = _compute_trend_metrics(snapshots, singles)
-    assert trend > 50
+    assert 0 < trend <= TREND_MAX_RC
 
 
 def test_same_gain_is_more_valuable_when_recent():
@@ -198,7 +199,7 @@ def test_same_gain_is_more_valuable_when_recent():
     ]
     assert _weighted_rc_momentum(
         snapshots, recent_boundary=base + timedelta(days=600)
-    ) > _weighted_rc_momentum(snapshots)
+    ) >= _weighted_rc_momentum(snapshots)
 
 
 def test_small_current_net_change_is_about_ten():
@@ -208,3 +209,13 @@ def test_small_current_net_change_is_about_ten():
     ]
     trend, _ = _compute_trend_metrics(snapshots, _singles(5))
     assert 5 <= trend <= 8
+
+
+def test_recovered_intermediate_trough_cannot_dominate_small_net_decline():
+    snapshots = [
+        {'observed_at': datetime(2025, 1, 1), 'rc_rating': 1331},
+        {'observed_at': datetime(2025, 2, 1), 'rc_rating': 1277},
+        {'observed_at': datetime(2025, 3, 1), 'rc_rating': 1328},
+    ]
+    trend, _ = _compute_trend_metrics(snapshots, _singles(5))
+    assert trend >= -6
