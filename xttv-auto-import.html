@@ -7,121 +7,131 @@
 </head>
 <body>
   <h1>XTTV Auto-Import</h1>
+  <p id="tokenHint" style="display:none;color:#b42318;font-size:0.9rem;">Admin-Token fehlt — URL mit <code>?admin_token=…</code> oder zuerst auf der Hauptseite eintragen.</p>
   <pre id="log">Starte …</pre>
-  <script>
-    (async()=>{
-      const p=new URLSearchParams(location.search),
-        initialStart=Number(p.get("start")),
-        finalEnd=Number(p.get("end")),
-        b=Number(p.get("batch")||"200"),
-        direction=(p.get("direction")||"forward").toLowerCase(),
-        span=1000,
-        log=t=>document.getElementById("log").textContent+=`\n${t}`;
+  <script type="module">
+    import { adminRequestHeaders, applyAdminTokenFromUrl, readAdminToken } from '/src/ui/admin-auth.mjs';
 
-      if(!Number.isInteger(initialStart)||!Number.isInteger(finalEnd)||!Number.isInteger(b)||b<1||b>1000||!['forward','backward'].includes(direction)||
-         (direction==='forward'&&initialStart>finalEnd)||(direction==='backward'&&initialStart<finalEnd)){
-        log("Ungültige Parameter");
+    applyAdminTokenFromUrl();
+
+    (async () => {
+      const p = new URLSearchParams(location.search);
+      const initialStart = Number(p.get('start'));
+      const finalEnd = Number(p.get('end'));
+      const b = Number(p.get('batch') || '200');
+      const direction = (p.get('direction') || 'forward').toLowerCase();
+      const span = 1000;
+      const log = (t) => { document.getElementById('log').textContent += `\n${t}`; };
+
+      const authStatus = await fetch('/api/auth/status').then((r) => r.json()).catch(() => ({ admin_required: false }));
+      if (authStatus.admin_required && !readAdminToken()) {
+        document.getElementById('tokenHint').style.display = 'block';
+        log('Abgebrochen: Admin-Token erforderlich.');
         return;
       }
 
-      const maxRetries=8;
-      const retryDelayMs=retry=>Math.min(30000,5000*2**(retry-1));
-      let batchNo=0,total=0,current=initialStart;
+      if (!Number.isInteger(initialStart) || !Number.isInteger(finalEnd) || !Number.isInteger(b) || b < 1 || b > 1000 || !['forward', 'backward'].includes(direction)
+        || (direction === 'forward' && initialStart > finalEnd) || (direction === 'backward' && initialStart < finalEnd)) {
+        log('Ungültige Parameter');
+        return;
+      }
 
-      while(direction==='forward'?current<=finalEnd:current>=finalEnd){
-        batchNo++;
+      const maxRetries = 8;
+      const retryDelayMs = (retry) => Math.min(30000, 5000 * 2 ** (retry - 1));
+      let batchNo = 0;
+      let total = 0;
+      let current = initialStart;
 
-        const currentStart=direction==='forward'
-          ? current
-          : Math.max(finalEnd,current-span);
-        const currentEnd=direction==='forward'
-          ? Math.min(finalEnd,current+span)
-          : current;
+      while (direction === 'forward' ? current <= finalEnd : current >= finalEnd) {
+        batchNo += 1;
 
-        const u=`/api/xttv/scan-import?start=${currentStart}&end=${currentEnd}&limit=${b}&cb=${Date.now()}-${batchNo}`;
+        const currentStart = direction === 'forward' ? current : Math.max(finalEnd, current - span);
+        const currentEnd = direction === 'forward' ? Math.min(finalEnd, current + span) : current;
+
+        const u = `/api/xttv/scan-import?start=${currentStart}&end=${currentEnd}&limit=${b}&cb=${Date.now()}-${batchNo}`;
         log(`Batch ${batchNo}: ${currentStart}-${currentEnd}, limit=${b}, direction=${direction}`);
 
         let d;
-        let succeeded=false;
+        let succeeded = false;
 
-        for(let retry=0;retry<=maxRetries;retry++){
+        for (let retry = 0; retry <= maxRetries; retry += 1) {
           let r;
-          try{
-            r=await fetch(u,{cache:"no-store"});
-          }catch(x){
-            if(retry===maxRetries){
+          try {
+            r = await fetch(u, { cache: 'no-store', headers: adminRequestHeaders() });
+          } catch (x) {
+            if (retry === maxRetries) {
               log(`Netzwerkfehler nach ${maxRetries} Wiederholungen: ${x}`);
               return;
             }
-            const wait=retryDelayMs(retry+1);
-            log(`Netzwerkfehler – Wiederholung ${retry+1}/${maxRetries} in ${Math.ceil(wait/1000)}s …`);
-            await new Promise(x=>setTimeout(x,wait));
+            const wait = retryDelayMs(retry + 1);
+            log(`Netzwerkfehler – Wiederholung ${retry + 1}/${maxRetries} in ${Math.ceil(wait / 1000)}s …`);
+            await new Promise((x) => setTimeout(x, wait));
             continue;
           }
 
-          if(r.ok){
-            try{
-              d=await r.json();
-              succeeded=true;
+          if (r.status === 401) {
+            log('Admin-Token erforderlich oder ungültig.');
+            return;
+          }
+
+          if (r.ok) {
+            try {
+              d = await r.json();
+              succeeded = true;
               break;
-            }catch(x){
-              if(retry===maxRetries){
+            } catch (x) {
+              if (retry === maxRetries) {
                 log(`HTTP ${r.status}: kein JSON nach ${maxRetries} Wiederholungen`);
                 return;
               }
-              const wait=retryDelayMs(retry+1);
-              log(`HTTP ${r.status}: kein JSON – Wiederholung ${retry+1}/${maxRetries} in ${Math.ceil(wait/1000)}s …`);
-              await new Promise(x=>setTimeout(x,wait));
+              const wait = retryDelayMs(retry + 1);
+              log(`HTTP ${r.status}: kein JSON – Wiederholung ${retry + 1}/${maxRetries} in ${Math.ceil(wait / 1000)}s …`);
+              await new Promise((x) => setTimeout(x, wait));
             }
             continue;
           }
 
-          if(r.status===429||r.status>=500){
-            if(retry===maxRetries){
+          if (r.status === 429 || r.status >= 500) {
+            if (retry === maxRetries) {
               log(`HTTP ${r.status}: nach ${maxRetries} Wiederholungen abgebrochen`);
               return;
             }
-            const wait=retryDelayMs(retry+1);
-            log(`HTTP ${r.status} – Wiederholung ${retry+1}/${maxRetries} in ${Math.ceil(wait/1000)}s …`);
-            await new Promise(x=>setTimeout(x,wait));
+            const wait = retryDelayMs(retry + 1);
+            log(`HTTP ${r.status} – Wiederholung ${retry + 1}/${maxRetries} in ${Math.ceil(wait / 1000)}s …`);
+            await new Promise((x) => setTimeout(x, wait));
             continue;
           }
 
-          try{
-            d=await r.json();
-            succeeded=true;
+          try {
+            d = await r.json();
+            succeeded = true;
             break;
-          }catch(x){
+          } catch (x) {
             log(`HTTP ${r.status}: kein JSON`);
             return;
           }
         }
 
-        if(!succeeded||!d){
-          log("Keine gültige Antwort erhalten.");
+        if (!succeeded || !d) {
+          log('Keine gültige Antwort erhalten.');
           return;
         }
 
-        if(!d.ok){
+        if (!d.ok) {
           log(JSON.stringify(d));
           return;
         }
 
-        total+=Number(d.imported||0);
+        total += Number(d.imported || 0);
         log(`checked=${d.checked}, imported=${d.imported}, skipped=${d.skipped_existing}, errors=${d.errors}, stopped=${d.stopped_after_limit}, totalImported=${total}`);
 
-        // Wenn der Scanner am Limit abgebrochen hat, bleibt derselbe 1000er-
-        // Bereich aktiv. Der nächste Request holt die nächsten Treffer aus
-        // diesem Bereich. Erst bei stopped_after_limit=false geht es weiter.
-        if(d.stopped_after_limit){
-          log("Limit erreicht – derselbe Bereich wird erneut verarbeitet …");
-        }else{
-          current=direction==='forward'
-            ? currentEnd+1
-            : currentStart-1;
+        if (d.stopped_after_limit) {
+          log('Limit erreicht – derselbe Bereich wird erneut verarbeitet …');
+        } else {
+          current = direction === 'forward' ? currentEnd + 1 : currentStart - 1;
         }
 
-        await new Promise(x=>setTimeout(x,250));
+        await new Promise((x) => setTimeout(x, 250));
       }
 
       log(`FERTIG: ${total} neue Spiele importiert.`);

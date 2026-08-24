@@ -1,4 +1,5 @@
-import { bindHeaderLeague, bindHeaderRefresh, escapeHtml, fetchRefreshApi, readStoredLeague, renderHeaderLeague, renderRefreshReport, storeLeague } from './header.mjs';
+import { bindHeaderLeague, bindHeaderRefresh, bindHeaderAdminToken, escapeHtml, fetchAdminRequired, fetchRefreshApi, readStoredLeague, renderHeaderLeague, renderRefreshReport, storeLeague } from './header.mjs';
+import { adminRequestHeaders, applyAdminTokenFromUrl } from './admin-auth.mjs';
 
 const app = document.querySelector('#app');
 const DESKTOP_VIEW_KEY = 'tt-statistiken-desktop-view';
@@ -7,6 +8,7 @@ const state = {
   sort: 'rc_rating', direction: 'desc',
   profile: null,
   dataRefreshRunning: false,
+  adminRequired: false,
   forceDesktopView: false,
 };
 
@@ -32,8 +34,9 @@ async function api(path, { timeoutMs = 60000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(path, { signal: controller.signal });
+    const response = await fetch(path, { signal: controller.signal, headers: adminRequestHeaders() });
     const data = await response.json();
+    if (response.status === 401) throw new Error(data.error || 'Admin-Token erforderlich — bitte im Header eintragen.');
     if (!response.ok || data.ok === false) throw new Error(data.error || 'API-Fehler');
     return data;
   } catch (error) {
@@ -52,9 +55,11 @@ function syncHeader() {
     backLabel: 'Zurück',
     showDataRefresh: true,
     dataRefreshRunning: state.dataRefreshRunning,
+    adminRequired: state.adminRequired,
   });
   bindHeaderLeague(loadLeague);
   bindHeaderRefresh(runDataRefresh);
+  bindHeaderAdminToken();
 }
 
 async function runDataRefresh() {
@@ -378,8 +383,10 @@ function renderProfile(data) {
 }
 
 async function init() {
+  applyAdminTokenFromUrl();
   app.innerHTML = '<section class="card"><p class="muted">Lade Ligen …</p></section>';
   try {
+    state.adminRequired = await fetchAdminRequired();
     const data = await api('/api/leagues');
     state.leagues = data.leagues || [];
     const stored = readStoredLeague();

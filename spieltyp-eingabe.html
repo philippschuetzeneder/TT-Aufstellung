@@ -31,6 +31,9 @@
   <div class="actions">
     <button type="button" class="primary" id="copyBtn">Text für Cursor kopieren</button>
     <button type="button" id="saveBtn">In DB speichern</button>
+    <label id="adminTokenWrap" style="display:none;align-items:center;gap:0.35rem;font-size:0.85rem;">
+      Admin-Token <input type="password" id="adminToken" autocomplete="off" style="min-width:12rem;">
+    </label>
   </div>
   <textarea id="export" readonly placeholder="Hier erscheint der Export …"></textarea>
   <p id="status" class="muted"></p>
@@ -94,7 +97,21 @@
 <tr data-pass="11524"><td>53</td><td>Kapeller Paul</td><td><code>11524</code></td><td>SGGP</td><td class="types"><label class="type-opt"><input type="radio" name="p11524" value="offensive" data-short="O"><span title="Offensiv">O</span></label><label class="type-opt"><input type="radio" name="p11524" value="pips" data-short="N"><span title="Noppen">N</span></label><label class="type-opt"><input type="radio" name="p11524" value="defensive" data-short="D"><span title="Defensiv">D</span></label><label class="type-opt"><input type="radio" name="p11524" value="" data-short="-" checked><span title="Kein Eintrag">-</span></label></td></tr>
     </tbody>
   </table>
-  <script>
+  <script type="module">
+    import { adminRequestHeaders, applyAdminTokenFromUrl, bindAdminTokenInput, readAdminToken } from '/src/ui/admin-auth.mjs';
+
+    applyAdminTokenFromUrl();
+    const adminInput = document.getElementById('adminToken');
+    bindAdminTokenInput(adminInput);
+    adminInput.value = readAdminToken();
+
+    fetch('/api/auth/status')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.admin_required) document.getElementById('adminTokenWrap').style.display = 'flex';
+      })
+      .catch(() => {});
+
     const TYPE_MAP = { offensive: 'O', pips: 'N', defensive: 'D', '': '-' };
     function buildLines() {
       const lines = [];
@@ -126,7 +143,7 @@
       try {
         const res = await fetch('/api/spieltyp/bulk', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: adminRequestHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ text }),
         });
         const data = await res.json();

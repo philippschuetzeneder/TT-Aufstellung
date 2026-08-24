@@ -19,6 +19,11 @@
 .header-btn-warn:hover:not(:disabled){background:rgba(255,196,120,.35)}
 .header-btn-warn:disabled{opacity:.65;cursor:not-allowed}
 
+.header-admin-token{display:grid;gap:4px;width:100%;font-weight:800;font-size:.72rem;color:rgba(255,255,255,.88)}
+.header-admin-token-label{text-transform:uppercase;letter-spacing:.06em}
+.header-admin-token-input{width:100%;min-width:0;border:1px solid rgba(255,255,255,.28);border-radius:12px;padding:8px 10px;background:rgba(7,25,43,.35);color:white;backdrop-filter:blur(6px);font-size:.78rem}
+.header-admin-token-input::placeholder{color:rgba(255,255,255,.45)}
+
 .refresh-report h2{margin:0 0 6px}
 .refresh-report-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
 .refresh-report-lead{margin:0 0 6px;font-size:1.05rem;font-weight:700}

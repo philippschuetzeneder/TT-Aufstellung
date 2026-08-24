@@ -16,6 +16,10 @@ if (-not $env:PORT) { $base = "http://localhost:10000" }
 
 $flag = if ($ImportHistory) { "1" } else { "0" }
 Write-Host "RC match apply-all (import_history=$ImportHistory, batch_size=$BatchSize) ..." -ForegroundColor Cyan
-$result = Invoke-RestMethod -Uri "$base/api/rc/match-apply-all?batch_size=$BatchSize&import_history=$flag" -TimeoutSec 7200
+$headers = @{}
+if ($env:ADMIN_TOKEN) {
+    $headers["X-Admin-Token"] = $env:ADMIN_TOKEN
+}
+$result = Invoke-RestMethod -Uri "$base/api/rc/match-apply-all?batch_size=$BatchSize&import_history=$flag" -Headers $headers -TimeoutSec 7200
 $result | ConvertTo-Json -Depth 4
 Write-Host "players_with_rc_id_after: $($result.players_with_rc_id_after)" -ForegroundColor Green

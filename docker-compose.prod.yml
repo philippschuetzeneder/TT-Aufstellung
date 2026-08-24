@@ -21,9 +21,12 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql+psycopg://tt:${POSTGRES_PASSWORD}@postgres:5432/tt_aufstellung
       PORT: 10000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     expose:
       - "10000"
     depends_on:

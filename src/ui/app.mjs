@@ -1,4 +1,5 @@
-import { bindHeaderLeague, bindHeaderRefresh, escapeHtml, fetchRefreshApi, readStoredLeague, renderHeaderLeague, renderRefreshReport, storeLeague } from './header.mjs';
+import { bindHeaderLeague, bindHeaderRefresh, bindHeaderAdminToken, escapeHtml, fetchAdminRequired, fetchRefreshApi, readStoredLeague, renderHeaderLeague, renderRefreshReport, storeLeague } from './header.mjs';
+import { adminRequestHeaders, applyAdminTokenFromUrl } from './admin-auth.mjs';
 
 const DEFAULT_LEAGUE = '411 RK Linz Umg. / MV Mitte';
 const DEFAULT_OWN_TEAM = 'Tragwein/Kamig 3';
@@ -27,6 +28,7 @@ const state = {
   loadingPlayers: false,
   analysisLoading: false,
   dataRefreshRunning: false,
+  adminRequired: false,
   uiExpanded: {
     why: false,
     moreInfo: false,
@@ -41,8 +43,9 @@ async function api(path, { timeoutMs = 5000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const r = await fetch(path, { signal: controller.signal });
+    const r = await fetch(path, { signal: controller.signal, headers: adminRequestHeaders() });
     const d = await r.json();
+    if (r.status === 401) throw new Error(d.error || 'Admin-Token erforderlich — bitte im Header eintragen.');
     if (!r.ok || d.ok === false) throw new Error(d.message || d.error || 'API error');
     return d;
   } catch (e) {
@@ -69,11 +72,13 @@ function syncHeader() {
     disabled: state.loadingPlayers || state.analysisLoading,
     showDataRefresh: true,
     dataRefreshRunning: state.dataRefreshRunning,
+    adminRequired: state.adminRequired,
     backHref: '/statistiken.html',
     backLabel: 'Statistiken',
   });
   bindHeaderLeague(onLeagueChange);
   bindHeaderRefresh(runDataRefresh);
+  bindHeaderAdminToken();
 }
 
 async function runDataRefresh() {
@@ -136,6 +141,7 @@ async function onLeagueChange(leagueId) {
 }
 
 async function init() {
+  applyAdminTokenFromUrl();
   app.innerHTML = '<section class="card"><p class="muted">Lade Daten …</p></section>';
   try {
     const health = await fetch('/api/db/health').then((r) => r.json()).catch(() => ({ ok: false, error: 'Backend nicht erreichbar' }));
@@ -143,6 +149,8 @@ async function init() {
       app.innerHTML = `<section class="card"><h2>Datenbank nicht erreichbar</h2><p>${escapeHtml(health.error || 'PostgreSQL antwortet nicht.')}</p><p class="muted">Starte Postgres und danach <code>.\\scripts\\start-dev.ps1</code>.</p></section>`;
       return;
     }
+
+    state.adminRequired = await fetchAdminRequired();
 
     const leagueData = await api('/api/leagues');
     state.leagues = leagueData.leagues || [];
@@ -798,7 +806,7 @@ async function runAnalysis() {
       strongerPair = `&stronger_double_pair=${state.strongerDoublePair}`;
     }
     const ownTeam = `&own_team=${encodeURIComponent(state.ownTeam)}`;
-    const nextResult = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${direction}${spieltyp}${pairs}${strongerPair}${ownTeam}${fixedOrder}${fixedDoublesOn}`);
+    const nextResult = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${direction}${spieltyp}${pairs}${strongerPair}${ownTeam}${fixedOrder}${fixedDoublesOn}`, { timeoutMs: 120000 });
     if (state.editMode) {
       state.result = nextResult;
       state.optimalResult = state.optimalResult || nextResult;

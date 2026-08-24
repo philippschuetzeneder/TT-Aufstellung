@@ -1,3 +1,5 @@
+import { adminRequestHeaders, applyAdminTokenFromUrl, bindAdminTokenInput, readAdminToken, storeAdminToken } from './admin-auth.mjs';
+
 const DEFAULT_LEAGUE = '411 RK Linz Umg. / MV Mitte';
 export const LEAGUE_STORAGE_KEY = 'tt-aufstellung-league';
 
@@ -27,6 +29,7 @@ export function renderHeaderLeague(leagues, league, {
   backLabel = 'Statistiken',
   showDataRefresh = false,
   dataRefreshRunning = false,
+  adminRequired = false,
 } = {}) {
   const host = document.querySelector('#header-controls');
   const navHost = document.querySelector('#header-nav');
@@ -49,8 +52,12 @@ export function renderHeaderLeague(leagues, league, {
   ).join('');
   const controlsNav = navHost ? '' : navLink;
   const controlsRefresh = refreshHost ? '' : refreshBtn;
+  const adminTokenHtml = adminRequired
+    ? `<label class="header-admin-token"><span class="header-admin-token-label">Admin-Token</span><input type="password" id="header-admin-token" class="header-admin-token-input" placeholder="für Analyse & Refresh" value="${escapeHtml(readAdminToken())}" ${disabled || dataRefreshRunning ? 'disabled' : ''} autocomplete="off"></label>`
+    : '';
   host.innerHTML = `
     ${controlsRefresh}
+    ${adminTokenHtml}
     <label class="header-league">
       <span class="header-league-label">Liga</span>
       <select id="header-league" class="header-league-select" ${disabled || dataRefreshRunning ? 'disabled' : ''}>${options}</select>
@@ -65,8 +72,24 @@ export function bindHeaderRefresh(onRefresh) {
   button.addEventListener('click', () => onRefresh());
 }
 
+export function bindHeaderAdminToken() {
+  bindAdminTokenInput(document.querySelector('#header-admin-token'));
+}
+
+export async function fetchAdminRequired() {
+  try {
+    const response = await fetch('/api/auth/status');
+    const data = await response.json();
+    return Boolean(data?.admin_required);
+  } catch {
+    return false;
+  }
+}
+
 export async function fetchRefreshApi(restart = true) {
-  const response = await fetch(`/api/data/refresh?restart=${restart ? '1' : '0'}`);
+  const response = await fetch(`/api/data/refresh?restart=${restart ? '1' : '0'}`, {
+    headers: adminRequestHeaders(),
+  });
   const contentType = response.headers.get('content-type') || '';
   const body = await response.text();
   if (!contentType.includes('application/json')) {

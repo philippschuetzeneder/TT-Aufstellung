@@ -24,6 +24,7 @@ from .models import XttvPlayer, PlayerRatingSnapshot
 from .data_refresh_service import run_data_refresh
 from .doubles_service import suggest_pairs as suggest_double_pairs
 from .spieltyp_service import bulk_import_text, list_spieltyp
+from .api_auth import admin_required, extract_admin_token, path_requires_admin, token_is_valid
 ROOT=Path(__file__).resolve().parents[2]
 RUNTIME_VERSION = "orientation-v9-incremental-frontier"
 SOURCE_COMMIT = "7a59946ecd9a531cf0f7aa81154b93dce0a5fda0"
@@ -85,12 +86,25 @@ class Handler(BaseHTTPRequestHandler):
         data=json.dumps(payload,ensure_ascii=False,default=str).encode("utf-8"); self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8"); self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0"); self.send_header("Pragma","no-cache"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
     def _api_not_found(self):
         return self.send_json({"ok": False, "error": "API endpoint not found"}, 404)
+    def _reject_unless_admin(self, path: str) -> bool:
+        if not path_requires_admin(path):
+            return False
+        if not admin_required():
+            return False
+        if token_is_valid(extract_admin_token(self.headers)):
+            return False
+        self.send_json({"ok": False, "error": "Admin-Token erforderlich oder ungültig"}, 401)
+        return True
     def _handle_data_refresh(self, query):
         restart = query.get("restart", ["1"])[0].strip().lower() in {"1", "true", "yes", "on"}
         return self.send_json(run_data_refresh(restart_server=restart))
     def do_POST(self):
         parsed=urlparse(self.path); query=parse_qs(parsed.query)
         try:
+            if parsed.path == "/api/auth/status":
+                return self.send_json({"ok": True, "admin_required": admin_required()})
+            if self._reject_unless_admin(parsed.path):
+                return
             length=int(self.headers.get("Content-Length","0") or 0)
             raw=self.rfile.read(length).decode("utf-8") if length else ""
             body=json.loads(raw) if raw.strip() else {}
@@ -113,6 +127,10 @@ class Handler(BaseHTTPRequestHandler):
         try: meid=int(query.get("meid",["437757"])[0])
         except ValueError: return self.send_json({"ok":False,"error":"meid must be an integer"},400)
         try:
+            if parsed.path == "/api/auth/status":
+                return self.send_json({"ok": True, "admin_required": admin_required()})
+            if self._reject_unless_admin(parsed.path):
+                return
             if parsed.path=="/health": return self.send_json({"ok":True,"runtime_version":RUNTIME_VERSION,"source_commit":SOURCE_COMMIT})
             if parsed.path=="/api/runtime-version": return self.send_json({"ok":True,"runtime_version":RUNTIME_VERSION,"source_commit":SOURCE_COMMIT})
             if parsed.path=="/api/db/health": return self.send_json(database_health())

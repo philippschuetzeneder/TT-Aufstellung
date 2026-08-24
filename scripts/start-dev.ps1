@@ -13,6 +13,8 @@ if (-not (Test-Path $venvPython)) {
 if (-not $env:PYTHONPATH) { $env:PYTHONPATH = "backend" }
 if (-not $env:PORT) { $env:PORT = "10000" }
 
+$adminHint = if ($env:ADMIN_TOKEN) { "ADMIN_TOKEN gesetzt (geschützte API aktiv)" } else { "ADMIN_TOKEN leer (lokal ohne Token-Schutz)" }
 Write-Host "DATABASE_URL=$env:DATABASE_URL"
+Write-Host $adminHint
 Write-Host "Starting server on http://localhost:$env:PORT" -ForegroundColor Cyan
 & $venvPython -m app.web
