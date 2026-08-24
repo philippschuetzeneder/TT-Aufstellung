@@ -468,7 +468,7 @@ function infoSummaryHtml(summary) {
 function altLineupsHtml(recommendations, optimalProbability) {
   const items = (recommendations || []).slice(1, 6);
   if (!items.length) return '<p class="muted">Keine weiteren Aufstellungen.</p>';
-  return `<ol class="prediction-list">${items.map((x) => { const loss = Math.max(0, (Number(optimalProbability) - Number(x.team_win_probability)) * 100); return `<li><div class="recommendation-rank">#${x.rank}</div><div class="recommendation-names">${ownLineup(x.own_player_ids, x.players)}</div><strong style="color:#b42318">-${loss.toFixed(1).replace('.', ',')} %</strong></li>`; }).join('')}</ol>`;
+  return `<ol class="prediction-list">${items.map((x) => { const loss = Math.max(0, (Number(optimalProbability) - Number(x.team_win_probability)) * 100); const lossText = loss < 0.05 ? '<0,1' : `-${loss.toFixed(1).replace('.', ',')}`; return `<li><div class="recommendation-rank">#${x.rank}</div><div class="recommendation-names">${ownLineup(x.own_player_ids, x.players)}</div><strong style="color:#b42318">${lossText} %</strong></li>`; }).join('')}</ol>`;
 }
 
 function opponentLineupsHtml(predictions, skipFirst = true) {
@@ -498,7 +498,7 @@ function resultHtml() {
     : 'Modelldetails';
 
   const alternatives = (state.result.recommendations?.length || 1) > 1
-    ? collapsible('altLineups', 'Alternative Aufstellungen', altLineupsHtml(state.result.recommendations, b.team_win_probability), `${Math.min(5, state.result.recommendations.length - 1)} weitere`)
+    ? collapsible('altLineups', 'Alternative Aufstellungen', altLineupsHtml(state.result.recommendations, state.result.recommendations[0].ranking_team_win_probability ?? state.result.recommendations[0].team_win_probability), `${Math.min(5, state.result.recommendations.length - 1)} weitere`)
     : '';
   const lineupHtml = state.editMode ? `${editableLineupHtml()}${editableDoublesHtml()}` : `<div class="optimal-players">${ownLineup(b.own_player_ids, b.players)}${ownDoublesLineupHtml()}</div>`;
   const comparison = state.editMode && state.result?.optimal_recommendation && state.optimalResult?.recommendation ? `<div class="edit-comparison">Optimal: ${pct(state.optimalResult.recommendation.team_win_probability)} · <span class="edit-deviation">Abweichung zu Optimal: ${((Number(b.team_win_probability) - Number(state.optimalResult.recommendation.team_win_probability)) * 100).toFixed(1).replace('.', ',')} %</span></div><button type="button" class="secondary reset-edit-button" data-action="reset-edit">Zurück zur optimalen Aufstellung</button>` : '';

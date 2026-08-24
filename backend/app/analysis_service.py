@@ -726,20 +726,23 @@ def _team_result_probabilities(probs):
 
 
 def _format_match_score_display(win_prob, expected_own, expected_opp):
-    """Map expected game wins to TT match notation (8:x, x:8, 7:7, specials)."""
+    """Show the expected winner's TT score, not the draw probability."""
     own = float(expected_own or 0)
     opp = float(expected_opp or 0)
 
-    if own >= 7.5 or (win_prob > 0.55 and own >= opp):
-        opp_r = int(round(opp))
+    # A non-draw win probability does not make 7:7 a useful score display.
+    # Use the expected score direction; the probability fields still show
+    # the full win/draw/loss distribution separately.
+    if own >= opp + 0.25:
+        opp_r = int(opp)
         if opp_r <= 0 and opp < 0.5:
             return '10:0'
         if opp_r <= 1 and opp < 1.5:
             return '9:1'
         return f'8:{max(2, min(6, opp_r))}'
 
-    if opp >= 7.5 or (win_prob < 0.45 and opp >= own):
-        own_r = int(round(own))
+    if opp >= own + 0.25:
+        own_r = int(own)
         if own_r >= 2:
             return f'{max(2, min(7, own_r))}:8'
         if own_r <= 0 and own < 0.5:
@@ -1848,6 +1851,10 @@ def _explain_recommendation(own_order, scenarios, matchup_p, profiles, names, ev
             'single_game_worst_probability': round(worst_game[1], 6),
             'first_doubles_probability': round(weighted_double[0], 6),
             'second_doubles_probability': round(weighted_double[1], 6),
+            # These are the scenario-aggregated game probabilities used for
+            # the result display. Keeping them alongside the explanation
+            # avoids presenting marginal matchup values as one fixed match.
+            'aggregate_game_probabilities': [round(value, 6) for value in weighted_games],
             'position_rates': [
                 {
                     'player_id': pid,
@@ -2296,6 +2303,23 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         own_on_letters=own_on_letters,
         fixed_game_pairs=fixed_game_pairs,
     )
+    # The lineup ranking remains unchanged. For the result card, however,
+    # use the same scenario-aggregated 14-game vector shown by the
+    # explanation instead of aggregating separately from marginal matchups.
+    recommendation['ranking_team_win_probability'] = recommendation['team_win_probability']
+    display_probs = explanation.get('detail', {}).get('aggregate_game_probabilities')
+    if display_probs and len(display_probs) == TOTAL_GAMES:
+        display_dist = _team_result_distribution(display_probs)
+        recommendation['team_win_probability'] = round(display_dist['win'], 6)
+        recommendation['team_draw_probability'] = round(display_dist['draw'], 6)
+        recommendation['team_loss_probability'] = round(display_dist['loss'], 6)
+        recommendation['expected_own_wins'] = round(display_dist['expected_own_wins'], 3)
+        recommendation['expected_opponent_wins'] = round(display_dist['expected_opponent_wins'], 3)
+        recommendation['expected_score_display'] = _format_match_score_display(
+            display_dist['win'],
+            display_dist['expected_own_wins'],
+            display_dist['expected_opponent_wins'],
+        )
     opponent_doubles_by_order = {}
     opponent_predictions = [
         {
