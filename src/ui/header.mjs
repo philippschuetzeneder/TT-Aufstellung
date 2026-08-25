@@ -28,11 +28,44 @@ function leagueLabel(leagueItem) {
   return `${leagueItem.name}${leagueItem.season ? ` ${leagueItem.season}` : ''} (${leagueItem.match_count})`;
 }
 
+function normalizeLeagueSearch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/ä/g, 'a')
+    .replace(/ö/g, 'o')
+    .replace(/ü/g, 'u')
+    .replace(/ß/g, 'ss')
+    .trim();
+}
+
+function leagueSearchText(leagueItem) {
+  return normalizeLeagueSearch(`${leagueItem.id} ${leagueItem.name} ${leagueItem.season || ''} ${leagueItem.match_count || ''}`);
+}
+
+function filterLeagueModal(query) {
+  const list = document.querySelector('#header-league-modal-list');
+  if (!list) return;
+  const normalized = normalizeLeagueSearch(query);
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  let visible = 0;
+  list.querySelectorAll('.header-league-option').forEach((button) => {
+    const haystack = button.dataset.searchText || '';
+    const match = !tokens.length || tokens.every((token) => haystack.includes(token));
+    button.hidden = !match;
+    if (match) visible += 1;
+  });
+  const empty = list.querySelector('.header-league-empty');
+  if (empty) empty.hidden = visible > 0;
+}
+
 function closeLeagueModal() {
   const modal = document.querySelector('#header-league-modal');
   if (!modal) return;
   modal.hidden = true;
   document.body.classList.remove('league-modal-open');
+  const search = document.querySelector('#header-league-search');
+  if (search) search.value = '';
+  filterLeagueModal('');
 }
 
 function openLeagueModal() {
@@ -40,7 +73,13 @@ function openLeagueModal() {
   if (!modal) return;
   modal.hidden = false;
   document.body.classList.add('league-modal-open');
-  const active = modal.querySelector('.header-league-option.is-active');
+  const search = document.querySelector('#header-league-search');
+  if (search) {
+    search.value = '';
+    filterLeagueModal('');
+    window.setTimeout(() => search.focus(), 0);
+  }
+  const active = modal.querySelector('.header-league-option.is-active:not([hidden])');
   if (active) active.scrollIntoView({ block: 'nearest' });
 }
 
@@ -74,7 +113,7 @@ export function renderHeaderLeague(leagues, league, {
     (l) => `<option value="${escapeHtml(l.id)}" ${league === l.id ? 'selected' : ''}>${escapeHtml(leagueLabel(l))}</option>`,
   ).join('');
   const modalOptions = leagueList.map(
-    (l) => `<button type="button" class="header-league-option${league === l.id ? ' is-active' : ''}" data-league-id="${escapeHtml(l.id)}" ${disabled || dataRefreshRunning ? 'disabled' : ''}><span class="header-league-option-name">${escapeHtml(l.name)}${l.season ? ` <span class="header-league-option-season">${escapeHtml(l.season)}</span>` : ''}</span><span class="header-league-option-meta">${l.match_count} Spiele</span></button>`,
+    (l) => `<button type="button" class="header-league-option${league === l.id ? ' is-active' : ''}" data-league-id="${escapeHtml(l.id)}" data-search-text="${escapeHtml(leagueSearchText(l))}" ${disabled || dataRefreshRunning ? 'disabled' : ''}><span class="header-league-option-name">${escapeHtml(l.name)}${l.season ? ` <span class="header-league-option-season">${escapeHtml(l.season)}</span>` : ''}</span><span class="header-league-option-meta">${l.match_count} Spiele</span></button>`,
   ).join('');
   const controlsNav = navHost ? '' : navLink;
   const controlsRefresh = refreshHost ? '' : refreshBtn;
@@ -96,9 +135,10 @@ export function renderHeaderLeague(leagues, league, {
         <div class="header-league-modal-panel" role="dialog" aria-modal="true" aria-labelledby="header-league-modal-title">
           <div class="header-league-modal-head">
             <h2 id="header-league-modal-title">Liga wählen</h2>
+            <input type="search" id="header-league-search" class="header-league-search" placeholder="Liga suchen …" autocomplete="off" enterkeyhint="search">
             <button type="button" class="header-league-modal-close" id="header-league-modal-close" aria-label="Schließen">×</button>
           </div>
-          <div class="header-league-modal-list">${modalOptions}</div>
+          <div class="header-league-modal-list" id="header-league-modal-list">${modalOptions}<p class="header-league-empty" hidden>Keine Liga gefunden.</p></div>
         </div>
       </div>
     </div>
@@ -158,9 +198,20 @@ export function bindHeaderLeague(onChange) {
   const modal = document.querySelector('#header-league-modal');
   const backdrop = document.querySelector('#header-league-modal-backdrop');
   const closeBtn = document.querySelector('#header-league-modal-close');
+  const searchInput = document.querySelector('#header-league-search');
   if (!select || typeof onChange !== 'function') return;
 
   select.addEventListener('change', () => onChange(select.value));
+
+  if (searchInput) {
+    searchInput.addEventListener('input', () => filterLeagueModal(searchInput.value));
+    searchInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeLeagueModal();
+      }
+    });
+  }
 
   if (trigger) {
     trigger.addEventListener('click', () => {
