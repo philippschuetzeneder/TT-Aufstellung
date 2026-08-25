@@ -53,7 +53,7 @@ export function renderHeaderLeague(leagues, league, {
   const controlsNav = navHost ? '' : navLink;
   const controlsRefresh = refreshHost ? '' : refreshBtn;
   const adminTokenHtml = adminRequired
-    ? `<label class="header-admin-token"><span class="header-admin-token-label">Admin-Token</span><input type="password" id="header-admin-token" class="header-admin-token-input" placeholder="für Analyse & Refresh" value="${escapeHtml(readAdminToken())}" ${disabled || dataRefreshRunning ? 'disabled' : ''} autocomplete="off"></label>`
+    ? `<label class="header-admin-token"><span class="header-admin-token-label">Admin-Token</span><input type="password" id="header-admin-token" class="header-admin-token-input" placeholder="für Daten-Refresh" value="${escapeHtml(readAdminToken())}" ${disabled || dataRefreshRunning ? 'disabled' : ''} autocomplete="off"></label>`
     : '';
   host.innerHTML = `
     ${controlsRefresh}

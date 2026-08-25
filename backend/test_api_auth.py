@@ -22,8 +22,8 @@ def test_token_is_valid_when_token_set(monkeypatch):
 
 def test_path_requires_admin_classification(monkeypatch):
     monkeypatch.setattr(api_auth, "ADMIN_TOKEN", "x")
-    assert api_auth.path_requires_admin("/api/analysis") is True
     assert api_auth.path_requires_admin("/api/data/refresh") is True
+    assert api_auth.path_requires_admin("/api/analysis") is False
     assert api_auth.path_requires_admin("/api/leagues") is False
     assert api_auth.path_requires_admin("/api/teams/players") is False
 

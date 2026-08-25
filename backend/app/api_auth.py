@@ -22,9 +22,8 @@ ADMIN_WRITE_PATHS = frozenset({
     "/api/analysis/cache-refresh",
 })
 
-# Lesende Endpunkte mit hohem DB-/Netzwerkaufwand.
+# Lesende Endpunkte mit hohem DB-/Netzwerkaufwand (nicht Kern-UI).
 ADMIN_HEAVY_READ_PATHS = frozenset({
-    "/api/analysis",
     "/api/db/validate",
     "/api/analytics/validate",
     "/api/rc/match-dry-run",

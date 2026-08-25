@@ -49,16 +49,9 @@ def test_public_leagues_without_token(auth_server):
     assert data.get("ok") is not False
 
 
-def test_analysis_requires_valid_token(auth_server):
+def test_analysis_is_public_even_with_admin_token(auth_server):
     port = auth_server
     status, data = _request(port, "/api/analysis?own_player_ids=1,2,3,4&opponent_team=TEST")
-    assert status == 401
-    assert "Admin-Token" in data.get("error", "")
-
-    status, data = _request(port, "/api/analysis?own_player_ids=1,2,3,4&opponent_team=TEST", token="wrong")
-    assert status == 401
-
-    status, data = _request(port, "/api/analysis?own_player_ids=1,2,3,4&opponent_team=TEST", token="test-admin-token")
     assert status in {200, 500}
     if status == 200:
         assert "recommendations" in data or data.get("ok") is not False
