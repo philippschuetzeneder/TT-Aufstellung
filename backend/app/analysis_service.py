@@ -2303,10 +2303,11 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         own_on_letters=own_on_letters,
         fixed_game_pairs=fixed_game_pairs,
     )
+    for item in evaluated:
+        item['ranking_team_win_probability'] = item['team_win_probability']
     # The lineup ranking remains unchanged. For the result card, however,
     # use the same scenario-aggregated 14-game vector shown by the
     # explanation instead of aggregating separately from marginal matchups.
-    recommendation['ranking_team_win_probability'] = recommendation['team_win_probability']
     display_probs = explanation.get('detail', {}).get('aggregate_game_probabilities')
     if display_probs and len(display_probs) == TOTAL_GAMES:
         display_dist = _team_result_distribution(display_probs)

@@ -23,6 +23,27 @@ export function escapeHtml(v) {
   return String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function leagueLabel(leagueItem) {
+  if (!leagueItem) return 'Liga wählen';
+  return `${leagueItem.name}${leagueItem.season ? ` ${leagueItem.season}` : ''} (${leagueItem.match_count})`;
+}
+
+function closeLeagueModal() {
+  const modal = document.querySelector('#header-league-modal');
+  if (!modal) return;
+  modal.hidden = true;
+  document.body.classList.remove('league-modal-open');
+}
+
+function openLeagueModal() {
+  const modal = document.querySelector('#header-league-modal');
+  if (!modal) return;
+  modal.hidden = false;
+  document.body.classList.add('league-modal-open');
+  const active = modal.querySelector('.header-league-option.is-active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
+}
+
 export function renderHeaderLeague(leagues, league, {
   disabled = false,
   backHref = '/statistiken.html',
@@ -47,8 +68,13 @@ export function renderHeaderLeague(leagues, league, {
     refreshHost.innerHTML = refreshBtn;
   }
   if (!host) return;
-  const options = (leagues || []).map(
-    (l) => `<option value="${escapeHtml(l.id)}" ${league === l.id ? 'selected' : ''}>${escapeHtml(l.name)}${l.season ? ` ${l.season}` : ''} (${l.match_count})</option>`,
+  const leagueList = leagues || [];
+  const current = leagueList.find((l) => l.id === league);
+  const options = leagueList.map(
+    (l) => `<option value="${escapeHtml(l.id)}" ${league === l.id ? 'selected' : ''}>${escapeHtml(leagueLabel(l))}</option>`,
+  ).join('');
+  const modalOptions = leagueList.map(
+    (l) => `<button type="button" class="header-league-option${league === l.id ? ' is-active' : ''}" data-league-id="${escapeHtml(l.id)}" ${disabled || dataRefreshRunning ? 'disabled' : ''}><span class="header-league-option-name">${escapeHtml(l.name)}${l.season ? ` <span class="header-league-option-season">${escapeHtml(l.season)}</span>` : ''}</span><span class="header-league-option-meta">${l.match_count} Spiele</span></button>`,
   ).join('');
   const controlsNav = navHost ? '' : navLink;
   const controlsRefresh = refreshHost ? '' : refreshBtn;
@@ -58,10 +84,24 @@ export function renderHeaderLeague(leagues, league, {
   host.innerHTML = `
     ${controlsRefresh}
     ${adminTokenHtml}
-    <label class="header-league">
+    <div class="header-league">
       <span class="header-league-label">Liga</span>
-      <select id="header-league" class="header-league-select" ${disabled || dataRefreshRunning ? 'disabled' : ''}>${options}</select>
-    </label>
+      <button type="button" class="header-league-trigger" id="header-league-trigger" ${disabled || dataRefreshRunning ? 'disabled' : ''} aria-haspopup="dialog" aria-controls="header-league-modal">
+        <span class="header-league-trigger-text">${escapeHtml(leagueLabel(current))}</span>
+        <span class="header-league-trigger-chevron" aria-hidden="true"></span>
+      </button>
+      <select id="header-league" class="header-league-select header-league-select-native" ${disabled || dataRefreshRunning ? 'disabled' : ''} aria-hidden="true" tabindex="-1">${options}</select>
+      <div id="header-league-modal" class="header-league-modal" hidden>
+        <button type="button" class="header-league-modal-backdrop" id="header-league-modal-backdrop" aria-label="Schließen"></button>
+        <div class="header-league-modal-panel" role="dialog" aria-modal="true" aria-labelledby="header-league-modal-title">
+          <div class="header-league-modal-head">
+            <h2 id="header-league-modal-title">Liga wählen</h2>
+            <button type="button" class="header-league-modal-close" id="header-league-modal-close" aria-label="Schließen">×</button>
+          </div>
+          <div class="header-league-modal-list">${modalOptions}</div>
+        </div>
+      </div>
+    </div>
     ${controlsNav}
   `;
 }
@@ -114,8 +154,37 @@ export async function fetchRefreshApi(restart = true) {
 
 export function bindHeaderLeague(onChange) {
   const select = document.querySelector('#header-league');
+  const trigger = document.querySelector('#header-league-trigger');
+  const modal = document.querySelector('#header-league-modal');
+  const backdrop = document.querySelector('#header-league-modal-backdrop');
+  const closeBtn = document.querySelector('#header-league-modal-close');
   if (!select || typeof onChange !== 'function') return;
+
   select.addEventListener('change', () => onChange(select.value));
+
+  if (trigger) {
+    trigger.addEventListener('click', () => {
+      if (trigger.disabled) return;
+      openLeagueModal();
+    });
+  }
+
+  modal?.querySelectorAll('.header-league-option').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      const leagueId = button.dataset.leagueId;
+      if (!leagueId || leagueId === select.value) {
+        closeLeagueModal();
+        return;
+      }
+      select.value = leagueId;
+      closeLeagueModal();
+      onChange(leagueId);
+    });
+  });
+
+  backdrop?.addEventListener('click', closeLeagueModal);
+  closeBtn?.addEventListener('click', closeLeagueModal);
 }
 
 function refreshDetailRow(label, value) {
@@ -190,6 +259,9 @@ export function renderRefreshReport(target, data, { onBack } = {}) {
 
   target.innerHTML = `
     <section class="card refresh-report">
+      <div class="refresh-report-top">
+        <button type="button" class="refresh-back-btn" id="refresh-report-back">← Zurück zur Hauptseite</button>
+      </div>
       <div class="refresh-report-head">
         <h2>${failed ? 'Daten-Refresh fehlgeschlagen' : 'Daten-Refresh abgeschlossen'}</h2>
         ${badge}
@@ -211,9 +283,6 @@ export function renderRefreshReport(target, data, { onBack } = {}) {
         </div>
       </div>
       ${restartNote}
-      <div class="refresh-report-actions">
-        <button type="button" class="refresh-back-btn" id="refresh-report-back">← Zurück zur Hauptseite</button>
-      </div>
     </section>
   `;
 
