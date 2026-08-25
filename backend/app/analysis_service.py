@@ -2305,6 +2305,12 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     )
     for item in evaluated:
         item['ranking_team_win_probability'] = item['team_win_probability']
+    optimal_ranking = evaluated[0]['ranking_team_win_probability']
+    for item in evaluated:
+        item['loss_pp_vs_optimal'] = round(
+            max(0.0, (optimal_ranking - item['ranking_team_win_probability']) * 100),
+            2,
+        )
     # The lineup ranking remains unchanged. For the result card, however,
     # use the same scenario-aggregated 14-game vector shown by the
     # explanation instead of aggregating separately from marginal matchups.
