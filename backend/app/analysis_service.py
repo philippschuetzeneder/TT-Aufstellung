@@ -37,6 +37,9 @@ MAX_ANALYSIS_SECONDS = 5.0
 STATS_YEARS = 2
 OPPONENT_POOL_YEARS = 2
 LINEUP_RECENCY_HALF_LIFE_DAYS = 60.0
+# Resharpen opponent scenario weights: p' = p^alpha / sum(p^alpha). alpha>1
+# concentrates mass on likelier lineups (less hedge-averaging of own orders).
+SCENARIO_SHARPENING_ALPHA = 2.5
 # Pseudo-observations blended with joint quartet history; n=5 -> 5/6 joint weight (~83%).
 KNOWN_QUARTET_JOINT_PRIOR_STRENGTH = 1.0
 POSITION_PRIOR_SMOOTHING = 0.35
@@ -74,7 +77,7 @@ TREND_COMPONENT_FULL_SCALE = 80.0
 # deliberately small corroborating signal; trend gets a comparable bounded
 # contribution so recent form can matter without dominating the model.
 RC_BASELINE = 1400.0
-RC_SCALE = 400.0
+RC_SCALE = 300.0
 RC_COMPONENT_WEIGHT = 0.75
 SINGLES_RECORD_WEIGHT = 0.18
 HOME_AWAY_MAX_COMPONENT = 0.08
@@ -82,7 +85,7 @@ HOME_AWAY_MIN_GAMES = 8
 HOME_AWAY_MIN_OVERALL_GAMES = 12
 HOME_AWAY_COMPONENT_SCALE = 0.32
 H2H_MAX_WEIGHT = 0.85
-MODEL_VERSION = 'rc-h2h-homeaway-v29-net-level-trend'
+MODEL_VERSION = 'rc-h2h-homeaway-v30-scenario-sharpening'
 
 # Home index 0=A..3=D; away index 0=1..3=4 on the guest row.
 SINGLES_SCHEDULE = (
@@ -634,6 +637,95 @@ def _pair_probability(a, b, c, d, profiles):
 def _doubles_pairs(order, profiles):
     ranked = sorted(order, key=lambda pid: _combined_strength(profiles.get(pid, _empty_profile())), reverse=True)
     return (ranked[0], ranked[1]), (ranked[2], ranked[3])
+
+
+def _trivial_strength_own_order(own, profiles):
+    """Strongest combined strength on A, weakest on D (trivial RC lineup)."""
+    return sorted(
+        [str(x) for x in own],
+        key=lambda pid: -_combined_strength(profiles.get(pid, _empty_profile())),
+    )
+
+
+def _all_double_pair_partitions(player_ids):
+    """All ways to split four players into two doubles pairs."""
+    players = sorted([str(x) for x in player_ids])
+    partitions = []
+    seen = set()
+    for pair_a in combinations(players, 2):
+        rest = tuple(p for p in players if p not in pair_a)
+        if len(rest) != 2:
+            continue
+        key = frozenset([frozenset(pair_a), frozenset(rest)])
+        if key in seen:
+            continue
+        seen.add(key)
+        partitions.append((tuple(pair_a), rest))
+    return partitions
+
+
+def _compute_lineup_configuration_spread_pp(
+    own, scenarios, profiles, matchups, names,
+    use_spieltyp=False, own_double_pairs=None, stronger_double_pair=1,
+    doubles_stats=None, own_on_letters=None, own_is_home=None,
+):
+    """Spread across singles orders, doubles pair splits, and Spiel-5 vs Spiel-10 assignment.
+
+    When own_double_pairs is set (UI edit / fixed doubles), only that pair split is
+    considered — matching what the user can change (24 singles × 2 Spiel-5/10 slots).
+  """
+    spread_started = time.monotonic()
+    if own_double_pairs:
+        pair_a, pair_b = _normalize_own_double_pairs(own, own_double_pairs, profiles)
+        pair_partitions = [(pair_a, pair_b)]
+    else:
+        pair_partitions = _all_double_pair_partitions(own)
+    doubles_stats = doubles_stats or {}
+    relevant = set(own)
+    for _, order in scenarios:
+        relevant.update(order)
+
+    orientations = [True, False] if own_is_home is None else [bool(own_is_home)]
+    schedule_by_orientation = {
+        home: _schedule_for_orientation(
+            home if own_on_letters is None else own_on_letters
+        )
+        for home in orientations
+    }
+    matchup_by_orientation = {
+        home: _build_matchup_table(
+            relevant, profiles, matchups, home, use_spieltyp=use_spieltyp,
+        )
+        for home in orientations
+    }
+
+    wins = []
+    for part_a, part_b in pair_partitions:
+        for game5_pair, game10_pair in ((part_a, part_b), (part_b, part_a)):
+            fixed_game_pairs = (tuple(game5_pair), tuple(game10_pair))
+            caches_by_orientation = {
+                home: _build_scenario_doubles_cache(
+                    scenarios, part_a, part_b, profiles, doubles_stats,
+                    stronger_double_pair, fixed_game_pairs,
+                )
+                for home in orientations
+            }
+            for own_order in permutations(own):
+                orientation_wins = []
+                for home in orientations:
+                    _check_analysis_budget(spread_started)
+                    _, agg, _, _, _, _ = _evaluate_lineup_for_perm(
+                        own_order,
+                        caches_by_orientation[home],
+                        matchup_by_orientation[home],
+                        schedule_by_orientation[home],
+                    )
+                    orientation_wins.append(agg['win'])
+                wins.append(sum(orientation_wins) / len(orientations))
+
+    if not wins:
+        return None
+    return round((max(wins) - min(wins)) * 100, 2)
 
 
 def _schedule_for_orientation(own_is_home):
@@ -1615,6 +1707,19 @@ def _filter_scenarios(scenarios, opponent_pool):
     return [(probability / total, order) for probability, order in filtered]
 
 
+def _sharpen_scenarios(scenarios, alpha=SCENARIO_SHARPENING_ALPHA):
+    """Concentrate scenario mass on likelier opponent lineups (power reweighting)."""
+    if not scenarios or alpha <= 1.0 or len(scenarios) <= 1:
+        return scenarios
+    weighted = [(probability ** alpha, order) for probability, order in scenarios]
+    total = sum(probability for probability, _ in weighted)
+    if total <= 0:
+        return scenarios
+    sharpened = [(probability / total, order) for probability, order in weighted]
+    sharpened.sort(key=lambda item: (-item[0], item[1]))
+    return sharpened
+
+
 def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
     db = SessionLocal()
     try:
@@ -1792,13 +1897,6 @@ def _explain_recommendation(own_order, scenarios, matchup_p, profiles, names, ev
 
     player_current_rates.sort(key=lambda x: x[1], reverse=True)
     strongest = player_current_rates[0]
-    biggest_placement_gain = max(player_current_rates, key=lambda x: x[3])
-
-    # Recalculate the best alternative from the already evaluated permutations.
-    sorted_evaluated = sorted(evaluated, key=lambda x: x['team_win_probability'], reverse=True)
-    best = sorted_evaluated[0]
-    second = sorted_evaluated[1] if len(sorted_evaluated) > 1 else None
-    margin = (best['team_win_probability'] - second['team_win_probability']) if second else 0.0
 
     # Most favorable and least favorable expected single game in the chosen order.
     single_game_indices = list(range(4)) + list(range(5, 9)) + list(range(10, 14))
@@ -1811,16 +1909,6 @@ def _explain_recommendation(own_order, scenarios, matchup_p, profiles, names, ev
         f"Die Reihenfolge ist optimal, weil sie die erwarteten Einzelspiel-Duelle über alle "
         f"historisch gewichteten gegnerischen Aufstellungen am besten verteilt."
     )
-    if margin >= 0.005 and second:
-        bullets.append(
-            f"Gegenüber der zweitbesten Reihenfolge bringt sie rund {margin * 100:.1f} Prozentpunkte "
-            f"mehr Mannschafts-Siegwahrscheinlichkeit ({best['team_win_probability'] * 100:.1f} % statt {second['team_win_probability'] * 100:.1f} %)."
-        )
-    elif second:
-        bullets.append(
-            f"Die ersten Aufstellungen liegen sehr eng beieinander: der Abstand zur zweitbesten "
-            f"Reihenfolge beträgt nur {margin * 100:.1f} Prozentpunkte."
-        )
 
     strongest_name = names.get(strongest[0], f'Spieler {strongest[0]}')
     bullets.append(
@@ -1828,12 +1916,11 @@ def _explain_recommendation(own_order, scenarios, matchup_p, profiles, names, ev
         f"Einzelspielchance der vier ({strongest[1] * 100:.1f} %)."
     )
 
-    gain_name = names.get(biggest_placement_gain[0], f'Spieler {biggest_placement_gain[0]}')
-    if biggest_placement_gain[3] >= 0.01:
+    if best_game[1] - worst_game[1] >= 0.03:
         bullets.append(
-            f"Besonders wichtig ist die Positionierung von {gain_name}: seine aktuelle Position "
-            f"ist gegenüber seiner rechnerisch besten anderen Position um {biggest_placement_gain[3] * 100:.1f} "
-            f"Prozentpunkte günstiger als die entsprechende Platzierung in der übrigen Reihenfolge."
+            f"Entscheidend im erwarteten Spielverlauf: Spiel {best_game[0]} mit ca. "
+            f"{best_game[1] * 100:.0f} % Siegchance, Spiel {worst_game[0]} mit ca. "
+            f"{worst_game[1] * 100:.0f} % — die Aufstellung nutzt genau diese Unterschiede."
         )
 
     if weighted_double[0] >= 0.01 or weighted_double[1] >= 0.01:
@@ -1919,14 +2006,11 @@ def _expected_singles_breakdown_for_lineup(
     for game_idx, (own_idx, opp_idx) in enumerate(schedule):
         pid = own_order[own_idx]
         weighted_prob = 0.0
-        opponent_ids = set()
-        most_likely_opponent_id = scenarios[0][1][opp_idx] if scenarios else None
+        opponent_weights = defaultdict(float)
         for scenario_probability, opp_order in scenarios:
             opp_id = opp_order[opp_idx]
-            opponent_ids.add(opp_id)
+            opponent_weights[opp_id] += scenario_probability
             weighted_prob += scenario_probability * matchup_p.get((pid, opp_id), 0.5)
-        # The detail view intentionally uses the same most-likely scenario(s)
-        # as its matchup probabilities, but applies the actual stop rule.
         play_probability = 0.0
         for scenario_probability, opp_order in scenarios:
             singles = [
@@ -1942,13 +2026,29 @@ def _expected_singles_breakdown_for_lineup(
             play_probability += scenario_probability * _game_play_probabilities(game_probs)[
                 SINGLE_GAME_PROBABILITY_INDICES[game_idx]
             ]
-        single_opponent_id = next(iter(opponent_ids)) if len(opponent_ids) == 1 else None
+        opponent_weighted = [
+            {
+                'player_id': oid,
+                'name': names.get(oid, f'Spieler {oid}'),
+                'weight': round(weight, 4),
+            }
+            for oid, weight in sorted(opponent_weights.items(), key=lambda item: -item[1])
+        ]
+        is_mix = len(opponent_weighted) > 1
+        if is_mix:
+            opponent_display = ' · '.join(
+                f"{_player_short_name(entry['name'])} {entry['weight'] * 100:.0f} %"
+                for entry in opponent_weighted[:4]
+            )
+            if len(opponent_weighted) > 4:
+                opponent_display += ' · …'
+        else:
+            opponent_display = opponent_weighted[0]['name'] if opponent_weighted else '—'
         breakdown[pid].append({
             'game_number': SINGLE_GAME_NUMBERS[game_idx],
-            'opponent_player_id': single_opponent_id,
-            'opponent_player_ids': sorted(opponent_ids),
-            'opponent_name': names.get(most_likely_opponent_id, f'Spieler {most_likely_opponent_id}') if most_likely_opponent_id else 'verschiedene Gegner',
-            'opponent_name_is_most_likely_scenario': len(opponent_ids) > 1,
+            'opponent_display': opponent_display,
+            'opponent_scenario_mix': is_mix,
+            'opponent_weighted': opponent_weighted,
             'win_probability': round(weighted_prob, 3),
             'played_probability': round(play_probability, 6),
         })
@@ -1958,6 +2058,26 @@ def _expected_singles_breakdown_for_lineup(
 def _player_short_name(full_name: str) -> str:
     parts = (full_name or '').strip().split()
     return parts[-1] if parts else full_name
+
+
+def _h2h_summaries_for_player(pid, breakdown, matchups, names):
+    seen = set()
+    summaries = []
+    for matchup in breakdown:
+        for entry in matchup.get('opponent_weighted', []):
+            opp_id = entry.get('player_id')
+            if not opp_id or opp_id in seen:
+                continue
+            seen.add(opp_id)
+            wins, games = matchups.get((pid, opp_id), (0, 0))
+            if games:
+                summaries.append({
+                    'opponent_player_id': opp_id,
+                    'opponent_name': names.get(opp_id, f'Spieler {opp_id}'),
+                    'wins': wins,
+                    'losses': games - wins,
+                })
+    return summaries
 
 
 def _build_expected_singles_explanation(
@@ -2067,22 +2187,21 @@ def _build_info_summary(
     own_order = recommendation['own_player_ids']
     expected_singles = {}
     singles_breakdown = {}
-    detail_scenarios = [(1.0, scenarios[0][1])] if scenarios else []
     if matchup_p is not None and own_is_home is not None:
         expected_singles = _expected_singles_wins_for_lineup(
-            own_order, detail_scenarios, matchup_p, own_is_home, own_on_letters,
+            own_order, scenarios, matchup_p, own_is_home, own_on_letters,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
         )
         singles_breakdown = _expected_singles_breakdown_for_lineup(
-            own_order, detail_scenarios, matchup_p, names, own_is_home, own_on_letters,
+            own_order, scenarios, matchup_p, names, own_is_home, own_on_letters,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
         )
     elif matchup_p is not None and own_is_home is None:
         schedule_orientation = True if own_on_letters is None else own_on_letters
         home = _expected_singles_wins_for_lineup(
-            own_order, detail_scenarios, matchup_p, True, schedule_orientation,
+            own_order, scenarios, matchup_p, True, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
         )
@@ -2093,18 +2212,18 @@ def _build_info_summary(
             False,
         )
         away = _expected_singles_wins_for_lineup(
-            own_order, detail_scenarios, away_matchup, False, schedule_orientation,
+            own_order, scenarios, away_matchup, False, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
         )
         expected_singles = {pid: (home[pid] + away[pid]) / 2.0 for pid in own_order}
         home_breakdown = _expected_singles_breakdown_for_lineup(
-            own_order, detail_scenarios, matchup_p, names, True, schedule_orientation,
+            own_order, scenarios, matchup_p, names, True, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
         )
         away_breakdown = _expected_singles_breakdown_for_lineup(
-            own_order, detail_scenarios, away_matchup, names, False, schedule_orientation,
+            own_order, scenarios, away_matchup, names, False, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
         )
@@ -2139,9 +2258,7 @@ def _build_info_summary(
             'expected_singles_wins': exp_rounded,
             'expected_singles_wins_raw': exp_raw,
             'expected_singles_matchups': breakdown,
-            'expected_singles_explanation': _build_expected_singles_explanation(
-                pid, position, breakdown, profile, matchups, names, exp_raw, exp_rounded, own_on_letters,
-            ),
+            'h2h_summaries': _h2h_summaries_for_player(pid, breakdown, matchups, names),
         })
 
     opponent_ids = set()
@@ -2183,6 +2300,7 @@ def _build_info_summary(
                 })
 
     margin_pp = 0.0
+    lineup_spread_pp = (recommendation or {}).get('lineup_spread_pp')
     if len(evaluated) > 1:
         top_ranking = evaluated[0].get('ranking_team_win_probability', evaluated[0]['team_win_probability'])
         second_ranking = evaluated[1].get('ranking_team_win_probability', evaluated[1]['team_win_probability'])
@@ -2207,6 +2325,7 @@ def _build_info_summary(
         'own_players': own_players,
         'opponent_team': opponent_team,
         'top_lineup_margin_pp': margin_pp,
+        'lineup_spread_pp': lineup_spread_pp,
         'h2h_pairs_with_data': len(h2h_pairs),
         'h2h_pairs': sorted(h2h_pairs, key=lambda x: -x['games'])[:8],
         'expected_first_doubles_probability': detail.get('first_doubles_probability'),
@@ -2216,6 +2335,7 @@ def _build_info_summary(
         'opponent_pool_years': OPPONENT_POOL_YEARS,
         'opponent_pool_size': len(opponent_pool),
         'scenario_variants': len(scenarios),
+        'scenario_sharpening_alpha': SCENARIO_SHARPENING_ALPHA,
         'opponent_set_source': source,
         'orientation': orientation_note,
     }
@@ -2253,6 +2373,9 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     if not scenarios:
         phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
         return {'ok': True, 'phase': phase, 'recommendations': [], 'warnings': [f'Keine passende Gegner-Aufstellung für {opponent_team} gefunden.']}
+
+    display_scenarios = scenarios
+    scenarios = _sharpen_scenarios(scenarios)
 
     opp_ids = set()
     for _, order in scenarios:
@@ -2313,6 +2436,25 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             max(0.0, (optimal_ranking - item['ranking_team_win_probability']) * 100),
             2,
         )
+    strength_order = _trivial_strength_own_order(own, profiles)
+    strength_item = next(
+        (item for item in evaluated if item['own_player_ids'] == strength_order),
+        None,
+    )
+    advantage_vs_strength_pp = None
+    if strength_item is not None:
+        advantage_vs_strength_pp = round(
+            max(0.0, (optimal_ranking - strength_item['ranking_team_win_probability']) * 100),
+            2,
+        )
+    recommendation['advantage_vs_strength_lineup_pp'] = advantage_vs_strength_pp
+    recommendation['strength_lineup_player_ids'] = strength_order
+    recommendation['lineup_spread_pp'] = _compute_lineup_configuration_spread_pp(
+        own, scenarios, profiles, matchups, names,
+        use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
+        stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
+        own_on_letters=own_on_letters, own_is_home=own_is_home,
+    )
     # The lineup ranking remains unchanged. For the result card, however,
     # use the same scenario-aggregated 14-game vector shown by the
     # explanation instead of aggregating separately from marginal matchups.
@@ -2330,14 +2472,16 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             display_dist['expected_opponent_wins'],
         )
     opponent_doubles_by_order = {}
+    model_probability_by_order = {tuple(order): probability for probability, order in scenarios}
     opponent_predictions = [
         {
             'player_ids': list(order),
             'players': _players_for_ids(order, names),
             'probability': round(probability, 6),
+            'model_probability': round(model_probability_by_order.get(tuple(order), probability), 6),
             'doubles': _cached_opponent_doubles(order, doubles_stats, profiles, names, opponent_doubles_by_order),
         }
-        for probability, order in scenarios
+        for probability, order in display_scenarios
     ]
     opponent_predictions.sort(key=lambda item: (-item['probability'], item['player_ids']))
     elapsed = time.monotonic() - started
@@ -2400,13 +2544,16 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             'opponent_lineups': (
                 f'historical position orders from last {STATS_YEARS} years with recurrence-adaptive RC '
                 f'strength-lineup prior (strength weight 10–70% based on exact 4-/best 3-player recurrence); '
+                f'scenario sharpening p^α (α={SCENARIO_SHARPENING_ALPHA:.1f}); '
                 f'player pool last {OPPONENT_POOL_YEARS} years'
             ),
+            'scenario_sharpening_alpha': SCENARIO_SHARPENING_ALPHA,
             'player_stats': f'XTTV singles + RC snapshots, last {STATS_YEARS} years',
             'orientation': orientation_note,
         },
         'data_quality': {
             'scenario_variants': len(scenarios),
+        'scenario_sharpening_alpha': SCENARIO_SHARPENING_ALPHA,
             'own_orders_evaluated': 24,
             'reference_date': ref_date.isoformat(),
             'stats_window_years': STATS_YEARS,

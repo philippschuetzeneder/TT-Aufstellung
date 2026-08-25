@@ -73,8 +73,10 @@ body.league-modal-open{overflow:hidden}
 @media (max-width:799px){
   .hero{padding:10px 12px}
   .hero-inner{gap:6px}
-  .hero-title-row{grid-template-columns:minmax(0,1fr) auto auto;gap:8px}
-  .hero-copy h1{font-size:clamp(2rem,9vw,3rem);line-height:.94;letter-spacing:-.055em}
+  .hero-title-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px}
+  .hero-heading{flex:1 1 100%;min-width:0}
+  .hero-copy h1{font-size:clamp(1.55rem,7.8vw,2.2rem);line-height:1.02;letter-spacing:-.045em;overflow-wrap:anywhere}
+  .hero-refresh,.hero-nav{flex:0 0 auto}
   .hero-byline{font-size:.7rem;line-height:1.2}
   .header-league-trigger{font-size:.68rem;padding:8px 10px}
   .header-btn-refresh{padding:4px 8px;font-size:.62rem}

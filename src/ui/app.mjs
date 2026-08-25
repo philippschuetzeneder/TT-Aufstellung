@@ -428,6 +428,34 @@ function explanationBody(explanation) {
   return `<p class="why-headline">${escapeHtml(explanation.headline || 'Die Aufstellung erzielt im Modell die höchste Siegchance.')}</p><ul class="why-list">${(explanation.bullets || []).map((x) => `<li>${escapeHtml(x)}</li>`).join('')}</ul><div class="why-note">Modellbegründung, keine Garantie für den tatsächlichen Spielausgang.</div>`;
 }
 
+function formatInfoPct(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return `${(n * 100).toFixed(0).replace('.', ',')} %`;
+}
+
+function playerInfoCardHtml(p) {
+  const expectedLabel = p.expected_singles_wins != null
+    ? `${p.expected_singles_wins} erwartete Einzel`
+    : '— erwartete Einzel';
+  const rawHint = p.expected_singles_wins_raw != null && p.expected_singles_wins_raw !== p.expected_singles_wins
+    ? ` (Ø ${String(p.expected_singles_wins_raw).replace('.', ',')})`
+    : '';
+  const summaryBits = [];
+  if (p.lineup_position) summaryBits.push(`Pos ${p.lineup_position}`);
+  summaryBits.push(`${expectedLabel}${rawHint}`);
+  const summaryLine = summaryBits.join(' · ');
+
+  const matchupLines = (p.expected_singles_matchups || []).map((m) => {
+    const opp = m.opponent_display || m.opponent_name || '—';
+    return `<li class="info-matchup-row"><span class="info-matchup-game">Sp. ${m.game_number}</span><span class="info-matchup-opp">vs ${escapeHtml(opp)}</span><strong class="info-matchup-win">${formatInfoPct(m.win_probability)} Sieg</strong></li>`;
+  }).join('');
+
+  const matchups = matchupLines ? `<ul class="info-matchup-compact-list">${matchupLines}</ul>` : '';
+
+  return `<div class="info-player-card"><div class="info-player-head"><strong>${escapeHtml(p.player_name)}</strong><span class="info-player-summary">${escapeHtml(summaryLine)}</span></div>${matchups}</div>`;
+}
+
 function infoSummaryHtml(summary) {
   if (!summary) return '<p class="muted">Keine Zusatzinfos verfügbar.</p>';
   const metaRows = [];
@@ -446,29 +474,10 @@ function infoSummaryHtml(summary) {
     metaRows.push(['Abstand zur 2. Aufstellung', `${summary.top_lineup_margin_pp.toFixed(1).replace('.', ',')} PP`]);
   }
   if (summary.h2h_pairs_with_data != null) {
-    metaRows.push(['Direkte Duelle', `${summary.h2h_pairs_with_data} · Datenbasis ${summary.stats_window_years} Jahre`]);
+    metaRows.push(['Direkte Duelle', `Anzahl: ${summary.h2h_pairs_with_data}`]);
   }
-  const opponentBasis = state.selectedOpp.length === 4
-    ? `${state.selectedOpp.length} feste Gegner`
-    : `${summary.opponent_pool_size || 0} mögliche Gegner`;
-  metaRows.push([
-    'Berechnungsgrundlage',
-    `${opponentBasis} · ${summary.scenario_variants || 0} historische Varianten · ${summary.orientation === 'opponent-A-D' ? 'Gegner A–D' : summary.orientation === 'opponent-1-4' ? 'Gegner 1–4' : (summary.orientation || '—')}`,
-  ]);
 
-  const playerCards = (summary.own_players || []).map((p) => {
-    const expectedLabel = p.expected_singles_wins != null
-      ? `${p.expected_singles_wins} erwartete Einzel`
-      : '— erwartete Einzel';
-    const rawHint = p.expected_singles_wins_raw != null && p.expected_singles_wins_raw !== p.expected_singles_wins
-      ? ` <span class="info-expected-raw">(Ø ${String(p.expected_singles_wins_raw).replace('.', ',')})</span>`
-      : '';
-    const explanation = p.expected_singles_explanation
-      ? `<div class="info-player-explanation">${escapeHtml(p.expected_singles_explanation)}</div>`
-      : '';
-
-    return `<div class="info-player-card"><div class="info-player-head"><strong>${escapeHtml(p.player_name)}</strong><div class="info-expected-singles">${escapeHtml(expectedLabel)}${rawHint}</div></div>${explanation}</div>`;
-  }).join('');
+  const playerCards = (summary.own_players || []).map((p) => playerInfoCardHtml(p)).join('');
 
   return `<div class="info-meta-grid">${metaRows.map(([label, value]) => `<div class="info-meta-row"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}</div><div class="info-player-cards">${playerCards}</div>`;
 }
@@ -521,7 +530,7 @@ function resultHtml() {
   const lineupHtml = state.editMode ? `${editableLineupHtml()}${editableDoublesHtml()}` : `<div class="optimal-players">${ownLineup(b.own_player_ids, b.players)}${ownDoublesLineupHtml()}</div>`;
   const comparison = state.editMode && state.result?.optimal_recommendation && state.optimalResult?.recommendation ? `<div class="edit-comparison">Optimal: ${pct(state.optimalResult.recommendation.team_win_probability)} · <span class="edit-deviation">Abweichung zu Optimal: ${((Number(b.team_win_probability) - Number(state.optimalResult.recommendation.team_win_probability)) * 100).toFixed(1).replace('.', ',')} %</span></div><button type="button" class="secondary reset-edit-button" data-action="reset-edit">Zurück zur optimalen Aufstellung</button>` : '';
   const resultClass = state.editMode ? 'fixed' : (state.result?.optimal_recommendation ? 'fixed' : '');
-  return `<div class="optimal-result ${resultClass}"><div class="optimal-label">Empfohlene Eigene Aufstellung</div>${lineupHtml}${resultMetricsHtml(b)}<div class="probability-breakdown"><span>Sieg ${pct(b.team_win_probability)}</span><span>Unentschieden ${pct(b.team_draw_probability)}</span><span>Niederlage ${pct(b.team_loss_probability)}</span></div>${comparison}</div>${!state.editMode ? explanationHtml(state.result.explanation) : ''}${!state.editMode ? collapsible('moreInfo', 'Mehr Info', infoSummaryHtml(summary), rcHint) : ''}${opp ? `<div class="opponent-prediction"><div class="optimal-label">Wahrscheinlichste gegnerische Aufstellung</div><div class="muted small-text">${pct(opp.probability)} Wahrscheinlichkeit</div><div class="optimal-players">${opponentLineup(opp)}</div></div>` : ''}${alternatives}`;
+  return `<div class="optimal-result ${resultClass}"><div class="optimal-label">Empfohlene Eigene Aufstellung</div>${lineupHtml}${resultMetricsHtml(b)}${lineupMetricsHtml(b, state.optimalResult?.recommendation || b)}<div class="probability-breakdown"><span>Unentschieden ${pct(b.team_draw_probability)}</span><span>Niederlage ${pct(b.team_loss_probability)}</span></div>${comparison}</div>${!state.editMode ? explanationHtml(state.result.explanation) : ''}${!state.editMode ? collapsible('moreInfo', 'Mehr Info', infoSummaryHtml(summary), rcHint) : ''}${opp ? `<div class="opponent-prediction"><div class="optimal-label">Wahrscheinlichste gegnerische Aufstellung</div><div class="muted small-text">${pct(opp.probability)} Wahrscheinlichkeit</div><div class="optimal-players">${opponentLineup(opp)}</div></div>` : ''}${alternatives}`;
 }
 
 function pct(v) {
@@ -671,11 +680,33 @@ function bindEditableLineupControls() {
   });
 }
 
+function formatAdvantagePp(pp) {
+  const value = Number(pp);
+  if (!Number.isFinite(value) || value <= 0) return '0,0';
+  return value.toFixed(1).replace('.', ',');
+}
+
+function lineupMetricLine(label, pp) {
+  return `<div class="result-lineup-metric">${escapeHtml(label)}: <strong>${formatAdvantagePp(pp)} %</strong></div>`;
+}
+
+function lineupMetricsHtml(recommendation, spreadRecommendation = recommendation) {
+  const metrics = [];
+  if (recommendation?.advantage_vs_strength_lineup_pp != null) {
+    metrics.push(lineupMetricLine('Vorteil gegenüber trivialer Stärke-Aufstellung', recommendation.advantage_vs_strength_lineup_pp));
+  }
+  if (spreadRecommendation?.lineup_spread_pp != null) {
+    metrics.push(lineupMetricLine('Vorteil gegenüber schlechtester Aufstellung', spreadRecommendation.lineup_spread_pp));
+  }
+  if (!metrics.length) return '';
+  return `<div class="result-lineup-metrics-block"><div class="result-lineup-metrics">${metrics.join('')}</div></div>`;
+}
+
 function resultMetricsHtml(recommendation) {
-  const expectedHtml = recommendation
-    ? `<div class="expected-score">${escapeHtml(scoreText(recommendation))} <span>Erwartetes Ergebnis</span></div>`
+  const expectedBlock = recommendation
+    ? `<div class="expected-score-block"><div class="expected-score">${escapeHtml(scoreText(recommendation))} <span>Erwartetes Ergebnis</span></div></div>`
     : '';
-  return `<div class="result-metrics"><div class="win-probability">${pct(recommendation.team_win_probability)} <span>Mannschafts-Siegwahrscheinlichkeit</span></div>${expectedHtml}</div>`;
+  return `<div class="result-metrics"><div class="win-probability">${pct(recommendation.team_win_probability)} <span>Mannschafts-Siegwahrscheinlichkeit</span></div>${expectedBlock}</div>`;
 }
 
 function bind() {
