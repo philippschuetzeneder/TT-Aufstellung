@@ -2184,7 +2184,9 @@ def _build_info_summary(
 
     margin_pp = 0.0
     if len(evaluated) > 1:
-        margin_pp = round((evaluated[0]['team_win_probability'] - evaluated[1]['team_win_probability']) * 100, 2)
+        top_ranking = evaluated[0].get('ranking_team_win_probability', evaluated[0]['team_win_probability'])
+        second_ranking = evaluated[1].get('ranking_team_win_probability', evaluated[1]['team_win_probability'])
+        margin_pp = round((top_ranking - second_ranking) * 100, 2)
 
     own_sum = round(sum(own_rc_values), 1) if own_rc_values else None
     own_avg = round(sum(own_rc_values) / len(own_rc_values), 1) if own_rc_values else None
