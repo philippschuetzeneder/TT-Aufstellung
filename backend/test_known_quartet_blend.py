@@ -46,3 +46,22 @@ def test_strength_prior_prefers_strongest_on_top():
     rc = {'strong': 2000.0, 'mid': 1600.0, 'mid2': 1550.0, 'weak': 1200.0}
     scenarios = _scenarios_from_strength_prior(players, rc)
     assert scenarios[0][1][0] == 'strong'
+
+
+def test_adaptive_strength_weights_tight_gradient_when_rc_spread_small():
+    from app.analysis_service import _adaptive_strength_position_weights, STRENGTH_POSITION_WEIGHTS_TIGHT
+
+    players = ['a', 'b', 'c', 'd']
+    rc = {'a': 1500.0, 'b': 1510.0, 'c': 1520.0, 'd': 1530.0}
+    weights = _adaptive_strength_position_weights(players, rc)
+    assert weights == STRENGTH_POSITION_WEIGHTS_TIGHT
+
+
+def test_adaptive_strength_weights_emphasize_top_when_clear_leader():
+    from app.analysis_service import _adaptive_strength_position_weights
+
+    players = ['weak', 'mid', 'strong', 'mid2']
+    rc = {'strong': 2000.0, 'mid': 1600.0, 'mid2': 1550.0, 'weak': 1200.0}
+    w_a, w_b, w_c, w_d = _adaptive_strength_position_weights(players, rc)
+    assert w_a > w_d
+    assert w_a > 2.5

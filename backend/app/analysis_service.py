@@ -49,7 +49,11 @@ GLOBAL_STRENGTH_MIN_TOP_RATE = 0.52
 GLOBAL_STRENGTH_MIN_BOTTOM_RATE = 0.50
 STRENGTH_PRIOR_BLEND_WEIGHT = 0.3
 STRENGTH_RC_SCALE = 500.0
-STRENGTH_POSITION_WEIGHTS = (4.0, 3.0, 2.0, 1.0)
+STRENGTH_POSITION_WEIGHTS = (4.0, 3.0, 2.0, 1.0)  # legacy reference; use _adaptive_strength_position_weights
+STRENGTH_RC_SPREAD_FLAT_THRESHOLD = 40.0
+STRENGTH_POSITION_WEIGHT_MIN = 1.0
+STRENGTH_POSITION_WEIGHT_MAX = 4.0
+STRENGTH_POSITION_WEIGHTS_TIGHT = (3.0, 2.66, 2.33, 2.0)  # A/B/C/D when RC spread < threshold
 COHESIVE_QUARTET_MIN_MATCHES = 5
 COHESIVE_TRIO_MIN_MATCHES = 6
 COHESIVE_QUARTET_MIN_RECENCY_MASS = 3.0
@@ -85,7 +89,7 @@ HOME_AWAY_MIN_GAMES = 8
 HOME_AWAY_MIN_OVERALL_GAMES = 12
 HOME_AWAY_COMPONENT_SCALE = 0.32
 H2H_MAX_WEIGHT = 0.85
-MODEL_VERSION = 'rc-h2h-homeaway-v30-scenario-sharpening'
+MODEL_VERSION = 'rc-h2h-homeaway-v32-rc-adaptive-moderate-cohesion5'
 
 # Home index 0=A..3=D; away index 0=1..3=4 on the guest row.
 SINGLES_SCHEDULE = (
@@ -1149,12 +1153,37 @@ def _measure_strength_lineup_support(db, player_ids, ref_date=None):
     return support, top_rate, bottom_rate, total
 
 
+def _adaptive_strength_position_weights(player_ids, rc_by_player):
+    """Derive A/B/C/D slot weights from RC gaps within the quartet.
+
+    Tight RC spread uses a narrow fixed gradient (never equal weights). Larger
+    gaps at the top (clear #1) raise A; larger gaps at the bottom lower D.
+    """
+    rc_values = sorted(
+        float(rc_by_player.get(str(pid), DEFAULT_RC_RATING)) for pid in player_ids
+    )
+    spread = rc_values[-1] - rc_values[0]
+    if spread < STRENGTH_RC_SPREAD_FLAT_THRESHOLD:
+        return STRENGTH_POSITION_WEIGHTS_TIGHT
+    gaps = [rc_values[i + 1] - rc_values[i] for i in range(3)]
+    total_gap = sum(gaps) or 1.0
+    normalized = [gap / total_gap for gap in gaps]
+    w_min = STRENGTH_POSITION_WEIGHT_MIN
+    w_span = STRENGTH_POSITION_WEIGHT_MAX - STRENGTH_POSITION_WEIGHT_MIN
+    w_a = w_min + w_span * (0.25 + 0.75 * normalized[2])
+    w_d = w_min + w_span * (0.25 + 0.75 * normalized[0])
+    w_b = w_min + w_span * (0.25 + 0.75 * (normalized[1] + normalized[2]) / 2.0)
+    w_c = w_min + w_span * (0.25 + 0.75 * (normalized[0] + normalized[1]) / 2.0)
+    return (w_a, w_b, w_c, w_d)
+
+
 def _scenarios_from_strength_prior(player_ids, rc_by_player):
     players = [str(x) for x in player_ids]
+    position_weights = _adaptive_strength_position_weights(players, rc_by_player)
     weighted = []
     for order in permutations(players):
         score = sum(
-            STRENGTH_POSITION_WEIGHTS[pos] * float(rc_by_player.get(pid, DEFAULT_RC_RATING))
+            position_weights[pos] * float(rc_by_player.get(pid, DEFAULT_RC_RATING))
             for pos, pid in enumerate(order)
         )
         weighted.append((math.exp(score / STRENGTH_RC_SCALE), tuple(order)))
