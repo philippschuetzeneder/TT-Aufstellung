@@ -1,12 +1,11 @@
-.hero{min-height:auto;padding:12px 14px}
-.hero-inner{align-items:stretch;flex-direction:column;gap:8px}
-.hero-title-row{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:6px;width:100%}
+.hero{min-height:auto;padding:8px 12px}
+.hero-inner{align-items:stretch;flex-direction:column;gap:6px}
+.hero-title-row{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;width:100%}
 .hero-copy{flex-basis:auto;width:100%}
-.hero-heading{min-width:0}
-.hero-copy h1{margin:0;font-size:clamp(1.5rem,5.2vw,4rem);line-height:1;letter-spacing:-.04em;justify-self:start;grid-column:1}
-.hero-byline{margin:4px 0 0;color:rgba(255,255,255,.78);font-size:.78rem;font-weight:700;letter-spacing:.02em}
-.hero-refresh{grid-column:2;justify-self:center}
-.hero-nav{grid-column:3;justify-self:end}
+.hero-heading{min-width:0;flex:1 1 100%}
+.hero-copy h1{margin:0;font-size:1.35rem;line-height:1.05;letter-spacing:-.04em}
+.hero-byline{margin:2px 0 0;color:rgba(255,255,255,.72);font-size:.66rem;font-weight:700;letter-spacing:.02em}
+.hero-refresh,.hero-nav{flex:0 0 auto}
 .hero-controls{align-items:stretch;width:100%}
 .hero-controls-league{flex:1 1 auto;margin-left:0}
 .header-league{margin:0;width:100%;min-width:0;display:grid;gap:6px}
@@ -71,13 +70,10 @@ body.league-modal-open{overflow:hidden}
 .refresh-back-btn:hover{background:#1a3048}
 
 @media (max-width:799px){
-  .hero{padding:10px 12px}
-  .hero-inner{gap:6px}
-  .hero-title-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px}
-  .hero-heading{flex:1 1 100%;min-width:0}
-  .hero-copy h1{font-size:clamp(1.55rem,7.8vw,2.2rem);line-height:1.02;letter-spacing:-.045em;overflow-wrap:anywhere}
-  .hero-refresh,.hero-nav{flex:0 0 auto}
-  .hero-byline{font-size:.7rem;line-height:1.2}
+  .hero{padding:8px 10px}
+  .hero-inner{gap:5px}
+  .hero-copy h1{font-size:1.28rem}
+  .hero-byline{font-size:.64rem}
   .header-league-trigger{font-size:.68rem;padding:8px 10px}
   .header-btn-refresh{padding:4px 8px;font-size:.62rem}
   .header-league-modal{align-items:stretch;padding:0}
@@ -89,10 +85,11 @@ body.league-modal-open{overflow:hidden}
 }
 
 @media (min-width:800px){
-  .hero-inner{flex-direction:row;align-items:center;gap:14px}
-  .hero-copy{flex:1 1 340px}
-  .hero-copy h1{font-size:clamp(2.5rem,4.5vw,3.6rem)}
-  .hero-byline{font-size:.8rem}
+  .hero{padding:10px 16px}
+  .hero-inner{flex-direction:row;align-items:center;gap:12px}
+  .hero-copy{flex:1 1 280px}
+  .hero-copy h1{font-size:1.75rem}
+  .hero-byline{font-size:.72rem}
   .hero-controls-league{flex:1 1 320px;max-width:520px}
   .header-league-select-native{display:block}
   .header-league-trigger{display:none}

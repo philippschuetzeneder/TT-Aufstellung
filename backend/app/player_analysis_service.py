@@ -149,13 +149,19 @@ def list_teams(league: str | None = None):
                 return {"ok": True, "league": league, "season": None, "teams": [], "count": 0}
             rows = session.execute(
                 text("""
-                    SELECT team_name, COUNT(DISTINCT match_id) AS match_count
+                    SELECT team_name,
+                           COUNT(DISTINCT external_player_id) AS player_count,
+                           COUNT(DISTINCT match_id) AS match_count
                     FROM (
-                        SELECT home_team AS team_name, id AS match_id
-                        FROM xttv_matches WHERE league = :league AND home_team IS NOT NULL
+                        SELECT m.home_team AS team_name, mp.external_player_id, m.id AS match_id
+                        FROM xttv_matches m
+                        JOIN match_players mp ON mp.match_id = m.id AND mp.side = 'home'
+                        WHERE m.league = :league AND m.home_team IS NOT NULL AND mp.external_player_id IS NOT NULL
                         UNION ALL
-                        SELECT away_team AS team_name, id AS match_id
-                        FROM xttv_matches WHERE league = :league AND away_team IS NOT NULL
+                        SELECT m.away_team, mp.external_player_id, m.id
+                        FROM xttv_matches m
+                        JOIN match_players mp ON mp.match_id = m.id AND mp.side = 'away'
+                        WHERE m.league = :league AND m.away_team IS NOT NULL AND mp.external_player_id IS NOT NULL
                     ) t
                     GROUP BY team_name
                     ORDER BY team_name
@@ -163,7 +169,12 @@ def list_teams(league: str | None = None):
                 {"league": resolved},
             ).mappings()
             teams = [
-                {"id": row["team_name"], "name": row["team_name"], "player_count": int(row["match_count"])}
+                {
+                    "id": row["team_name"],
+                    "name": row["team_name"],
+                    "player_count": int(row["player_count"]),
+                    "match_count": int(row["match_count"]),
+                }
                 for row in rows
             ]
             return {
@@ -269,7 +280,8 @@ def list_players(team_name, league: str | None = None):
         "players": players,
     }
 
-def analyze(own_ids,opponent_team,actual_opponent_ids=None,limit=25):
+def analyze(own_ids, opponent_team, actual_opponent_ids=None, limit=25):
+    """Deprecated legacy analyzer; production uses analysis_service.analyze_lineup."""
     own=[str(x) for x in own_ids]
     if len(own)!=4 or len(set(own))!=4: raise ValueError("exactly four different own_player_ids are required")
     if not opponent_team: raise ValueError("opponent_team is required")

@@ -128,3 +128,6 @@ class MatchGame(Base):
     sets: Mapped[str | None] = mapped_column(Text)
     raw_row: Mapped[str | None] = mapped_column(Text)
     match: Mapped[XttvMatch] = relationship(back_populates="games")
+    __table_args__ = (
+        UniqueConstraint("match_id", "sequence", name="uq_match_game_sequence"),
+    )

@@ -2,8 +2,6 @@ from app.analysis_service import (
     _apply_strength_prior_to_scenarios,
     _measure_global_strength_lineup_support,
     _reference_date,
-    _strength_prior_blend_weight,
-    STRENGTH_PRIOR_BLEND_WEIGHT,
     _lineup_recency_weight,
 )
 from app.db import SessionLocal
@@ -15,15 +13,6 @@ def test_global_strength_lineup_is_frequent_in_database():
     assert total >= 100
     assert top_rate >= 0.52
     assert bottom_rate >= 0.50
-
-
-def test_strength_prior_uses_fixed_blend_weight():
-    blend_weight, support, top_rate, bottom_rate, total = _strength_prior_blend_weight()
-    assert blend_weight == STRENGTH_PRIOR_BLEND_WEIGHT
-    assert support is None
-    assert top_rate is None
-    assert bottom_rate is None
-    assert total is None
 
 
 def test_apply_strength_prior_uses_recurrence_adaptive_weight():

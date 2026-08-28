@@ -54,6 +54,10 @@ def create_all() -> None:
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_match_players_external_id ON match_players (external_player_id)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_match_players_match_side_position ON match_players (match_id, side, position)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_match_games_match_id ON match_games (match_id)"))
+            connection.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_match_game_sequence "
+                "ON match_games (match_id, sequence) WHERE sequence IS NOT NULL"
+            ))
 
 
 def database_health() -> dict:

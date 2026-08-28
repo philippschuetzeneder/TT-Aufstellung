@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from .analysis_cache import refresh_analysis_cache
+from .analysis_service import clear_analysis_runtime_caches
 from .db import SessionLocal, create_all
 from .models import XttvPlayer
 from .rc_import import import_rc_player
@@ -84,6 +85,7 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
 
         data_changed = bool(new_meids) or rc_history.get("imported", 0) > 0 or rc_mapped > 0
         if data_changed:
+            clear_analysis_runtime_caches()
             cache = refresh_analysis_cache()
             summary["analysis_cache"] = {"ok": cache.get("ok", True)}
         else:

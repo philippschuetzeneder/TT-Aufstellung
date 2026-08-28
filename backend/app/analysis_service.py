@@ -47,7 +47,6 @@ POSITION_PRIOR_SMOOTHING = 0.35
 GLOBAL_STRENGTH_MIN_SAMPLE = 100
 GLOBAL_STRENGTH_MIN_TOP_RATE = 0.52
 GLOBAL_STRENGTH_MIN_BOTTOM_RATE = 0.50
-STRENGTH_PRIOR_BLEND_WEIGHT = 0.3
 STRENGTH_RC_SCALE = 500.0
 STRENGTH_POSITION_WEIGHTS = (4.0, 3.0, 2.0, 1.0)  # legacy reference; use _adaptive_strength_position_weights
 STRENGTH_RC_SPREAD_FLAT_THRESHOLD = 40.0
@@ -61,7 +60,13 @@ COHESIVE_TRIO_MIN_RECENCY_MASS = 3.5
 MEDIUM_GROUP_MIN_MATCHES = 4
 _global_strength_support_cache: dict[str, tuple[float, float, float, int]] = {}
 _lineup_cohesion_cache: dict[tuple[str, str], tuple[int, float, int, float]] = {}
-DEFAULT_RC_RATING = 1500.0
+
+
+def clear_analysis_runtime_caches() -> None:
+    """Drop in-process caches after DB imports."""
+    _lineup_cohesion_cache.clear()
+    _global_strength_support_cache.clear()
+DEFAULT_RC_RATING = 1200.0
 TREND_MIN_RC = -100.0
 TREND_MAX_RC = 100.0
 TREND_WINDOW_DAYS = 365.25
@@ -89,7 +94,20 @@ HOME_AWAY_MIN_GAMES = 8
 HOME_AWAY_MIN_OVERALL_GAMES = 12
 HOME_AWAY_COMPONENT_SCALE = 0.32
 H2H_MAX_WEIGHT = 0.85
-MODEL_VERSION = 'rc-h2h-homeaway-v32-rc-adaptive-moderate-cohesion5'
+MODEL_VERSION = 'rc-h2h-homeaway-v34-infra'
+
+# Safe XTTV date parsing — invalid or missing dates become NULL instead of aborting SQL.
+_SQL_MATCH_DAY = (
+    "CASE WHEN m.match_date ~ '^\\d{2}\\.\\d{2}\\.\\d{4}' "
+    "THEN to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') "
+    "ELSE NULL END"
+)
+_SQL_MATCH_DAY_COL = (
+    "CASE WHEN match_date ~ '^\\d{2}\\.\\d{2}\\.\\d{4}' "
+    "THEN to_date(substring(match_date from 1 for 10), 'DD.MM.YYYY') "
+    "ELSE NULL END"
+)
+_MATCH_DAY_FILTER = f"{_SQL_MATCH_DAY} IS NOT NULL AND {_SQL_MATCH_DAY} >= :cutoff"
 
 # Home index 0=A..3=D; away index 0=1..3=4 on the guest row.
 SINGLES_SCHEDULE = (
@@ -111,13 +129,151 @@ def _parse_match_date(value):
 
 
 def _reference_date(db):
-    row = db.execute(text("""
-        SELECT max(to_date(substring(match_date from 1 for 10), 'DD.MM.YYYY')) AS latest
-        FROM xttv_matches
-        WHERE match_date IS NOT NULL
-    """)).mappings().first()
-    latest = row['latest'] if row else None
-    return latest or date.today()
+    try:
+        row = db.execute(text(f"""
+            SELECT max({_SQL_MATCH_DAY_COL}) AS latest
+            FROM xttv_matches
+            WHERE match_date IS NOT NULL
+              AND match_date ~ '^\\d{{2}}\\.\\d{{2}}\\.\\d{{4}}'
+        """)).mappings().first()
+        latest = row['latest'] if row else None
+        return latest or date.today()
+    except Exception:
+        return date.today()
+
+
+def _clamp_probability(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return max(0.0, min(1.0, number))
+
+
+def _extend_opponent_pool(pool, *player_groups):
+    extended = {str(x) for x in pool}
+    for group in player_groups:
+        if group:
+            extended.update(str(x) for x in group)
+    return extended
+
+
+def _uniform_lineup_scenarios(player_ids):
+    players = [str(x) for x in player_ids]
+    if len(players) != 4 or len(set(players)) != 4:
+        return []
+    uniform = 1.0 / 24.0
+    return [(uniform, tuple(order)) for order in permutations(players)]
+
+
+def _team_average_rc(rc_by_player, player_ids, exclude_pid=None):
+    """Average RC of teammates with known ratings; DEFAULT_RC_RATING if none."""
+    exclude = {str(exclude_pid)} if exclude_pid is not None else set()
+    values = []
+    for pid in player_ids:
+        pid = str(pid)
+        if pid in exclude:
+            continue
+        raw = rc_by_player.get(pid)
+        if raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(val):
+            values.append(val)
+    if not values:
+        return DEFAULT_RC_RATING
+    return sum(values) / len(values)
+
+
+def _resolve_rc_rating(pid, rc_by_player, player_ids):
+    """Use player RC when known; otherwise the average RC of the remaining group."""
+    pid = str(pid)
+    raw = rc_by_player.get(pid)
+    if raw is not None:
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            val = None
+        else:
+            if math.isfinite(val):
+                return val
+    return _team_average_rc(rc_by_player, player_ids, exclude_pid=pid)
+
+
+def _pick_quartet_from_pool(db, pool, ref_date=None, prefer=None):
+    """Pick four distinct opponent ids, preferring known players then RC strength."""
+    del ref_date
+    prefer = [str(x) for x in (prefer or [])]
+    pool = {str(x) for x in pool}
+    chosen = []
+    for pid in prefer:
+        if pid not in chosen:
+            chosen.append(pid)
+    if len(chosen) > 4:
+        chosen = chosen[:4]
+    if len(chosen) == 4:
+        return chosen
+    remaining = 4 - len(chosen)
+    candidates = sorted(pool - set(chosen))
+    if len(candidates) < remaining:
+        return None
+    if not candidates:
+        return chosen if len(chosen) == 4 else None
+    rc_map = _load_latest_rc_map(db, candidates)
+    team_context = chosen + candidates
+    ranked = sorted(
+        candidates,
+        key=lambda pid: _resolve_rc_rating(pid, rc_map, team_context),
+        reverse=True,
+    )
+    return chosen + ranked[:remaining]
+
+
+def _scenarios_from_strength_prior_lineup(db, player_ids):
+    players = [str(x) for x in player_ids]
+    if len(players) != 4 or len(set(players)) != 4:
+        return []
+    rc_map = _load_latest_rc_map(db, players)
+    return _scenarios_from_strength_prior(players, rc_map)
+
+
+def _build_fallback_opponent_scenarios(db, opponent_pool, ref_date, actual=None):
+    """Last-resort scenarios when history is missing or was filtered away."""
+    warnings = []
+    prefer = [str(x) for x in (actual or [])]
+    quartet = None
+    if actual and len(actual) == 4 and len(set(actual)) == 4:
+        quartet = [str(x) for x in actual]
+    else:
+        quartet = _pick_quartet_from_pool(db, opponent_pool, ref_date, prefer=prefer)
+    if not quartet:
+        pool_size = len(opponent_pool)
+        if pool_size < 4:
+            warnings.append(
+                f'Nur {pool_size} Spieler im Gegner-Kader gefunden (mindestens 4 nötig). '
+                'Prüfe Teamname und importierte XTTV-Daten.',
+            )
+        else:
+            warnings.append('Kein vollständiges Gegner-Quartett aus dem Kader ableitbar.')
+        return [], 'fallback-unavailable', warnings
+
+    strength_scenarios = _scenarios_from_strength_prior_lineup(db, quartet)
+    if strength_scenarios:
+        warnings.append(
+            'Keine verwertbare Aufstellungshistorie — Schätzung basiert auf RC-Stärke-Prior.',
+        )
+        return strength_scenarios, 'strength-prior-fallback', warnings
+
+    uniform = _uniform_lineup_scenarios(quartet)
+    warnings.append(
+        'Keine Historie und keine RC-Daten — alle 24 Aufstellungen gleich wahrscheinlich.',
+    )
+    return uniform, 'all-24-uniform-fallback', warnings
 
 
 def _cutoff(ref, years):
@@ -487,7 +643,7 @@ def _matchup_probability(a, b, profiles, matchups, own_is_home=True, use_spielty
         return base
     direct = (wins + 1.5) / (games + 3.0)
     weight = min(H2H_MAX_WEIGHT, 0.35 + games / 6.0)
-    return (1.0 - weight) * base + weight * direct
+    return _clamp_probability((1.0 - weight) * base + weight * direct)
 
 
 def _pair_combined_strength(p1, p2, profiles):
@@ -857,12 +1013,12 @@ def _position_index(position):
 
 def _load_opponent_pool(db, team, ref_date):
     cutoff = _cutoff(ref_date, OPPONENT_POOL_YEARS)
-    rows = db.execute(text("""
+    rows = db.execute(text(f"""
         SELECT DISTINCT mp.external_player_id::text AS player_id
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id = m.id
         WHERE mp.external_player_id IS NOT NULL
-          AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+          AND {_MATCH_DAY_FILTER}
           AND ((m.home_team = :team AND mp.side = 'home') OR (m.away_team = :team AND mp.side = 'away'))
     """), {'team': team, 'cutoff': cutoff}).scalars().all()
     return {str(pid) for pid in rows}
@@ -872,14 +1028,14 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None, ref_date=None, oppon
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
     opponent_pool = opponent_pool or _load_opponent_pool(db, team, ref_date)
-    rows = db.execute(text("""
+    rows = db.execute(text(f"""
         SELECT m.id AS match_id, m.match_date, mp.external_player_id AS player_id,
                mp.name AS player_name, mp.position
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id=m.id
         WHERE ((m.home_team=:team AND mp.side='home') OR (m.away_team=:team AND mp.side='away'))
           AND mp.external_player_id IS NOT NULL
-          AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+          AND {_MATCH_DAY_FILTER}
         ORDER BY m.match_date DESC NULLS LAST, m.id DESC
     """), {'team': team, 'cutoff': stats_cutoff}).mappings()
     matches = defaultdict(list)
@@ -944,7 +1100,7 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
         WHERE mp.external_player_id IS NOT NULL
           AND mp.external_player_id::text IN ({placeholders})
           {team_clause}
-          AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+          AND {_MATCH_DAY_FILTER}
         ORDER BY m.match_date DESC NULLS LAST, m.id DESC
     """), params).mappings()
     matches = defaultdict(list)
@@ -982,7 +1138,7 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
 
 
 def _load_player_position_priors(db, player_ids, ref_date=None, team=None):
-    """Smoothed per-player singles position rates (team-scoped or cross-team)."""
+    """Recency-weighted, smoothed per-player singles position rates (team-scoped or cross-team)."""
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
     ids = [str(x) for x in player_ids]
@@ -997,20 +1153,20 @@ def _load_player_position_priors(db, player_ids, ref_date=None, team=None):
         )
         params['team'] = team
     rows = db.execute(text(f"""
-        SELECT mp.external_player_id::text AS player_id, mp.position
+        SELECT mp.external_player_id::text AS player_id, mp.position, m.match_date
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id = m.id
         WHERE mp.external_player_id IS NOT NULL
           AND mp.external_player_id::text IN ({placeholders})
           {team_clause}
-          AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+          AND {_MATCH_DAY_FILTER}
     """), params).mappings()
     counts = {pid: [0.0, 0.0, 0.0, 0.0] for pid in ids}
     for row in rows:
         pid = str(row['player_id'])
         idx = _position_index(row['position'])
         if pid in counts and idx is not None:
-            counts[pid][idx] += 1.0
+            counts[pid][idx] += _lineup_recency_weight(row.get('match_date'), ref_date)
     alpha = POSITION_PRIOR_SMOOTHING
     priors = {}
     for pid in ids:
@@ -1028,13 +1184,13 @@ def _measure_global_strength_lineup_support(db, ref_date=None):
     cached = _global_strength_support_cache.get(cache_key)
     if cached is not None:
         return cached
-    rows = db.execute(text("""
+    rows = db.execute(text(f"""
         WITH side_players AS (
             SELECT m.id AS match_id, mp.side, mp.external_player_id::text AS player_id, mp.position
             FROM xttv_matches m
             JOIN match_players mp ON mp.match_id = m.id
             WHERE mp.external_player_id IS NOT NULL
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
         ),
         fours AS (
             SELECT match_id, side
@@ -1063,7 +1219,7 @@ def _measure_global_strength_lineup_support(db, ref_date=None):
         if len(slots) != 4:
             continue
         order = [slots[i] for i in range(4)]
-        rc_vals = [float(rc_map.get(pid) or DEFAULT_RC_RATING) for pid in order]
+        rc_vals = [_resolve_rc_rating(pid, rc_map, order) for pid in order]
         strongest_idx = max(range(4), key=lambda i: rc_vals[i])
         weakest_idx = min(range(4), key=lambda i: rc_vals[i])
         if strongest_idx == 0:
@@ -1080,16 +1236,6 @@ def _measure_global_strength_lineup_support(db, ref_date=None):
         result = (support, top_rate, bottom_rate, total)
     _global_strength_support_cache[cache_key] = result
     return result
-
-
-def _strength_prior_blend_weight(db=None, ref_date=None):
-    """Return the fixed RC strength-prior weight.
-
-    The global evidence check was completed once and is intentionally not
-    repeated during analyses or server starts.
-    """
-    del db, ref_date
-    return STRENGTH_PRIOR_BLEND_WEIGHT, None, None, None, None
 
 
 def _source_includes_strength_prior(source: str | None) -> bool:
@@ -1111,7 +1257,7 @@ def _measure_strength_lineup_support(db, player_ids, ref_date=None):
             JOIN match_players mp ON mp.match_id = m.id
             WHERE mp.external_player_id IS NOT NULL
               AND mp.external_player_id::text IN ({placeholders})
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
         ),
         fours AS (
             SELECT match_id, side
@@ -1137,7 +1283,7 @@ def _measure_strength_lineup_support(db, player_ids, ref_date=None):
         if len(slots) != 4:
             continue
         order = [slots[i] for i in range(4)]
-        rc_vals = [float(rc_map.get(pid) or DEFAULT_RC_RATING) for pid in order]
+        rc_vals = [_resolve_rc_rating(pid, rc_map, order) for pid in order]
         strongest_idx = max(range(4), key=lambda i: rc_vals[i])
         weakest_idx = min(range(4), key=lambda i: rc_vals[i])
         if strongest_idx == 0:
@@ -1160,7 +1306,7 @@ def _adaptive_strength_position_weights(player_ids, rc_by_player):
     gaps at the top (clear #1) raise A; larger gaps at the bottom lower D.
     """
     rc_values = sorted(
-        float(rc_by_player.get(str(pid), DEFAULT_RC_RATING)) for pid in player_ids
+        _resolve_rc_rating(pid, rc_by_player, player_ids) for pid in player_ids
     )
     spread = rc_values[-1] - rc_values[0]
     if spread < STRENGTH_RC_SPREAD_FLAT_THRESHOLD:
@@ -1183,7 +1329,7 @@ def _scenarios_from_strength_prior(player_ids, rc_by_player):
     weighted = []
     for order in permutations(players):
         score = sum(
-            position_weights[pos] * float(rc_by_player.get(pid, DEFAULT_RC_RATING))
+            position_weights[pos] * _resolve_rc_rating(pid, rc_by_player, players)
             for pos, pid in enumerate(order)
         )
         weighted.append((math.exp(score / STRENGTH_RC_SCALE), tuple(order)))
@@ -1222,12 +1368,12 @@ def _lineup_cohesion(db, player_ids, ref_date=None):
     cached = _lineup_cohesion_cache.get(cache_key)
     if cached is not None:
         return cached
-    rows = db.execute(text("""
+    rows = db.execute(text(f"""
         SELECT m.id AS match_id, m.match_date, mp.side, mp.external_player_id::text AS player_id
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id = m.id
         WHERE mp.external_player_id IS NOT NULL
-          AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+          AND {_MATCH_DAY_FILTER}
     """), {'cutoff': _cutoff(ref_date, STATS_YEARS)}).mappings()
     exact = 0
     exact_mass = 0.0
@@ -1403,11 +1549,16 @@ def _build_known_four_opponent_scenarios(db, opponent_team, player_ids, ref_date
 def _build_partial_opponent_scenarios(db, team, known_ids, opponent_pool, ref_date):
     known = {str(x) for x in known_ids}
     remaining = 4 - len(known)
-    candidates = sorted(opponent_pool - known)
-    if remaining < 0 or len(candidates) < remaining:
-        return [], {}
-
     names = {}
+    if remaining < 0:
+        return [], names
+    candidates = sorted(opponent_pool - known)
+    if len(candidates) < remaining:
+        quartet = _pick_quartet_from_pool(db, opponent_pool | known, ref_date, prefer=list(known))
+        if quartet:
+            scenarios = _scenarios_from_strength_prior_lineup(db, quartet)
+            return scenarios, names
+        return [], names
     weighted = Counter()
     combos = list(combinations(candidates, remaining))
     if not combos:
@@ -1440,7 +1591,7 @@ def _load_player_profiles(db, ids, ref_date):
         return {}, {}, {}
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
     params = {'ids': ids, 'cutoff': stats_cutoff}
-    stats_stmt = text("""
+    stats_stmt = text(f"""
         WITH games AS (
             SELECT hp.external_player_id::text AS player_id,
                    hp.name AS player_name,
@@ -1451,7 +1602,7 @@ def _load_player_profiles(db, ids, ref_date):
             JOIN xttv_matches m ON m.id = g.match_id
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
               AND hp.external_player_id::text IN :ids
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
             UNION ALL
             SELECT ap.external_player_id::text, ap.name, 'away',
                    CASE WHEN split_part(trim(g.result),':',2)::int > split_part(trim(g.result),':',1)::int THEN 1 ELSE 0 END
@@ -1460,7 +1611,7 @@ def _load_player_profiles(db, ids, ref_date):
             JOIN xttv_matches m ON m.id = g.match_id
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
               AND ap.external_player_id::text IN :ids
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
         )
         SELECT player_id,
                max(player_name) AS player_name,
@@ -1540,10 +1691,10 @@ def _load_player_profiles(db, ids, ref_date):
     ).mappings():
         trend_rows[str(r['player_id'])].append({'observed_at': r['observed_at'], 'rc_rating': r['rc_rating']})
 
-    recent_singles_stmt = text("""
+    recent_singles_stmt = text(f"""
         WITH all_singles AS (
             SELECT hp.external_player_id::text AS player_id,
-                   to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') AS match_day,
+                   {_SQL_MATCH_DAY} AS match_day,
                    split_part(trim(g.result),':',1)::int AS own_score,
                    split_part(trim(g.result),':',2)::int AS opp_score
             FROM match_games g
@@ -1551,10 +1702,10 @@ def _load_player_profiles(db, ids, ref_date):
             JOIN xttv_matches m ON m.id = g.match_id
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
               AND hp.external_player_id::text IN :ids
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
             UNION ALL
             SELECT ap.external_player_id::text,
-                   to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY'),
+                   {_SQL_MATCH_DAY},
                    split_part(trim(g.result),':',2)::int,
                    split_part(trim(g.result),':',1)::int
             FROM match_games g
@@ -1562,7 +1713,7 @@ def _load_player_profiles(db, ids, ref_date):
             JOIN xttv_matches m ON m.id = g.match_id
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
               AND ap.external_player_id::text IN :ids
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
         ),
         ranked AS (
             SELECT player_id, own_score, opp_score, match_day,
@@ -1602,7 +1753,7 @@ def _load_player_profiles(db, ids, ref_date):
         profiles[pid]['rc_trend_momentum'] = net_change
         profiles[pid]['trend_component'] = component
 
-    h2h_stmt = text("""
+    h2h_stmt = text(f"""
         WITH base AS (
             SELECT hp.external_player_id::text AS home_id, ap.external_player_id::text AS away_id,
                    CASE WHEN split_part(trim(g.result),':',1)::int > split_part(trim(g.result),':',2)::int THEN 1 ELSE 0 END AS home_win
@@ -1612,7 +1763,7 @@ def _load_player_profiles(db, ids, ref_date):
             JOIN xttv_matches m ON m.id = g.match_id
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
               AND hp.external_player_id::text IN :ids AND ap.external_player_id::text IN :ids
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
         )
         SELECT player_id, opponent_id, sum(win) AS wins, count(*) AS games
         FROM (
@@ -1680,7 +1831,7 @@ def _augment_profiles_spieltyp(db, ids, profiles, ref_date):
         profiles.setdefault(pid, _empty_profile())
         profiles[pid]['spieltyp'] = r['spieltyp']
 
-    style_stmt = text("""
+    style_stmt = text(f"""
         WITH base AS (
             SELECT hp.external_player_id::text AS player_id,
                    xp_opp.spieltyp AS opp_style,
@@ -1693,7 +1844,7 @@ def _augment_profiles_spieltyp(db, ids, profiles, ref_date):
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
               AND hp.external_player_id::text IN :ids
               AND xp_opp.spieltyp IS NOT NULL
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
             UNION ALL
             SELECT ap.external_player_id::text,
                    xp_opp.spieltyp,
@@ -1706,7 +1857,7 @@ def _augment_profiles_spieltyp(db, ids, profiles, ref_date):
             WHERE g.game_type='singles' AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
               AND ap.external_player_id::text IN :ids
               AND xp_opp.spieltyp IS NOT NULL
-              AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff
+              AND {_MATCH_DAY_FILTER}
         )
         SELECT player_id, opp_style, sum(win) AS wins, count(*) AS games
         FROM base
@@ -1723,10 +1874,12 @@ def _augment_profiles_spieltyp(db, ids, profiles, ref_date):
         profile['style_component'] = 0.0
 
 
-def _filter_scenarios(scenarios, opponent_pool):
+def _filter_scenarios(scenarios, opponent_pool, allow_outside=None):
+    allow_outside = {str(x) for x in (allow_outside or [])}
+    effective_pool = {str(x) for x in opponent_pool} | allow_outside
     filtered = []
     for probability, order in scenarios:
-        if set(order).issubset(opponent_pool):
+        if set(order).issubset(effective_pool):
             filtered.append((probability, order))
     if not filtered:
         return []
@@ -1734,6 +1887,16 @@ def _filter_scenarios(scenarios, opponent_pool):
     if total <= 0:
         return filtered
     return [(probability / total, order) for probability, order in filtered]
+
+
+def _apply_opponent_fallback(db, scenarios, source, opponent_pool, ref_date, actual, warnings):
+    if scenarios:
+        return scenarios, source, warnings
+    fallback_scenarios, fallback_source, fallback_warnings = _build_fallback_opponent_scenarios(
+        db, opponent_pool, ref_date, actual=actual,
+    )
+    warnings.extend(fallback_warnings)
+    return fallback_scenarios, fallback_source, warnings
 
 
 def _sharpen_scenarios(scenarios, alpha=SCENARIO_SHARPENING_ALPHA):
@@ -1751,11 +1914,14 @@ def _sharpen_scenarios(scenarios, alpha=SCENARIO_SHARPENING_ALPHA):
 
 def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
     db = SessionLocal()
+    warnings = []
     try:
-        db.execute(text("SET statement_timeout = '5000ms'")); db.execute(text("SET lock_timeout = '500ms'"))
+        db.execute(text("SET statement_timeout = '15000ms'")); db.execute(text("SET lock_timeout = '500ms'"))
         own = [str(x) for x in own]; actual = None if actual is None else [str(x) for x in actual]
         ref_date = _reference_date(db)
         opponent_pool = _load_opponent_pool(db, opponent_team, ref_date)
+        if actual:
+            opponent_pool = _extend_opponent_pool(opponent_pool, actual)
         fallback_names = {}
         if actual is not None and len(actual) > 0:
             if len(actual) == 4:
@@ -1771,14 +1937,28 @@ def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
                 db, opponent_team, None, ref_date, opponent_pool,
             )
             source = 'predicted-historical-recency-weighted'
-            if not scenarios:
-                return {}, {}, {}, [], source, ref_date, opponent_pool
+        scenarios, source, warnings = _apply_opponent_fallback(
+            db, scenarios, source, opponent_pool, ref_date, actual, warnings,
+        )
+        if not scenarios:
+            return {}, {}, {}, [], source, ref_date, opponent_pool, warnings
         if not _source_includes_strength_prior(source):
             scenarios, strength_meta = _apply_strength_prior_to_scenarios(scenarios, db, ref_date)
             if strength_meta:
                 source = f'{source}+{strength_meta}'
         if source != 'all-24-uniform-fallback':
-            scenarios = _filter_scenarios(scenarios, opponent_pool)
+            filtered = _filter_scenarios(scenarios, opponent_pool, allow_outside=actual)
+            if not filtered and scenarios:
+                warnings.append(
+                    'Aufstellungshistorie enthielt Spieler außerhalb des Gegner-Kaders — Fallback wird verwendet.',
+                )
+                scenarios, source, warnings = _apply_opponent_fallback(
+                    db, [], source, opponent_pool, ref_date, actual, warnings,
+                )
+            else:
+                scenarios = filtered
+        if not scenarios:
+            return {}, {}, {}, [], source, ref_date, opponent_pool, warnings
         relevant = set(own)
         for _, order in scenarios:
             relevant.update(order)
@@ -1789,9 +1969,13 @@ def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
         names.update({k: v for k, v in fallback_names.items() if v})
         for pid in ids:
             profiles.setdefault(pid, _empty_profile()); names.setdefault(pid, f'Spieler {pid}')
-        return names, profiles, matchups, scenarios, source, ref_date, opponent_pool
+        return names, profiles, matchups, scenarios, source, ref_date, opponent_pool, warnings
     except Exception as exc:
-        raise RuntimeError(f'Analyse-Daten konnten nicht geladen werden: {type(exc).__name__}: {exc}') from exc
+        warnings.append(
+            f'Daten konnten nicht vollständig geladen werden ({type(exc).__name__}). '
+            'Bitte XTTV-Import und Datenbankverbindung prüfen.',
+        )
+        return {}, {}, {}, [], 'load-error', date.today(), set(), warnings
     finally:
         db.close()
 
@@ -2398,10 +2582,29 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         if not actual:
             actual = None
 
-    names, profiles, matchups, scenarios, source, ref_date, opponent_pool = _load_analysis_data(own, opponent_team, actual, use_spieltyp=use_spieltyp)
+    names, profiles, matchups, scenarios, source, ref_date, opponent_pool, data_warnings = _load_analysis_data(
+        own, opponent_team, actual, use_spieltyp=use_spieltyp,
+    )
+    warnings = list(data_warnings)
     if not scenarios:
         phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
-        return {'ok': True, 'phase': phase, 'recommendations': [], 'warnings': [f'Keine passende Gegner-Aufstellung für {opponent_team} gefunden.']}
+        if not warnings:
+            warnings.append(
+                f'Keine passende Gegner-Aufstellung für {opponent_team} gefunden. '
+                'Prüfe Teamname, XTTV-Import und ob mindestens vier Gegenspieler im Kader sind.',
+            )
+        return {
+            'ok': True,
+            'phase': phase,
+            'recommendations': [],
+            'warnings': warnings,
+            'opponent_team': opponent_team,
+            'data_quality': {
+                'opponent_pool_size': len(opponent_pool),
+                'opponent_set_source': source,
+                'reference_date': ref_date.isoformat() if hasattr(ref_date, 'isoformat') else str(ref_date),
+            },
+        }
 
     display_scenarios = scenarios
     scenarios = _sharpen_scenarios(scenarios)
@@ -2409,20 +2612,41 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     opp_ids = set()
     for _, order in scenarios:
         opp_ids.update(order)
-    with SessionLocal() as db:
-        doubles_stats = _load_doubles_stats(db, own, opp_ids, own_team, opponent_team, ref_date)
+    try:
+        with SessionLocal() as db:
+            doubles_stats = _load_doubles_stats(db, own, opp_ids, own_team, opponent_team, ref_date)
 
-    _check_analysis_budget(started)
-    own_on_letters = None if opponent_on_letters is None else not bool(opponent_on_letters)
-    if own_is_home is None:
-        home_eval, home_matchups = _evaluate_lineups(own, scenarios, profiles, matchups, names, True, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
-        away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
-        evaluated = _merge_orientations(home_eval, away_eval)
-        matchup_p = home_matchups
-        orientation_note = 'home-and-away-averaged' if own_on_letters is None else ('opponent-A-D' if opponent_on_letters else 'opponent-1-4')
-    else:
-        evaluated, matchup_p = _evaluate_lineups(own, scenarios, profiles, matchups, names, bool(own_is_home), started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
-        orientation_note = ('home' if own_is_home else 'away') if opponent_on_letters is None else ('opponent-A-D' if opponent_on_letters else 'opponent-1-4')
+        _check_analysis_budget(started)
+        own_on_letters = None if opponent_on_letters is None else not bool(opponent_on_letters)
+        if own_is_home is None:
+            home_eval, home_matchups = _evaluate_lineups(own, scenarios, profiles, matchups, names, True, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
+            away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
+            evaluated = _merge_orientations(home_eval, away_eval)
+            matchup_p = home_matchups
+            orientation_note = 'home-and-away-averaged' if own_on_letters is None else ('opponent-A-D' if opponent_on_letters else 'opponent-1-4')
+        else:
+            evaluated, matchup_p = _evaluate_lineups(own, scenarios, profiles, matchups, names, bool(own_is_home), started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
+            orientation_note = ('home' if own_is_home else 'away') if opponent_on_letters is None else ('opponent-A-D' if opponent_on_letters else 'opponent-1-4')
+    except RuntimeError as exc:
+        if 'safety budget' not in str(exc).lower():
+            raise
+        phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
+        warnings.append(
+            'Die Analyse wurde wegen Zeitlimit abgebrochen (große Datenmenge). '
+            'Bitte erneut versuchen oder weniger bekannte Gegner angeben.',
+        )
+        return {
+            'ok': True,
+            'phase': phase,
+            'recommendations': [],
+            'warnings': warnings,
+            'opponent_team': opponent_team,
+            'data_quality': {
+                'opponent_pool_size': len(opponent_pool),
+                'opponent_set_source': source,
+                'reference_date': ref_date.isoformat() if hasattr(ref_date, 'isoformat') else str(ref_date),
+            },
+        }
 
     if fixed is None:
         # The normal route evaluates and ranks all 24 permutations.
@@ -2525,6 +2749,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     return {
         'ok': True,
         'phase': 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A'),
+        'warnings': warnings,
         'known_opponent_ids': actual or [],
         'known_opponent_count': len(actual or []),
         'own_is_home': own_is_home,
@@ -2582,7 +2807,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         },
         'data_quality': {
             'scenario_variants': len(scenarios),
-        'scenario_sharpening_alpha': SCENARIO_SHARPENING_ALPHA,
+            'scenario_sharpening_alpha': SCENARIO_SHARPENING_ALPHA,
             'own_orders_evaluated': 24,
             'reference_date': ref_date.isoformat(),
             'stats_window_years': STATS_YEARS,
@@ -2590,7 +2815,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             'opponent_pool_size': len(opponent_pool),
             'runtime_seconds': round(elapsed, 4),
             'runtime_data_source': 'rc-profiles-plus-lineup-history',
-            'missing_player_stats_use_neutral_prior': False,
+            'missing_player_stats_use_neutral_prior': source in ('all-24-uniform-fallback', 'strength-prior-fallback', 'fallback-unavailable', 'load-error'),
             'position_probabilities_observed': source != 'all-24-uniform-fallback',
         },
     }

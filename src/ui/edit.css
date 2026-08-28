@@ -10,7 +10,7 @@
 .edit-player:active,.edit-double:active{cursor:grabbing}
 .edit-player.edit-touch-active,.edit-player.edit-touch-target{background:#d4f3ea}
 .edit-double.edit-touch-active,.edit-double.edit-touch-target{background:#d4f3ea}
-.edit-hint{font-size:.76rem;margin-top:7px}
+.edit-hint{font-size:.8rem;margin-top:8px;line-height:1.4}
 .editable-doubles{padding-top:10px}
 .edit-comparison{margin-top:12px;padding:9px 11px;border-radius:12px;background:#e8f3f6;color:#526a7d;font-size:.82rem;font-weight:800}
 .edit-deviation{color:#b42318}

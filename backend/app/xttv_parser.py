@@ -11,6 +11,12 @@ def clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def normalize_team_name(name: str) -> str:
+    """Collapse whitespace and normalize common dash variants for stable team keys."""
+    value = clean(name)
+    return value.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+
+
 def _cells(table):
     return [[clean(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
             for tr in table.find_all("tr") if tr.find_all(["th", "td"])]
@@ -20,7 +26,7 @@ def _team(cell: str):
     m = re.match(r"(.+?)\s*\(([^)]+)\)", cell.strip())
     if not m:
         raise ValueError(f"Could not parse team cell: {cell!r}")
-    return clean(m.group(1)), clean(m.group(2))
+    return normalize_team_name(m.group(1)), clean(m.group(2))
 
 
 def _is_walkover_lineup_cell(cell: str) -> bool:
@@ -29,9 +35,14 @@ def _is_walkover_lineup_cell(cell: str) -> bool:
 
 def _player(cell: str):
     m = re.match(r"([A-D1-4]):\s*PassNr\s+(\d+)\s+(.+)$", cell)
-    if not m:
-        raise ValueError(f"Could not parse player cell: {cell!r}")
-    return m.group(1), clean(m.group(3)), m.group(2)
+    if m:
+        return m.group(1), clean(m.group(3)), m.group(2)
+    m = re.match(r"([A-D1-4]):\s*(.+)$", cell.strip())
+    if m and not _is_walkover_lineup_cell(cell):
+        name = clean(m.group(2))
+        if name:
+            return m.group(1), name, None
+    raise ValueError(f"Could not parse player cell: {cell!r}")
 
 
 def _parse_lineup_cell(cell: str) -> tuple[str, dict]:

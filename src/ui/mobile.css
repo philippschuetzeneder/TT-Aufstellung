@@ -60,18 +60,6 @@ main.app-shell,
     text-align: right;
   }
 
-  .setup-team-row {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .venue-label {
-    min-width: 0;
-  }
-
-  .venue-label select {
-    min-width: 0;
-  }
-
   .doubles-setup-head {
     flex-wrap: wrap;
     gap: 6px;

@@ -10,11 +10,12 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from .db import SessionLocal, create_all
 from .models import MatchGame, MatchPlayer, RawSourceDocument, XttvMatch, XttvPlayer
 from .xttv_import import fetch_match
-from .xttv_parser import parse_match
+from .xttv_parser import normalize_team_name, parse_match
 
 TARGET_SEASONS = {"2025/2026", "2024/2025", "2023/2024"}
 REFERENCE_MEID = 437757
@@ -112,15 +113,29 @@ def _upsert_player_master(session, external_player_id: str | None, name: str, cl
             player.last_seen_at = observed_at
 
 
-def import_one(meid: int) -> dict:
-    html, status, content_type, url = fetch_match(meid)
-    parsed = parse_match(html, meid)
-    if not _is_valid_importable_report(parsed):
-        raise ValueError(
-            f"Not a valid importable report: players={parsed['player_count']}, "
-            f"singles={parsed['singles_count']}, doubles={parsed['doubles_count']}, "
-            f"walkover={parsed.get('has_walkover')}"
-        )
+def _resolve_match_player_id(player: dict) -> str | None:
+    external_player_id = player.get("external_player_id")
+    if external_player_id:
+        return str(external_player_id).strip() or None
+    side = player.get("side") or "x"
+    position = player.get("position") or "x"
+    return f"__nopass_{side}_{position}"
+
+
+def _is_real_player_id(external_player_id: str | None) -> bool:
+    return bool(external_player_id) and not str(external_player_id).startswith("__nopass_")
+
+
+def _normalize_parsed_match(parsed: dict) -> dict:
+    if parsed.get("home_team"):
+        parsed["home_team"] = normalize_team_name(parsed["home_team"])
+    if parsed.get("away_team"):
+        parsed["away_team"] = normalize_team_name(parsed["away_team"])
+    return parsed
+
+
+def _persist_import(meid: int, html: str, status: int, content_type: str, url: str, parsed: dict) -> dict:
+    parsed = _normalize_parsed_match(parsed)
     with SessionLocal.begin() as session:
         raw = session.query(RawSourceDocument).filter_by(source="xttv", external_id=str(meid)).one_or_none()
         if raw is None:
@@ -145,19 +160,21 @@ def import_one(meid: int) -> dict:
         session.flush()
         observed_at = datetime.utcnow()
         for player in parsed["players"]:
+            external_player_id = _resolve_match_player_id(player)
             match.players.append(MatchPlayer(
                 name=player["name"],
-                external_player_id=player.get("external_player_id"),
+                external_player_id=external_player_id,
                 side=player["side"],
                 position=player.get("position"),
             ))
-            _upsert_player_master(
-                session,
-                player.get("external_player_id"),
-                player["name"],
-                parsed.get("home_team") if player.get("side") == "home" else parsed.get("away_team"),
-                observed_at,
-            )
+            if _is_real_player_id(external_player_id):
+                _upsert_player_master(
+                    session,
+                    external_player_id,
+                    player["name"],
+                    parsed.get("home_team") if player.get("side") == "home" else parsed.get("away_team"),
+                    observed_at,
+                )
         for game in parsed["games"]:
             match.games.append(MatchGame(
                 sequence=game.get("sequence"),
@@ -181,6 +198,21 @@ def import_one(meid: int) -> dict:
         "away_team": parsed["away_team"],
         "team_result": parsed["team_result"],
     }
+
+
+def import_one(meid: int) -> dict:
+    html, status, content_type, url = fetch_match(meid)
+    parsed = parse_match(html, meid)
+    if not _is_valid_importable_report(parsed):
+        raise ValueError(
+            f"Not a valid importable report: players={parsed['player_count']}, "
+            f"singles={parsed['singles_count']}, doubles={parsed['doubles_count']}, "
+            f"walkover={parsed.get('has_walkover')}"
+        )
+    try:
+        return _persist_import(meid, html, status, content_type, url, parsed)
+    except IntegrityError:
+        return _persist_import(meid, html, status, content_type, url, parsed)
 
 
 def _quick_report_info(html: str) -> dict:
@@ -249,18 +281,30 @@ def _classify_meid(meid: int, *, check_db: bool = True) -> dict:
         "three_player": quick.get("is_three_player"),
     }
     importable = False
-    try:
-        if quick["season"] in TARGET_SEASONS and not quick["is_three_player"]:
+    status = "valid_outside_filter"
+    if quick["season"] not in TARGET_SEASONS:
+        detail["filter_reason"] = "season"
+    elif quick["is_three_player"]:
+        detail["filter_reason"] = "three_player"
+    else:
+        try:
             parsed = parse_match(html, meid)
             if _is_valid_importable_report(parsed):
                 importable = True
+                status = "importable"
                 detail["home_team"] = parsed.get("home_team")
                 detail["away_team"] = parsed.get("away_team")
                 detail["walkover"] = parsed.get("has_walkover")
-    except Exception:
-        pass
+            else:
+                status = "invalid_report"
+                detail["invalid_reason"] = (
+                    f"players={parsed.get('player_count')}, singles={parsed.get('singles_count')}, "
+                    f"doubles={parsed.get('doubles_count')}, walkover={parsed.get('has_walkover')}"
+                )
+        except Exception as exc:
+            status = "parse_error"
+            detail["parse_error"] = f"{type(exc).__name__}: {exc}"
 
-    status = "importable" if importable else "valid_outside_filter"
     return {
         "meid": meid,
         "status": status,
@@ -274,6 +318,7 @@ def _try_import_classified(
     cls: dict,
     imported_ids: list[int],
     imported_details: list[dict],
+    import_failures: list[dict],
     limit: int,
 ) -> bool:
     if len(imported_ids) >= limit or not cls.get("importable") or cls.get("status") == "already_imported":
@@ -281,10 +326,90 @@ def _try_import_classified(
     meid = int(cls["meid"])
     if _is_imported(meid):
         return False
-    result = import_one(meid)
+    try:
+        result = import_one(meid)
+    except Exception as exc:
+        failure = {
+            "ok": False,
+            "meid": meid,
+            "error": f"{type(exc).__name__}: {exc}",
+            "status": cls.get("status"),
+        }
+        import_failures.append(failure)
+        imported_details.append(failure)
+        return False
     imported_ids.append(meid)
     imported_details.append(result)
     return True
+
+
+def _can_advance_frontier(cls: dict, import_succeeded: bool) -> bool:
+    if cls.get("miss"):
+        return True
+    if cls.get("status") == "already_imported":
+        return True
+    if cls.get("status") == "valid_outside_filter":
+        return True
+    if cls.get("status") == "importable":
+        return import_succeeded
+    return False
+
+
+def scan_import_reports(
+    *,
+    start: int,
+    end: int,
+    limit: int = MAX_IMPORT,
+    direction: str = 'forward',
+) -> dict:
+    """Import reports in an explicit MEID range (used by xttv-auto-import.html)."""
+    create_all()
+    direction = str(direction or 'forward').lower()
+    if direction not in {'forward', 'backward'}:
+        raise ValueError('direction must be forward or backward')
+    start = int(start)
+    end = int(end)
+    limit = min(max(int(limit), 1), MAX_IMPORT)
+    if direction == 'forward' and start > end:
+        raise ValueError('forward scan requires start <= end')
+    if direction == 'backward' and start < end:
+        raise ValueError('backward scan requires start >= end')
+
+    step = 1 if direction == 'forward' else -1
+    imported_ids: list[int] = []
+    imported_details: list[dict] = []
+    import_failures: list[dict] = []
+    checked = errors = 0
+    meid = start
+    while (direction == 'forward' and meid <= end) or (direction == 'backward' and meid >= end):
+        if len(imported_ids) >= limit:
+            break
+        if _is_imported(meid):
+            meid += step
+            continue
+        checked += 1
+        cls = _classify_meid(meid, check_db=False)
+        import_succeeded = _try_import_classified(cls, imported_ids, imported_details, import_failures, limit)
+        if cls.get('status') == 'error':
+            errors += 1
+            break
+        if cls.get('status') in {'parse_error', 'invalid_report'}:
+            errors += 1
+        meid += step
+        time.sleep(REQUEST_DELAY)
+
+    return {
+        'ok': True,
+        'mode': 'range',
+        'direction': direction,
+        'range': {'start': start, 'end': end},
+        'checked': checked,
+        'imported': len(imported_ids),
+        'imported_meids': imported_ids,
+        'imported_details': imported_details,
+        'import_failures': import_failures,
+        'errors': errors,
+    }
 
 
 def import_new_reports(
@@ -312,44 +437,59 @@ def import_new_reports(
 
     imported_ids: list[int] = []
     imported_details: list[dict] = []
+    import_failures: list[dict] = []
     checked = errors = empty_streak = 0
     meid = start
     last_checked = start - 1
+    frontier_candidate = start - 1
 
     while empty_streak < empty_streak_stop:
         if len(imported_ids) >= limit:
             break
         if _is_imported(meid):
+            frontier_candidate = meid
             meid += 1
             continue
         checked += 1
         last_checked = meid
         cls = _classify_meid(meid, check_db=False)
+        import_succeeded = False
         if cls.get("miss"):
             empty_streak += 1
+            import_succeeded = True
         else:
             empty_streak = 0
-            _try_import_classified(cls, imported_ids, imported_details, limit)
+            import_succeeded = _try_import_classified(
+                cls, imported_ids, imported_details, import_failures, limit,
+            )
         if cls.get("status") == "error":
             errors += 1
+            break
+        if cls.get("status") in {"parse_error", "invalid_report"}:
+            errors += 1
+        if _can_advance_frontier(cls, import_succeeded):
+            frontier_candidate = meid
+        elif cls.get("importable"):
+            break
         meid += 1
         time.sleep(REQUEST_DELAY)
 
-    if last_checked >= start:
-        _set_scan_frontier(last_checked)
+    if frontier_candidate >= start:
+        _set_scan_frontier(frontier_candidate)
 
     return {
         "ok": True,
         "last_known_meid": last_known,
         "max_imported_meid": _max_imported_meid(),
         "scan_frontier_before": scan_frontier,
-        "scan_frontier_after": last_checked if last_checked >= start else scan_frontier,
+        "scan_frontier_after": frontier_candidate if frontier_candidate >= start else scan_frontier,
         "range": {"start": start, "end": last_checked if last_checked >= start else start - 1},
         "last_scanned_meid": last_checked if last_checked >= start else None,
         "checked": checked,
         "imported": len(imported_ids),
         "imported_meids": imported_ids,
         "imported_details": imported_details,
+        "import_failures": import_failures,
         "errors": errors,
         "stopped_after_empty_streak": empty_streak >= empty_streak_stop,
     }
@@ -401,5 +541,5 @@ scan_forward_for_new = import_new_reports
 
 def scan_and_import(start: int, end: int, limit: int = DEFAULT_LIMIT, delay: float = REQUEST_DELAY) -> dict:
     """Admin-only: import a specific MEID range (not used by Daten Refresh)."""
-    del start, end, delay
-    return import_new_reports(limit=min(limit, MAX_IMPORT))
+    del delay
+    return scan_import_reports(start=start, end=end, limit=min(limit, MAX_IMPORT))

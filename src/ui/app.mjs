@@ -27,6 +27,7 @@ const state = {
   editDoubles: null,
   loadingPlayers: false,
   analysisLoading: false,
+  pendingScrollToResult: false,
   dataRefreshRunning: false,
   adminRequired: false,
   uiExpanded: {
@@ -38,6 +39,23 @@ const state = {
 };
 const app = document.querySelector('#app');
 let doublesSuggestionLoad = null;
+
+function isPhaseThreeReady() {
+  return state.selectedOpp.length === 4 && Boolean(state.opponentDirection);
+}
+
+function canAnalyze() {
+  if (state.loadingPlayers || state.analysisLoading) return false;
+  if (state.selectedOwn.length !== 4 || new Set(state.selectedOwn).size !== 4) return false;
+  if (state.selectedOpp.length === 4 && !state.opponentDirection) return false;
+  return true;
+}
+
+function scrollToResultPanel() {
+  requestAnimationFrame(() => {
+    document.getElementById('result-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
 
 async function api(path, { timeoutMs = 5000 } = {}) {
   const controller = new AbortController();
@@ -258,6 +276,8 @@ function toggleDoublePair(playerId) {
     state.doublePair1Ids = p1.filter((x) => x !== String(p1[0])).concat(id);
   }
   state.result = null;
+  state.optimalResult = null;
+  state.editMode = false;
   render();
 }
 
@@ -324,26 +344,43 @@ function ownDoublesLineupHtml() {
 }
 
 function setupPanelHtml(own, opp, opponents) {
-  const directionRequired = state.selectedOpp.length === 4 && !state.opponentDirection;
-  const analyzeDisabled = state.selectedOwn.length !== 4 || directionRequired || state.analysisLoading || state.loadingPlayers;
+  const analyzeDisabled = !canAnalyze();
   const analyzeLabel = state.analysisLoading ? 'Berechnung läuft …' : 'Optimale Aufstellung berechnen';
-  return `<h2 class="section-title">1. Match Setup</h2><div class="setup-teams-block"><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div><div class="setup-opponent">${select('Gegner', 'opponentTeam', opponents)}</div></div><label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp inkludieren</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3><p class="muted setup-hint">Wähle genau vier Spieler.</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}<h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3><p class="muted setup-hint">Optional: bis zu vier Gegner wählen</p>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}${opponentDirectionHtml()}<button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button>`;
+  const oppComplete = state.selectedOpp.length === 4;
+  const phaseBlock = `<div class="phase-primary-block${oppComplete ? ' complete' : ''}"><h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}${opponentDirectionHtml()}</div>`;
+  return `<h2 class="section-title">Einstellungen</h2><div class="setup-teams-block"><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}</div><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}${phaseBlock}<details class="collapsible setup-advanced"><summary><span class="collapsible-title">Erweitert</span></summary><div class="collapsible-body"><label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp inkludieren</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p></div></details><button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button>`;
 }
 
 function opponentDirectionHtml() {
   if (state.selectedOpp.length !== 4) return '';
-  return `<div class="direction-select" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px"><span class="direction-label" style="grid-column:1/-1">Gegnerische Aufstellungsrichtung</span><label class="option-check"><input type="checkbox" data-direction="letters" ${state.opponentDirection === 'letters' ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>A–D (waagrecht)</span></label><label class="option-check"><input type="checkbox" data-direction="numbers" ${state.opponentDirection === 'numbers' ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>1–4 (senkrecht)</span></label></div>`;
+  return `<div class="direction-select"><span class="direction-label">Gegnerische Aufstellungsrichtung</span><div class="direction-options"><label class="direction-option ${state.opponentDirection === 'letters' ? 'selected' : ''}"><input type="radio" name="opponentDirection" data-direction="letters" ${state.opponentDirection === 'letters' ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>A–D waagrecht</span></label><label class="direction-option ${state.opponentDirection === 'numbers' ? 'selected' : ''}"><input type="radio" name="opponentDirection" data-direction="numbers" ${state.opponentDirection === 'numbers' ? 'checked' : ''} ${state.analysisLoading ? 'disabled' : ''}><span>1–4 senkrecht</span></label></div></div>`;
 }
 
 function venueSelect() {
-  return `<label class="venue-label">Spielort<select data-field="ownIsHome" ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><option value="home" ${state.ownIsHome ? 'selected' : ''}>Heim</option><option value="away" ${!state.ownIsHome ? 'selected' : ''}>Gast</option></select></label>`;
+  return `<label class="venue-label">Ort<select data-field="ownIsHome" ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><option value="home" ${state.ownIsHome ? 'selected' : ''}>Heim</option><option value="away" ${!state.ownIsHome ? 'selected' : ''}>Gast</option></select></label>`;
+}
+
+function shouldShowResultPanel() {
+  if (state.analysisLoading) return true;
+  if (state.result?.recommendation) return true;
+  if (state.result && (state.result.message || state.result.error || (state.result.warnings || []).length)) {
+    return true;
+  }
+  return false;
+}
+
+function resultPanelHtml(resultTitle, editLabel) {
+  if (!shouldShowResultPanel()) return '';
+  return `<div class="card highlight result-card" id="result-panel"><div class="result-card-heading"><h2 class="section-title">${resultTitle}</h2>${state.result?.recommendation ? `<button type="button" class="secondary edit-button" data-action="toggle-edit" ${state.analysisLoading ? 'disabled' : ''}>${editLabel}</button>` : ''}</div>${resultHtml()}</div>`;
 }
 
 function render() {
   const own = state.ownPlayers;
   const opp = state.opponentPlayers;
   const opponents = state.teams.filter((t) => t.id !== state.ownTeam);
-  app.innerHTML = `<section class="grid two"><div class="card setup-card">${setupPanelHtml(own, opp, opponents)}</div><div class="card highlight"><div class="result-card-heading"><h2 class="section-title">2. Optimale Aufstellung</h2>${state.result?.recommendation ? `<button type="button" class="secondary edit-button" data-action="toggle-edit" ${state.analysisLoading ? 'disabled' : ''}>${state.editMode ? 'Neu berechnen' : 'Ändern'}</button>` : ''}</div>${resultHtml()}</div></section>`;
+  const resultTitle = isPhaseThreeReady() ? 'Optimale Aufstellung' : 'Empfehlung';
+  const editLabel = state.editMode ? 'Neu berechnen' : 'Anpassen';
+  app.innerHTML = `<section class="grid two lineup-layout"><div class="card setup-card">${setupPanelHtml(own, opp, opponents)}</div>${resultPanelHtml(resultTitle, editLabel)}</section>`;
   scheduleDoublesSuggestion();
   bind();
 }
@@ -397,14 +434,14 @@ function ownLineup(ids, backendNames) {
 function editableLineupHtml() {
   const ids = state.editOwnOrder;
   const labels = state.opponentDirection === 'numbers' ? ['A', 'B', 'C', 'D'] : ['1', '2', '3', '4'];
-  return `<div class="optimal-players editable-lineup">${ids.map((id, i) => `<div class="optimal-player edit-player" draggable="${state.analysisLoading ? 'false' : 'true'}" data-edit-player="${escapeHtml(id)}" data-edit-index="${i}"><span>${labels[i]}</span><strong>${escapeHtml(ownNameById(id))}</strong></div>`).join('')}</div><div class="edit-hint muted">Spieler per Drag & Drop verschieben.</div>`;
+  return `<div class="optimal-players editable-lineup">${ids.map((id, i) => `<div class="optimal-player edit-player" draggable="${state.analysisLoading ? 'false' : 'true'}" data-edit-player="${escapeHtml(id)}" data-edit-index="${i}"><span>${labels[i]}</span><strong>${escapeHtml(ownNameById(id))}</strong></div>`).join('')}</div><div class="edit-hint muted">Spieler gedrückt halten und auf eine andere Position ziehen.</div>`;
 }
 
 function editableDoublesHtml() {
   const doubles = state.editDoubles;
   if (!doubles?.game5 || !doubles?.game10) return '';
   const row = (game, ids) => `<div class="optimal-player edit-double" draggable="${state.analysisLoading ? 'false' : 'true'}" data-edit-double="${game}"><span>${game}</span><strong>${ids.map((id) => escapeHtml(ownNameById(id))).join(' / ')}</strong></div>`;
-  return `<div class="doubles-lineup editable-doubles">${row('5', doubles.game5)}${row('10', doubles.game10)}</div><div class="edit-hint muted">Doppel 5 und 10 können als Paar getauscht werden.</div>`;
+  return `<div class="doubles-lineup editable-doubles">${row('5', doubles.game5)}${row('10', doubles.game10)}</div><div class="edit-hint muted">Doppel-Zeile antippen, halten und auf die andere Zeile ziehen zum Tauschen.</div>`;
 }
 
 function opponentLineup(pred, { includeDoubles = true } = {}) {
@@ -510,13 +547,17 @@ function explanationHtml(explanation) {
 }
 
 function resultHtml() {
-  if (state.analysisLoading) return '<div class="analysis-loading" role="status" aria-live="polite"><div class="loading-title">Berechnung läuft …</div><div class="loading-track"><div class="loading-bar"></div></div><div class="loading-text">Die Analyse berücksichtigt Spielstärken, direkte Duelle und historische gegnerische Positionierungen.</div></div>';
-  if (state.selectedOpp.length === 4 && !state.opponentDirection) return '<div class="empty">Phase 2: Die vier Gegner sind bekannt. Wähle noch, ob der Gegner A–D (waagrecht) oder 1–4 (senkrecht) spielt.</div>';
-  if (!state.result) return '<div class="empty">Wähle vier eigene Spieler und starte die Berechnung.</div>';
+  if (state.analysisLoading && !state.result?.recommendation) {
+    return analysisLoadingHtml();
+  }
+  if (!state.result) {
+    return '';
+  }
   if (!state.result.recommendation) {
     const warning = (state.result.warnings || []).join(' | ');
     return `<div class="empty error-box"><strong>Berechnung nicht abgeschlossen.</strong><br>${escapeHtml(state.result.message || state.result.error || warning || 'Unbekannter Fehler')}</div>`;
   }
+  const loadingOverlay = state.analysisLoading ? `<div class="result-updating">${analysisLoadingHtml(true)}</div>` : '';
   const b = state.result.recommendation;
   const opp = state.result.most_likely_opponent;
   const summary = state.result.info_summary;
@@ -527,10 +568,20 @@ function resultHtml() {
   const alternatives = (state.result.recommendations?.length || 1) > 1
     ? collapsible('altLineups', 'Alternative Aufstellungen', altLineupsHtml(state.result.recommendations), `${Math.min(5, state.result.recommendations.length - 1)} weitere`)
     : '';
+  const dataWarnings = (state.result.warnings || []).filter(Boolean);
+  const warningBanner = dataWarnings.length
+    ? `<div class="empty warning-box" style="margin-bottom:12px"><strong>Hinweis zur Datenqualität</strong><br>${dataWarnings.map((w) => escapeHtml(w)).join('<br>')}</div>`
+    : '';
   const lineupHtml = state.editMode ? `${editableLineupHtml()}${editableDoublesHtml()}` : `<div class="optimal-players">${ownLineup(b.own_player_ids, b.players)}${ownDoublesLineupHtml()}</div>`;
   const comparison = state.editMode && state.result?.optimal_recommendation && state.optimalResult?.recommendation ? `<div class="edit-comparison">Optimal: ${pct(state.optimalResult.recommendation.team_win_probability)} · <span class="edit-deviation">Abweichung zu Optimal: ${((Number(b.team_win_probability) - Number(state.optimalResult.recommendation.team_win_probability)) * 100).toFixed(1).replace('.', ',')} %</span></div><button type="button" class="secondary reset-edit-button" data-action="reset-edit">Zurück zur optimalen Aufstellung</button>` : '';
-  const resultClass = state.editMode ? 'fixed' : (state.result?.optimal_recommendation ? 'fixed' : '');
-  return `<div class="optimal-result ${resultClass}"><div class="optimal-label">Empfohlene Eigene Aufstellung</div>${lineupHtml}${resultMetricsHtml(b)}${lineupMetricsHtml(b, state.optimalResult?.recommendation || b)}<div class="probability-breakdown"><span>Unentschieden ${pct(b.team_draw_probability)}</span><span>Niederlage ${pct(b.team_loss_probability)}</span></div>${comparison}</div>${!state.editMode ? explanationHtml(state.result.explanation) : ''}${!state.editMode ? collapsible('moreInfo', 'Mehr Info', infoSummaryHtml(summary), rcHint) : ''}${opp ? `<div class="opponent-prediction"><div class="optimal-label">Wahrscheinlichste gegnerische Aufstellung</div><div class="muted small-text">${pct(opp.probability)} Wahrscheinlichkeit</div><div class="optimal-players">${opponentLineup(opp)}</div></div>` : ''}${alternatives}`;
+  const resultClass = state.editMode ? 'fixed editing' : (state.result?.optimal_recommendation ? 'fixed' : '');
+  const staleClass = state.analysisLoading ? ' is-updating' : '';
+  return `${loadingOverlay}<div class="optimal-result ${resultClass}${staleClass}">${warningBanner}<div class="optimal-label">Empfohlene Eigene Aufstellung</div>${lineupHtml}${resultMetricsHtml(b)}${lineupMetricsHtml(b, state.optimalResult?.recommendation || b)}<div class="probability-breakdown"><span>Unentschieden ${pct(b.team_draw_probability)}</span><span>Niederlage ${pct(b.team_loss_probability)}</span></div>${comparison}</div>${!state.editMode ? explanationHtml(state.result.explanation) : ''}${!state.editMode ? collapsible('moreInfo', 'Mehr Info', infoSummaryHtml(summary), rcHint) : ''}${opp && !isPhaseThreeReady() ? `<div class="opponent-prediction"><div class="optimal-label">Wahrscheinlichste gegnerische Aufstellung</div><div class="muted small-text">${pct(opp.probability)} Wahrscheinlichkeit</div><div class="optimal-players">${opponentLineup(opp)}</div></div>` : ''}${alternatives}`;
+}
+
+function analysisLoadingHtml(compact = false) {
+  const klass = compact ? 'analysis-loading compact' : 'analysis-loading';
+  return `<div class="${klass}" role="status" aria-live="polite"><div class="loading-title">Berechnung läuft …</div><div class="loading-track"><div class="loading-bar"></div></div>${compact ? '' : '<div class="loading-text">Spielstärken, direkte Duelle und Gegner-Aufstellungen werden berücksichtigt.</div>'}</div>`;
 }
 
 function pct(v) {
@@ -706,7 +757,7 @@ function resultMetricsHtml(recommendation) {
   const expectedBlock = recommendation
     ? `<div class="expected-score-block"><div class="expected-score">${escapeHtml(scoreText(recommendation))} <span>Erwartetes Ergebnis</span></div></div>`
     : '';
-  return `<div class="result-metrics"><div class="win-probability">${pct(recommendation.team_win_probability)} <span>Mannschafts-Siegwahrscheinlichkeit</span></div>${expectedBlock}</div>`;
+  return `<div class="result-metrics"><div class="win-probability">${pct(recommendation.team_win_probability)} <span>Siegchance laut Modell</span></div>${expectedBlock}</div>`;
 }
 
 function bind() {
@@ -748,12 +799,9 @@ function bind() {
       render();
     }
   }));
-  app.querySelectorAll('input[type="checkbox"][data-direction]').forEach((el) => el.addEventListener('change', (e) => {
-    if (e.currentTarget.checked) {
-      state.opponentDirection = e.currentTarget.dataset.direction;
-    } else if (state.opponentDirection === e.currentTarget.dataset.direction) {
-      state.opponentDirection = '';
-    }
+  app.querySelectorAll('input[type="radio"][data-direction]').forEach((el) => el.addEventListener('change', (e) => {
+    if (!e.currentTarget.checked) return;
+    state.opponentDirection = e.currentTarget.dataset.direction;
     state.result = null;
     state.optimalResult = null;
     state.editMode = false;
@@ -799,11 +847,11 @@ function bind() {
     const id = e.currentTarget.dataset.player;
     state[key] = state[key].includes(id) ? state[key].filter((x) => x !== id) : state[key].length < 4 ? [...state[key], id] : state[key];
     state.result = null;
+    state.optimalResult = null;
+    state.editMode = false;
     if (group === 'opp' && state.selectedOpp.length !== 4) state.opponentDirection = '';
     if (group === 'own') {
       if (state.selectedOwn.length === 4) {
-        // Load the historical pair suggestion in the background. It must
-        // never block the analysis UI when the database is cold.
         scheduleDoublesSuggestion();
       } else {
         state.doublePair1Ids = [];
@@ -812,7 +860,10 @@ function bind() {
     }
     render();
   }));
-  app.querySelector('[data-action="analyze"]')?.addEventListener('click', runAnalysis);
+  app.querySelector('[data-action="analyze"]')?.addEventListener('click', () => {
+    state.pendingScrollToResult = true;
+    runAnalysis();
+  });
   app.querySelectorAll('[data-collapse]').forEach((el) => {
     el.addEventListener('toggle', () => {
       state.uiExpanded[el.dataset.collapse] = el.open;
@@ -821,9 +872,8 @@ function bind() {
 }
 
 async function runAnalysis() {
-  if (state.selectedOwn.length !== 4 || new Set(state.selectedOwn).size !== 4 || state.analysisLoading) return;
+  if (!canAnalyze()) return;
   state.analysisLoading = true;
-  state.result = null;
   syncHeader();
   render();
   try {
@@ -861,6 +911,10 @@ async function runAnalysis() {
     state.analysisLoading = false;
     syncHeader();
     render();
+    if (state.pendingScrollToResult && !state.editMode) {
+      state.pendingScrollToResult = false;
+      scrollToResultPanel();
+    }
   }
 }
 

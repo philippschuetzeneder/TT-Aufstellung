@@ -13,7 +13,7 @@ from .db import database_health, SessionLocal, create_all
 from .db_routes import get_match
 from .validation_service import validate_database
 from .xttv_import import MATCH_URL, fetch_match, inspect_html
-from .xttv_db_import import DEFAULT_LIMIT, REFERENCE_MEID, import_one, import_new_reports, player_master_status
+from .xttv_db_import import DEFAULT_LIMIT, REFERENCE_MEID, import_one, import_new_reports, player_master_status, scan_import_reports
 from .xttv_parser import parse_match
 from .rc_import import import_rc_player, fetch_player_history, parse_player_history, bulk_import_rc
 from .rc_matching import dry_run as rc_matching_dry_run, dry_run_all as rc_matching_dry_run_all
@@ -255,8 +255,18 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path=="/api/xttv/scan-import":
                 try:
                     limit=int(query.get("limit",[str(DEFAULT_LIMIT)])[0])
+                    start_raw=query.get("start",[None])[0]
+                    end_raw=query.get("end",[None])[0]
+                    direction=(query.get("direction",["forward"])[0] or "forward").strip().lower()
                 except ValueError:
-                    return self.send_json({"ok":False,"error":"limit must be an integer"},400)
+                    return self.send_json({"ok":False,"error":"limit/start/end must be integers"},400)
+                if start_raw is not None and end_raw is not None:
+                    try:
+                        return self.send_json(scan_import_reports(
+                            start=int(start_raw), end=int(end_raw), limit=limit, direction=direction,
+                        ))
+                    except ValueError as exc:
+                        return self.send_json({"ok":False,"error":str(exc)},400)
                 return self.send_json(import_new_reports(limit=limit))
             if parsed.path=="/api/rc/import":
                 raw_rc_id=query.get("player_id",[""])[0].strip()

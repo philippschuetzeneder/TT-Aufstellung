@@ -74,7 +74,7 @@ def test_lineup_spread_includes_doubles_and_pair_partitions():
     own = ['21773', '23754', '24889', '23782']
     opp = ['22472', '22223', '21339', '21970']
     pairs = [['21773', '24889'], ['23754', '23782']]
-    names, profiles, matchups, scenarios, source, ref_date, opponent_pool = _load_analysis_data(
+    names, profiles, matchups, scenarios, source, ref_date, opponent_pool, _warnings = _load_analysis_data(
         own, 'Alberndorf 2', opp, use_spieltyp=False,
     )
     with SessionLocal() as db:

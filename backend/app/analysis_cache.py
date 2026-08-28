@@ -81,6 +81,8 @@ def refresh_analysis_cache() -> dict:
                 ) SELECT team,lineup_key,concat(p1,',',p2,',',p3,',',p4),p1,p2,p3,p4,count(*) FROM four GROUP BY team,lineup_key,p1,p2,p3,p4
             """))
             db.execute(text("INSERT INTO analysis_cache_meta(cache_name,source_match_count,refreshed_at) VALUES ('main',:n,CURRENT_TIMESTAMP) ON CONFLICT (cache_name) DO UPDATE SET source_match_count=EXCLUDED.source_match_count,refreshed_at=EXCLUDED.refreshed_at"), {"n": source_count})
+        from .analysis_service import clear_analysis_runtime_caches
+        clear_analysis_runtime_caches()
         _READY = True
         return {"ok": True, "refreshed": True, "source_matches": source_count}
 
