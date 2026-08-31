@@ -1,0 +1,38 @@
+{
+  "description": "Gleiche optimale Aufstellung (Vollmodell). Einzel-Wahrscheinlichkeiten: Produktions-Spielstärke vs. nur RC. Doppel unverändert Produktionsmodell.",
+  "season": "2025/2026",
+  "perspective": "home_only",
+  "phase": "C",
+  "cases_total": 3936,
+  "cases_processed": 3936,
+  "runtime_sec": 393.7,
+  "team_win_comparison": {
+    "n": 3936,
+    "mean_full_pct": 45.108,
+    "mean_rc_only_pct": 39.899,
+    "mean_delta_pp": 5.209,
+    "median_delta_pp": 4.357,
+    "full_higher_pct": 71.77,
+    "equal_pct": 0.03,
+    "full_lower_pct": 28.2,
+    "min_delta_pp": -30.059,
+    "max_delta_pp": 49.323,
+    "p10_delta_pp": -7.2,
+    "p90_delta_pp": 18.555
+  },
+  "singles_mean_comparison": {
+    "n": 3936,
+    "mean_full_pct": 51.994,
+    "mean_rc_only_pct": 50.055,
+    "mean_delta_pp": 1.939,
+    "median_delta_pp": 1.783,
+    "full_higher_pct": 71.98,
+    "equal_pct": 0.03,
+    "full_lower_pct": 28.0,
+    "min_delta_pp": -36.4,
+    "max_delta_pp": 42.887,
+    "p10_delta_pp": -3.028,
+    "p90_delta_pp": 7.315
+  },
+  "errors": []
+}

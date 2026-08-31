@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 
 from .analysis_cache import refresh_analysis_cache
@@ -19,6 +21,21 @@ from .xttv_db_import import import_new_reports, player_ids_from_meids
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
+def _refresh_not_before() -> date | None:
+    raw = os.environ.get("DATA_REFRESH_NOT_BEFORE", "").strip()
+    if not raw or raw.lower() in {"0", "false", "off", "none"}:
+        return None
+    return date.fromisoformat(raw)
+
+
+def _refresh_paused() -> tuple[bool, str | None]:
+    not_before = _refresh_not_before()
+    if not_before is None:
+        return False, None
+    today = date.today()
+    if today < not_before:
+        return True, f"Sommerpause bis {not_before.isoformat()} (heute: {today.isoformat()})"
+    return False, None
 
 
 def _import_rc_for_players(external_ids: list[str]) -> dict:
@@ -52,6 +69,16 @@ def _import_rc_for_players(external_ids: list[str]) -> dict:
 
 def run_data_refresh(*, restart_server: bool = False) -> dict:
     """Find new XTTV reports forward from max MEID; update RC only if needed."""
+    paused, pause_reason = _refresh_paused()
+    if paused:
+        return {
+            "ok": True,
+            "skipped": True,
+            "data_changed": False,
+            "reason": pause_reason,
+            "message": pause_reason,
+        }
+
     create_all()
     started = time.monotonic()
     summary: dict = {}
@@ -123,14 +150,31 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
 
 def _schedule_server_restart() -> None:
     time.sleep(1.5)
-    script = ROOT / "scripts" / "restart-dev.ps1"
-    if not script.is_file():
+    custom = os.environ.get("DATA_REFRESH_RESTART_CMD", "").strip()
+    if custom:
+        try:
+            subprocess.Popen(custom, shell=True, cwd=str(ROOT))
+        except Exception as exc:
+            logger.exception("restart failed: %s", exc)
         return
-    try:
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
-            cwd=str(ROOT),
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
-        )
-    except Exception as exc:
-        logger.exception("restart failed: %s", exc)
+
+    if sys.platform == "win32":
+        script = ROOT / "scripts" / "restart-dev.ps1"
+        if not script.is_file():
+            return
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)],
+                cwd=str(ROOT),
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        except Exception as exc:
+            logger.exception("restart failed: %s", exc)
+        return
+
+    prod_script = ROOT / "scripts" / "restart-prod.sh"
+    if prod_script.is_file():
+        try:
+            subprocess.Popen(["/bin/bash", str(prod_script)], cwd=str(ROOT))
+        except Exception as exc:
+            logger.exception("restart failed: %s", exc)

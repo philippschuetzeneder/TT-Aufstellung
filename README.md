@@ -29,3 +29,7 @@ npm run build
 ```
 
 Die aktuelle Anwendung läuft bewusst mit Demo-/Seed-Daten. Der XTTV-Import ist sauber als spätere Datenquelle vorgesehen und wird nicht live aus der UI aufgerufen. Architektur- und Importnotizen liegen in [`docs/architecture-plan.md`](docs/architecture-plan.md) und [`docs/xttv-data-structure.md`](docs/xttv-data-structure.md).
+
+Backtest-Nachweis (optimale vs. triviale RC-Aufstellung, Saison 2025/2026): [`docs/backtest-optimal-vs-rc-baseline.md`](docs/backtest-optimal-vs-rc-baseline.md).
+
+Wöchentliches Prod-Daten-Update (Montag 04:00, ab 5.10.2026): [`docs/weekly-data-refresh.md`](docs/weekly-data-refresh.md).

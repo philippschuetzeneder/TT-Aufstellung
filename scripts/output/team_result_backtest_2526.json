@@ -1,0 +1,47 @@
+{
+  "season": "2025/2026",
+  "perspective": "home_only",
+  "phase": "C (known opponent quartet + fixed order + direction)",
+  "history_years": 3,
+  "leakage": "RC/stats only before match day (ref_end = match_date - 1)",
+  "cases_total": 3936,
+  "cases_processed": 3936,
+  "cases_skipped": 0,
+  "runtime_sec": 746.3,
+  "timed_out": false,
+  "full_model_optimal": {
+    "n": 3936,
+    "outcome_hit_pct": 0.5345528455284553,
+    "mean_brier": 0.5782257574631597,
+    "mean_log_loss": 1.0456170864514402
+  },
+  "full_model_baseline": {
+    "n": 3936,
+    "outcome_hit_pct": 0.5073678861788617,
+    "mean_brier": 0.5783244595513399,
+    "mean_log_loss": 1.0496026356946897
+  },
+  "rc_only_optimal": {
+    "n": 3936,
+    "outcome_hit_pct": 0.4301321138211382,
+    "mean_brier": 0.6288921362514022,
+    "mean_log_loss": 1.1311806352206348
+  },
+  "rc_only_baseline": {
+    "n": 3936,
+    "outcome_hit_pct": 0.43064024390243905,
+    "mean_brier": 0.6291213464191818,
+    "mean_log_loss": 1.1317716222108531
+  },
+  "delta_full_optimal_minus_baseline_pp": {
+    "outcome_hit_pp": 2.718495934959353,
+    "brier": -9.870208818019144e-05,
+    "log_loss": -0.003985549243249453
+  },
+  "delta_rc_optimal_minus_baseline_pp": {
+    "outcome_hit_pp": -0.05081300813008505,
+    "brier": -0.00022921016777965875,
+    "log_loss": -0.0005909869902183118
+  },
+  "errors": []
+}

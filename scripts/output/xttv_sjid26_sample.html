@@ -1,0 +1,219 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+			<html lang="de">
+			<head>
+				<title>XTTV Ergebnisdienst</title>
+				<meta http-equiv="Content-type" content="text/html; charset=iso-8859-1">
+				<meta http-equiv="pragma" content="no-cache">
+				<meta http-equiv="cache-control" content="no-cache">
+				<meta http-equiv="expires" content="0">				
+				<link rel="shortcut icon" href="../pic/favicon_ed.ico" type="image/x-icon">
+				<link rel="stylesheet" href="../css/ed_style.css" media="screen" type="text/css">
+				<link rel="stylesheet" href="../css/ed_style_printer.css" media="print" type="text/css">
+				<link href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.6-rc.0/css/select2.min.css" rel="stylesheet" />
+				<script src="https://code.jquery.com/jquery-3.3.1.min.js" integrity="sha256-FgpCb/KJQlLNfOu91ta32o/NMZxltwRo8QtmkMRdAu8=" crossorigin="anonymous"></script>
+				<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery.tablesorter/2.2.2/js/jquery.tablesorter.js"></script>
+				<script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.6-rc.0/js/select2.min.js"></script>		
+			
+			<script type=text/javascript>
+				function changePdfVisibility() {
+					if (document.getElementById("pdfform").style.display == "block") {
+						document.getElementById("pdfform").style.display = "none";
+						document.getElementById("pdfform").style.padding = "0px";
+						document.getElementById("pdftable").style.display = "none";
+						document.getElementById("pdflink").innerHTML = "PDF-Auswahl";
+					} else {
+						document.getElementById("pdfform").style.display = "block";
+						document.getElementById("pdfform").style.padding = "10px";
+						document.getElementById("pdftable").style.display = "block";
+						document.getElementById("pdflink").innerHTML = "PDF-Auswahl ausblenden";
+					}
+				}
+			</script>
+			<script type="text/javascript" src="../spamprotection/spamprotection.js"></script>
+<link rel="stylesheet" type="text/css" href="../spamprotection/spamprotection.css" /><link rel="stylesheet" type="text/css" href="//cdnjs.cloudflare.com/ajax/libs/cookieconsent2/3.0.3/cookieconsent.min.css" />
+<script src="//cdnjs.cloudflare.com/ajax/libs/cookieconsent2/3.0.3/cookieconsent.min.js"></script>
+<script>
+window.addEventListener("load", function(){
+	window.cookieconsent.initialise({
+	  "cookie": {
+		  "path": "/ed",
+		  "expiryDays": 365
+	  },
+	  "palette": {
+		"popup": {
+		  "background": "#000"
+		},
+		"button": {
+		  "background": "#f1d600"
+		}
+	  },
+	  "theme": "classic",
+	  "position": "bottom-right",
+	  "content": {
+		"message": "Um unsere Webseite für Sie optimal zu gestalten und fortlaufend verbessern zu können, verwenden wir Cookies. Durch die Nutzung dieser Webseite erklären Sie sich mit der Verwendung von Cookies einverstanden!",
+		"dismiss": "Einverstanden! [schließen]",
+		"link": "Datenschutzerklärung",
+		"href": "https://xttv.at/?page_id=547"
+	  }
+	});
+});
+</script>
+
+			</head>
+			<body>
+			
+    <div id="header">
+	<table class="header">
+		<tr valign="middle">
+			<td style="border-style:none; margin:0; padding:0px;" width="25%" align="left"><a class="img" href="https://http://www.ooettv.at/"><img src="../pic/verbaende/oettv/logo_ooettv.png" border="0" style="margin:5px; margin-left:0px" height="71" alt="" /></a></td>
+			<td style="border-style:none" width="50%" align="center">
+				<span class="headerTitle">XTTV Ergebnisdienst</span><br>
+				<span class="headerSubTitle">Aufgrund von rückwirkenden Änderungen der Einstufungen bei internationalen Turnieren, haben alle Ranglistenpunkte ab 15.6.2026 ein wenig zugenommen (19.6.2026).<noscript><br /><b>Für eine vollständige Funktionsweise und eine optimale Darstellung muss Javascript aktiviert werden.</b></noscript></span>
+			</td>
+			<td style="border-style:none; margin:0; padding:0px;" width="25%" align="right"><a class="img" href=""  target="_blank" > <img  class="noprint" src="" border="0" style="margin:5px; margin-right:0;" height="60" alt="" /></a></td>
+		</tr>
+	</table>
+	</div>
+	
+
+<div id="subheader">
+<table width="100%" border="0" cellpadding="0" cellspacing="0">
+	<tr class="subheader">
+		<td style="border-style:none; padding:5px;" align="left"> 
+
+				<div class="subheader-left">
+			<a href="/ed/index.php?oid=191"><img src="../pic/home.gif" align="middle" border="0" alt="" /></a>
+		</div> 		<div class="subheader-left">
+			<form action="index.php" method="GET" style="margin:0;">
+				<select name="oid" onchange="this.form.submit()"> 						<option value="189" >BTTV</option> 						<option value="190" >KTTV</option> 						<option value="188" >NÖTTV</option> 						<option value="191"  selected="selected">OÖTTV</option> 						<option value="193" >STTTV</option> 						<option value="192" >STTV</option> 						<option value="194" >TTTV</option> 						<option value="195" >VTTV</option> 						<option value="196" >WTTV</option> 						<option value="133" >ÖTTV</option> 						<option value="268" >Superleague</option> 						<option value="862" >Intercup</option> 				</select> 
+				<noscript><br /></noscript> 						&nbsp;
+						<select name="sjid" onchange="this.form.submit()"> 								<option value="26"  selected="selected">2026/2027&nbsp;</option> 								<option value="25" >2025/2026&nbsp;</option> 								<option value="24" >2024/2025&nbsp;</option> 								<option value="23" >2023/2024&nbsp;</option> 								<option value="22" >2022/2023&nbsp;</option> 								<option value="21" >2021/2022&nbsp;</option> 								<option value="20" >2020/2021&nbsp;</option> 								<option value="19" >2019/2020&nbsp;</option> 								<option value="18" >2018/2019&nbsp;</option> 								<option value="17" >2017/2018&nbsp;</option> 								<option value="16" >2016/2017&nbsp;</option> 								<option value="15" >2015/2016&nbsp;</option> 						</select> 				<noscript><br /><input type="submit" value="Absenden"></noscript>
+			</form>
+		</div> 			<script>
+				function submitForm() {
+					const doForm = document.getElementById("doForm");
+					const doSelect = document.getElementById("doSelect");		
+
+					doForm.action = "/ed/index.php";
+					if (doSelect.value == "turniere" || doSelect.value == "ranglisten") {
+						doForm.target = "_blank";
+					} else {
+						doForm.target = "_self";
+					}
+
+					doForm.submit();
+				}
+			</script> 
+			<div class="subheader-left">
+				<form id="doForm" method="GET" style="margin:0;">
+					<select name="do" id="doSelect" onchange="submitForm()">
+						<option value="">Ergebnisse</option>
+						<option value="turniere" >Turniere</option>
+						<option value="ranglisten" >Ranglistenabfrage</option>
+						<option value="vereinstermine" >Vereinstermine</option>
+						<option value="spielersuche" >Spielersuche</option>
+						<option value="spielereinsatz" >Spielereinsätze</option>
+						<option value="benachrichtigung" >E-Mail-Nachricht</option>
+					</select> <input name="oid" type="hidden" value="191"><input name="sjid" type="hidden" value="26"><input name="vid" type="hidden" value="0">					<noscript><br /><input type="submit" value="Absenden"></noscript>
+				</form>
+			</div> 		</td>
+		<td style="border-style:none; padding:5px;" align="right"> 
+				<div class="subheader-right"> 			<a href="../public/Anleitung_XTTV-Ergebnisdienst.pdf" target="_blank"><img src="../pic/hilfe.gif" align="middle" border="0" alt="" /></a>
+		</div> 		<div class="subheader-right">
+			<a class="img" href="/ed/index.php?lang=de&amp;oid=191&amp;sjid=26"><img src="../pic/sprache_de.gif" align="middle" border="0" alt="" /></a>
+			<a class="img" href="/ed/index.php?lang=en&amp;oid=191&amp;sjid=26"><img src="../pic/sprache_en.gif" align="middle" border="0" alt="" /></a>
+		</div>
+
+				<div class="subheader-right"> 				<form action="login.php" method="POST"> 							 
+						<input type="button" style="width:120px;" value="Anmeldung" name="dummy" onclick="document.getElementById('loginFenster').style.display='inline';document.getElementById('benutzer').focus();document.getElementById('benutzer').select();"> 				</form>	 			<div id="loginFenster" style="display:none;" > 
+					<form action="login.php" method="POST"> <input name="oid" type="hidden" value="191" /><input name="sjid" type="hidden" value="26" />Benutzer: <input name="user" id="benutzer" type="text" size="10" maxlength="20" /><br /> Kennwort: <input name="password" type="password" size="10" /><br /><br />
+							<input type="checkbox" name="remember" value="1">Angemeldet bleiben<br /><br />
+							<a class="login" href="/ed/index.php?pw=lost">Passwort vergessen</a><br /><br />
+							<input name="login" type="submit" value="Anmelden" /><br /> 						<input name="cancel" type="Button" value="Abbrechen" onclick="document.getElementById('loginFenster').style.display='none'" /> 
+					</form> 
+			</div>
+		</div> 
+		<div class="subheader-right"> 
+			<form action="../dv/index.php" method="POST">
+				<input type="submit" value="Datenverwaltung">
+			</form>
+		</div>
+		</td>
+	</tr>
+</table>
+</div> 
+
+ 
+
+			<div id="uebersicht">
+				<table class="uebersicht">
+					<tr>
+						<th colspan="7">Herren Mannschafts Meisterschaft</th>
+					</tr>
+					<tr>
+								<th>Landesebenen							</th>
+								<th>Regionalliga							</th>
+								<th>Regionalklasse							</th>
+								<th>Bezirksliga							</th>
+								<th>Bezirksklasse							</th>
+								<th>1. Klasse							</th>
+								<th>2. Klasse							</th>
+					</tr>
+					<tr>
+							<td class="oben-zentriert">
+	<a href="/ed/index.php?lid=8794">100 DONIC/GO SPORTS OÖ-Liga</a><br /><a href="/ed/index.php?lid=8796">101 Landesliga Nord-Ost powered by Go Sports</a><br /><a href="/ed/index.php?lid=8797">141 Landesliga Süd-West powered by Go Sports</a><br /><a href="/ed/index.php?lid=8798">201 Landesklasse Nord-Ost</a><br /><a href="/ed/index.php?lid=8799">241 Landesklasse Süd-West</a><br />							</td>
+							<td class="oben-zentriert">
+	<a href="/ed/index.php?lid=8800">301 Regionalliga Nord</a><br /><a href="/ed/index.php?lid=8801">321 Regionalliga Ost/Mitte</a><br /><a href="/ed/index.php?lid=8802">341 Regionalliga Süd/Mitte</a><br /><a href="/ed/index.php?lid=8803">361 Regionalliga Süd-West</a><br />							</td>
+							<td class="oben-zentriert">
+	<a href="/ed/index.php?lid=8815">401 RK Linz -MV Umg.</a><br /><a href="/ed/index.php?lid=8816">411 RK Linz Umg. / MV Mitte</a><br /><a href="/ed/index.php?lid=8817">421 RK Linz Umg. / MV Ost</a><br /><a href="/ed/index.php?lid=8818">431 RK Steyr Umg. / LL</a><br /><a href="/ed/index.php?lid=8819">441 RK Linz, LL-Kirchdorf Umg.</a><br /><a href="/ed/index.php?lid=8820">451 RK Salzkammergut-Umg.</a><br /><a href="/ed/index.php?lid=8821">461 RK W-WL- Attn.Umg.- VB Umg.</a><br /><a href="/ed/index.php?lid=8822">471 RK Innviertel-Umg.</a><br />							</td>
+							<td class="oben-zentriert">
+	<a href="/ed/index.php?lid=8823">501 Bezirksliga Linz,LL Umg./MV West</a><br /><a href="/ed/index.php?lid=8824">511 Bezirksliga Linz -Umg./MV Mitte</a><br /><a href="/ed/index.php?lid=8825">521 Bezirksliga Linz Umg./MV Ost</a><br /><a href="/ed/index.php?lid=8826">531 Bezirksliga Steyr - Linz Umg.</a><br /><a href="/ed/index.php?lid=8827">541 Bezirksliga Kremstal / Wels-Umg.</a><br /><a href="/ed/index.php?lid=8828">551 Bezirksliga Salzkammergut-Umg.</a><br /><a href="/ed/index.php?lid=8829">561 Bezirksliga Wels,WL -Innv.-Umg.</a><br /><a href="/ed/index.php?lid=8830">571 Bezirksliga Innv. u. Umland</a><br />							</td>
+							<td class="oben-zentriert">
+	<a href="/ed/index.php?lid=8831">601 Bezirksklasse Linz / MV West</a><br /><a href="/ed/index.php?lid=8832">602 Bezirksklasse Linz Umg.-MV Mitte Nord</a><br /><a href="/ed/index.php?lid=8833">611 Bezirksklasse Linz Umg. / MV -PE- FR</a><br /><a href="/ed/index.php?lid=8834">612 Bezirksklasse Linz / LL /UU</a><br /><a href="/ed/index.php?lid=8835">621 Bezirksklasse Linz Umg. / MV-PE-FR.</a><br /><a href="/ed/index.php?lid=8836">631 Bezirksklasse Steyr-PE Umg.</a><br /><a href="/ed/index.php?lid=8837">632 Bezirksklasse Steyr,LL,W,WL,Kichdorf Umg.</a><br /><a href="/ed/index.php?lid=8838">641 Bezirksklasse LL,Wels-Kichdorf Umg.</a><br /><a href="/ed/index.php?lid=8839">651 Bezirksklasse KI, WE, WL, GM,VB Umg.</a><br /><a href="/ed/index.php?lid=8840">652 Bezirksklasse Salzkammergut Umg.</a><br /><a href="/ed/index.php?lid=8841">661 Bezirksklasse LL, WE,WL -Umg.</a><br /><a href="/ed/index.php?lid=8842">662 Bezirksklasse VB,Hausruck- Umg.</a><br /><a href="/ed/index.php?lid=8843">671 Bezirksklasse Innviertel/Braunau</a><br /><a href="/ed/index.php?lid=8844">672 Bezirksklasse Innviertel/Schärding</a><br />							</td>
+							<td class="oben-zentriert">
+	<a href="/ed/index.php?lid=8845">701 1. Klasse Linz ,LL,WL, Mühlviertel-West-Umg.</a><br /><a href="/ed/index.php?lid=8846">702 1. Klasse Mühlviertel-Mitte</a><br /><a href="/ed/index.php?lid=8847">711 1. Klasse Linz , LL-Umg.</a><br /><a href="/ed/index.php?lid=8848">712 1. Klasse Linz - LL- UU</a><br /><a href="/ed/index.php?lid=8849">721 1. Klasse Linz Umg./Mühlviertel Ost</a><br /><a href="/ed/index.php?lid=8850">731 1. Klasse Steyr Umg. / LL/PE</a><br /><a href="/ed/index.php?lid=8851">741 1. Klasse LL / Wels / Kremstal</a><br /><a href="/ed/index.php?lid=8852">751 1. Klasse Salzkammergut 1</a><br /><a href="/ed/index.php?lid=8853">752 1. Klasse Salzkammergut 2</a><br /><a href="/ed/index.php?lid=8854">761 1. Klasse Wels / WL / Innv.</a><br /><a href="/ed/index.php?lid=8855">771 1. Klasse Innv. / Braunau</a><br /><a href="/ed/index.php?lid=8856">781 1. Klasse Innv. - Schärding / Mühlv.West</a><br />							</td>
+							<td class="oben-zentriert">
+								&nbsp;
+								</td>
+					</tr>
+					<tr>
+						<th colspan="7">Damen MM, Cup und Jugend</th>
+					</tr>
+					<tr>
+								<th>Damen MM							</th>
+								<th>Cup							</th>
+								<th>U17							</th>
+								<th>U15							</th>
+								<th>U13							</th>
+								<th>U11							</th>
+	<td colspan="1">&nbsp;</td>				</tr>
+					<tr>
+							<td class="oben-zentriert">
+								&nbsp;
+								</td>
+							<td class="oben-zentriert">
+	<a href="/ed/index.php?lid=9007">UNIQA-Herren-Cup OÖ-L/LL/LK</a><br /><a href="/ed/index.php?lid=9008">UNIQA-Herren-Cup RL/RK/BL</a><br /><a href="/ed/index.php?lid=9009">UNIQA-Herren-Cup BK/1.KL</a><br />							</td>
+							<td class="oben-zentriert">
+								&nbsp;
+								</td>
+							<td class="oben-zentriert">
+								&nbsp;
+								</td>
+							<td class="oben-zentriert">
+								&nbsp;
+								</td>
+							<td class="oben-zentriert">
+								&nbsp;
+								</td>
+	<td colspan="1">&nbsp;</td>				</tr>
+				</table>
+				</div>
+	
+<div id="siteInfo">
+
+XTTV Ergebnisdienst (Version 2026)	<span class="noPrint">| <a href="https://xttv.at" target="_blank">XTTV</a> 
+			| <a href="mailto:office@ooettv.at">OÖTTV-Kontakt</a>
+		| <a target="_blank" href="https://xttv.at/?page_id=547">Datenschutzerklärung</a>
+	</span>
+</div>
+</body></html>

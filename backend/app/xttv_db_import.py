@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import time
 import urllib.error
-from datetime import datetime
+from datetime import date, datetime
 
 from bs4 import BeautifulSoup
 
@@ -17,7 +17,21 @@ from .models import MatchGame, MatchPlayer, RawSourceDocument, XttvMatch, XttvPl
 from .xttv_import import fetch_match
 from .xttv_parser import normalize_team_name, parse_match
 
-TARGET_SEASONS = {"2025/2026", "2024/2025", "2023/2024"}
+SEASON_ROLLOVER_DATE = date(2026, 10, 5)
+TARGET_SEASONS_BEFORE_ROLLOVER = frozenset({"2025/2026", "2024/2025", "2023/2024"})
+TARGET_SEASONS_AFTER_ROLLOVER = frozenset({"2026/2027", "2025/2026", "2024/2025"})
+
+
+def get_target_seasons(*, today: date | None = None) -> frozenset[str]:
+    """Rolling three-season window; switches to 2026/2027 on first weekly refresh date."""
+    today = today or date.today()
+    if today >= SEASON_ROLLOVER_DATE:
+        return TARGET_SEASONS_AFTER_ROLLOVER
+    return TARGET_SEASONS_BEFORE_ROLLOVER
+
+
+# Backward-compatible alias for scripts that import the constant directly.
+TARGET_SEASONS = get_target_seasons()
 REFERENCE_MEID = 437757
 MAX_IMPORT = 200
 EMPTY_STREAK_STOP = 25
@@ -282,7 +296,7 @@ def _classify_meid(meid: int, *, check_db: bool = True) -> dict:
     }
     importable = False
     status = "valid_outside_filter"
-    if quick["season"] not in TARGET_SEASONS:
+    if quick["season"] not in get_target_seasons():
         detail["filter_reason"] = "season"
     elif quick["is_three_player"]:
         detail["filter_reason"] = "three_player"

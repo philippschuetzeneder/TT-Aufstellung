@@ -1,0 +1,10 @@
+# TT-Aufstellung — weekly XTTV/RC data refresh
+# Install: sudo cp deploy/tt-aufstellung-weekly-refresh.cron /etc/cron.d/tt-aufstellung-weekly-refresh
+#          sudo chmod 644 /etc/cron.d/tt-aufstellung-weekly-refresh
+#
+# Runs every Monday 04:00 Europe/Vienna. The shell script skips execution before 2026-10-05 (summer pause).
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Europe/Vienna
+
+0 4 * * 1 root DATA_REFRESH_NOT_BEFORE=2026-10-05 /opt/tt-aufstellung/scripts/weekly-data-refresh-prod.sh
