@@ -36,9 +36,11 @@ WIN_TARGET = 8
 MAX_ANALYSIS_SECONDS = 5.0
 STATS_YEARS = 2
 OPPONENT_POOL_YEARS = 2
-LINEUP_RECENCY_HALF_LIFE_DAYS = 60.0
-# Resharpen opponent scenario weights: p' = p^alpha / sum(p^alpha). alpha>1
-# concentrates mass on likelier lineups (less hedge-averaging of own orders).
+# Recency decay by completed league rounds (matches), not calendar days.
+LINEUP_RECENCY_HALF_LIFE_MATCHES = 8.0
+# Legacy alias kept for external scripts that still reference the old name.
+LINEUP_RECENCY_HALF_LIFE_DAYS = LINEUP_RECENCY_HALF_LIFE_MATCHES
+# Concentrate opponent scenario mass for own-lineup ranking, display, and alternatives.
 SCENARIO_SHARPENING_ALPHA = 2.5
 # Pseudo-observations blended with joint quartet history; n=5 -> 5/6 joint weight (~83%).
 KNOWN_QUARTET_JOINT_PRIOR_STRENGTH = 1.0
@@ -60,12 +62,14 @@ COHESIVE_TRIO_MIN_RECENCY_MASS = 3.5
 MEDIUM_GROUP_MIN_MATCHES = 4
 _global_strength_support_cache: dict[str, tuple[float, float, float, int]] = {}
 _lineup_cohesion_cache: dict[tuple[str, str], tuple[int, float, int, float]] = {}
+_match_rounds_ago_cache: dict[tuple[str, str], dict[int, int]] = {}
 
 
 def clear_analysis_runtime_caches() -> None:
     """Drop in-process caches after DB imports."""
     _lineup_cohesion_cache.clear()
     _global_strength_support_cache.clear()
+    _match_rounds_ago_cache.clear()
 DEFAULT_RC_RATING = 1200.0
 TREND_MIN_RC = -100.0
 TREND_MAX_RC = 100.0
@@ -93,8 +97,15 @@ HOME_AWAY_MAX_COMPONENT = 0.08
 HOME_AWAY_MIN_GAMES = 8
 HOME_AWAY_MIN_OVERALL_GAMES = 12
 HOME_AWAY_COMPONENT_SCALE = 0.32
-H2H_MAX_WEIGHT = 0.85
-MODEL_VERSION = 'rc-h2h-homeaway-v34-infra'
+H2H_SHRINKAGE_MATCHES = 4.0
+H2H_LEGACY_PRIOR_WINS = 1.5
+H2H_LEGACY_PRIOR_GAMES = 3.0
+H2H_LEGACY_WEIGHT_CAP = 0.85
+H2H_LEGACY_WEIGHT_BASE = 0.35
+H2H_LEGACY_WEIGHT_GAMES_DIV = 6.0
+# 0 = pure shrinkage toward RC base, 1 = legacy weighted direct record, 0.5 = midpoint.
+H2H_SHRINKAGE_BLEND = 0.5
+MODEL_VERSION = 'rc-h2h-homeaway-v36-sharpen-blend'
 
 # Safe XTTV date parsing — invalid or missing dates become NULL instead of aborting SQL.
 _SQL_MATCH_DAY = (
@@ -205,6 +216,44 @@ def _resolve_rc_rating(pid, rc_by_player, player_ids):
     return _team_average_rc(rc_by_player, player_ids, exclude_pid=pid)
 
 
+def _effective_rc(rating, deviation=None):
+    """Shrink observed RC toward baseline when deviation is large."""
+    if rating is None:
+        return None
+    try:
+        value = float(rating)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    if deviation is None:
+        return value
+    try:
+        dev = float(deviation)
+    except (TypeError, ValueError):
+        return value
+    if not math.isfinite(dev) or dev <= 0:
+        return value
+    confidence = 1.0 / (1.0 + dev / RC_SCALE)
+    return RC_BASELINE + confidence * (value - RC_BASELINE)
+
+
+def _impute_missing_rc_ratings(profiles, player_ids):
+    """Fill missing RC in profiles using the same teammate-average rule as lineup priors."""
+    player_ids = [str(x) for x in player_ids]
+    rc_map = {
+        pid: profiles.get(pid, _empty_profile()).get('rc_rating')
+        for pid in player_ids
+    }
+    for pid in player_ids:
+        profile = profiles.setdefault(pid, _empty_profile())
+        if profile.get('rc_rating') is None:
+            profile['rc_rating'] = _resolve_rc_rating(pid, rc_map, player_ids)
+            profile['rc_imputed'] = True
+        else:
+            profile['rc_imputed'] = False
+
+
 def _pick_quartet_from_pool(db, pool, ref_date=None, prefer=None):
     """Pick four distinct opponent ids, preferring known players then RC strength."""
     del ref_date
@@ -280,13 +329,53 @@ def _cutoff(ref, years):
     return ref - timedelta(days=int(round(years * 365.25)))
 
 
-def _lineup_recency_weight(match_date, ref_date):
-    """Exponential recency weight for a historical lineup observation."""
-    parsed = _parse_match_date(match_date)
-    if not parsed or not ref_date:
-        return 0.15
-    age_days = max(0, (ref_date - parsed).days)
-    return math.pow(0.5, age_days / LINEUP_RECENCY_HALF_LIFE_DAYS)
+def _lineup_recency_weight_by_rounds(rounds_ago: int | float) -> float:
+    """Exponential decay by league rounds completed before the reference match."""
+    age = max(0.0, float(rounds_ago))
+    return math.pow(0.5, age / LINEUP_RECENCY_HALF_LIFE_MATCHES)
+
+
+def _build_match_rounds_ago(db, ref_date) -> dict[int, int]:
+    """Map match_id -> rounds before ref_date (0 = most recent completed round)."""
+    ref_date = ref_date or _reference_date(db)
+    cache_key = (str(ref_date), str(_cutoff(ref_date, STATS_YEARS)))
+    cached = _match_rounds_ago_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    rows = db.execute(
+        text(f"""
+        SELECT m.id AS match_id
+        FROM xttv_matches m
+        WHERE {_SQL_MATCH_DAY} IS NOT NULL
+          AND {_SQL_MATCH_DAY} <= :ref_date
+          AND {_MATCH_DAY_FILTER}
+        ORDER BY {_SQL_MATCH_DAY} DESC, m.id DESC
+        """),
+        {'ref_date': ref_date, 'cutoff': _cutoff(ref_date, STATS_YEARS)},
+    ).mappings()
+    result = {int(row['match_id']): idx for idx, row in enumerate(rows)}
+    _match_rounds_ago_cache[cache_key] = result
+    return result
+
+
+def _lineup_recency_weight(
+    match_date,
+    ref_date,
+    *,
+    match_id=None,
+    rounds_ago=None,
+    rounds_map=None,
+):
+    """Recency weight for lineup observations (round-based, not calendar-based)."""
+    del match_date
+    if rounds_ago is not None:
+        return _lineup_recency_weight_by_rounds(rounds_ago)
+    if match_id is not None and rounds_map is not None:
+        idx = rounds_map.get(int(match_id))
+        if idx is not None:
+            return _lineup_recency_weight_by_rounds(idx)
+    # Unknown round index: moderate stale weight (avoid calendar-day fallback).
+    return _lineup_recency_weight_by_rounds(4.0)
 
 
 def _empty_profile():
@@ -294,7 +383,8 @@ def _empty_profile():
         'wins': 0, 'games': 0,
         'home_wins': 0, 'home_games': 0,
         'away_wins': 0, 'away_games': 0,
-        'rc_rating': None, 'rc_trend': None, 'rc_trend_momentum': None, 'trend_component': 0.0,
+        'rc_rating': None, 'rc_deviation': None, 'rc_imputed': False,
+        'rc_trend': None, 'rc_trend_momentum': None, 'trend_component': 0.0,
         'spieltyp': None, 'style_matchups': {}, 'style_component': 0.0,
     }
 
@@ -623,6 +713,25 @@ def _logistic(delta, scale=4.0):
     return 1.0 / (1.0 + math.exp(-scale * delta))
 
 
+def _h2h_shrunk_probability(wins, games, base):
+    return (wins + H2H_SHRINKAGE_MATCHES * base) / (games + H2H_SHRINKAGE_MATCHES)
+
+
+def _h2h_legacy_probability(wins, games, base):
+    direct = (wins + H2H_LEGACY_PRIOR_WINS) / (games + H2H_LEGACY_PRIOR_GAMES)
+    weight = min(
+        H2H_LEGACY_WEIGHT_CAP,
+        H2H_LEGACY_WEIGHT_BASE + games / H2H_LEGACY_WEIGHT_GAMES_DIV,
+    )
+    return (1.0 - weight) * base + weight * direct
+
+
+def _h2h_blended_probability(wins, games, base):
+    shrunk = _h2h_shrunk_probability(wins, games, base)
+    legacy = _h2h_legacy_probability(wins, games, base)
+    return (1.0 - H2H_SHRINKAGE_BLEND) * shrunk + H2H_SHRINKAGE_BLEND * legacy
+
+
 def _matchup_probability(a, b, profiles, matchups, own_is_home=True, use_spieltyp=False):
     own_profile = profiles.get(a, _empty_profile())
     opp_profile = profiles.get(b, _empty_profile())
@@ -641,9 +750,26 @@ def _matchup_probability(a, b, profiles, matchups, own_is_home=True, use_spielty
     wins, games = matchups.get((a, b), (0, 0))
     if not games:
         return base
-    direct = (wins + 1.5) / (games + 3.0)
-    weight = min(H2H_MAX_WEIGHT, 0.35 + games / 6.0)
-    return _clamp_probability((1.0 - weight) * base + weight * direct)
+    return _clamp_probability(_h2h_blended_probability(wins, games, base))
+
+
+def _lookup_matchup_probability(
+    matchup_p,
+    own_id,
+    opp_id,
+    profiles,
+    matchups,
+    own_is_home=True,
+    use_spieltyp=False,
+):
+    """Resolve a singles probability without silently defaulting to 0.5."""
+    key = (own_id, opp_id)
+    if key in matchup_p:
+        return matchup_p[key]
+    return _matchup_probability(
+        own_id, opp_id, profiles, matchups,
+        own_is_home=own_is_home, use_spieltyp=use_spieltyp,
+    )
 
 
 def _pair_combined_strength(p1, p2, profiles):
@@ -721,9 +847,16 @@ def _build_scenario_doubles_cache(scenarios, pair_a, pair_b, profiles, doubles_s
 def _scenario_match_outcome(
     own_order, opp_order, schedule, matchup_p, pair_a, pair_b, profiles, doubles_stats,
     stronger_doubles_on, stronger_double_pair, doubles5=None, doubles10=None,
-    fixed_game_pairs=None,
+    fixed_game_pairs=None, matchups=None, own_is_home=True, use_spieltyp=False,
 ):
-    singles = [matchup_p.get((own_order[own_idx], opp_order[opp_idx]), 0.5) for own_idx, opp_idx in schedule]
+    matchups = matchups or {}
+    singles = [
+        _lookup_matchup_probability(
+            matchup_p, own_order[own_idx], opp_order[opp_idx],
+            profiles, matchups, own_is_home=own_is_home, use_spieltyp=use_spieltyp,
+        )
+        for own_idx, opp_idx in schedule
+    ]
     if doubles5 is None or doubles10 is None:
         doubles5, doubles10 = _doubles_probs_for_scenario(
             opp_order, pair_a, pair_b, profiles, doubles_stats, stronger_double_pair, fixed_game_pairs,
@@ -757,11 +890,20 @@ def _game_play_probabilities(probs):
     return played
 
 
-def _evaluate_lineup_for_perm(own_order, scenario_cache, matchup_p, schedule):
+def _evaluate_lineup_for_perm(
+    own_order, scenario_cache, matchup_p, schedule, *,
+    profiles, matchups, own_is_home=True, use_spieltyp=False,
+):
     agg5 = _empty_match_agg()
     agg10 = _empty_match_agg()
     for scenario_probability, opp_order, doubles5, doubles10 in scenario_cache:
-        singles = [matchup_p.get((own_order[own_idx], opp_order[opp_idx]), 0.5) for own_idx, opp_idx in schedule]
+        singles = [
+            _lookup_matchup_probability(
+                matchup_p, own_order[own_idx], opp_order[opp_idx],
+                profiles, matchups, own_is_home=own_is_home, use_spieltyp=use_spieltyp,
+            )
+            for own_idx, opp_idx in schedule
+        ]
         for agg, doubles in ((agg5, doubles5), (agg10, doubles10)):
             game_probs = _build_game_probs(singles, doubles)
             _accumulate_match_agg(agg, _team_result_distribution(game_probs), scenario_probability)
@@ -879,6 +1021,10 @@ def _compute_lineup_configuration_spread_pp(
                         caches_by_orientation[home],
                         matchup_by_orientation[home],
                         schedule_by_orientation[home],
+                        profiles=profiles,
+                        matchups=matchups,
+                        own_is_home=home,
+                        use_spieltyp=use_spieltyp,
                     )
                     orientation_wins.append(agg['win'])
                 wins.append(sum(orientation_wins) / len(orientations))
@@ -1027,6 +1173,7 @@ def _load_opponent_pool(db, team, ref_date):
 def _raw_team_lineup_scenarios(db, team, required_ids=None, ref_date=None, opponent_pool=None):
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
+    rounds_map = _build_match_rounds_ago(db, ref_date)
     opponent_pool = opponent_pool or _load_opponent_pool(db, team, ref_date)
     rows = db.execute(text(f"""
         SELECT m.id AS match_id, m.match_date, mp.external_player_id AS player_id,
@@ -1043,7 +1190,7 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None, ref_date=None, oppon
         matches[row['match_id']].append(row)
     counts = Counter(); names = {}
     required = set(str(x) for x in required_ids) if required_ids is not None else None
-    for players in matches.values():
+    for match_id, players in matches.items():
         by_id = {}
         for r in players:
             pid = str(r['player_id']); by_id.setdefault(pid, r); names.setdefault(pid, r['player_name'])
@@ -1066,6 +1213,7 @@ def _raw_team_lineup_scenarios(db, team, required_ids=None, ref_date=None, oppon
         if valid and all(order):
             counts[tuple(order)] += _lineup_recency_weight(
                 players[0].get('match_date'), ref_date,
+                match_id=match_id, rounds_map=rounds_map,
             )
     total = sum(counts.values())
     if not total:
@@ -1081,6 +1229,7 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
     """Historical position orders for an exact known quartet (optionally team-scoped)."""
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
+    rounds_map = _build_match_rounds_ago(db, ref_date)
     ids = [str(x) for x in player_ids]
     bind_names = [f'known_id_{i}' for i in range(len(ids))]
     id_params = {name: value for name, value in zip(bind_names, ids)}
@@ -1111,7 +1260,7 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
         names.setdefault(str(row['player_id']), row['player_name'])
 
     counts = Counter()
-    for players in matches.values():
+    for match_id, players in matches.items():
         by_side = defaultdict(dict)
         for row in players:
             by_side[row['side']][str(row['player_id'])] = row
@@ -1129,6 +1278,7 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
             if valid and all(order):
                 counts[tuple(order)] += _lineup_recency_weight(
                     players[0].get('match_date'), ref_date,
+                    match_id=match_id, rounds_map=rounds_map,
                 )
 
     total = sum(counts.values())
@@ -1141,6 +1291,7 @@ def _load_player_position_priors(db, player_ids, ref_date=None, team=None):
     """Recency-weighted, smoothed per-player singles position rates (team-scoped or cross-team)."""
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
+    rounds_map = _build_match_rounds_ago(db, ref_date)
     ids = [str(x) for x in player_ids]
     bind_names = [f'pid_{i}' for i in range(len(ids))]
     id_params = {name: value for name, value in zip(bind_names, ids)}
@@ -1153,7 +1304,8 @@ def _load_player_position_priors(db, player_ids, ref_date=None, team=None):
         )
         params['team'] = team
     rows = db.execute(text(f"""
-        SELECT mp.external_player_id::text AS player_id, mp.position, m.match_date
+        SELECT mp.external_player_id::text AS player_id, mp.position,
+               m.id AS match_id, m.match_date
         FROM xttv_matches m
         JOIN match_players mp ON mp.match_id = m.id
         WHERE mp.external_player_id IS NOT NULL
@@ -1162,17 +1314,28 @@ def _load_player_position_priors(db, player_ids, ref_date=None, team=None):
           AND {_MATCH_DAY_FILTER}
     """), params).mappings()
     counts = {pid: [0.0, 0.0, 0.0, 0.0] for pid in ids}
+    raw_counts = {pid: [0, 0, 0, 0] for pid in ids}
     for row in rows:
         pid = str(row['player_id'])
         idx = _position_index(row['position'])
         if pid in counts and idx is not None:
-            counts[pid][idx] += _lineup_recency_weight(row.get('match_date'), ref_date)
-    alpha = POSITION_PRIOR_SMOOTHING
+            weight = _lineup_recency_weight(
+                row.get('match_date'), ref_date,
+                match_id=row.get('match_id'), rounds_map=rounds_map,
+            )
+            counts[pid][idx] += weight
+            raw_counts[pid][idx] += 1
     priors = {}
     for pid in ids:
-        c = counts[pid]
-        denom = sum(c) + 4 * alpha
-        priors[pid] = [(x + alpha) / denom for x in c]
+        weighted = counts[pid]
+        raw = raw_counts[pid]
+        total_raw = sum(raw)
+        total_weighted = sum(weighted)
+        # More Dirichlet smoothing when few distinct observations (F12).
+        alpha_scale = math.sqrt(4.0 / max(1.0, float(total_raw)))
+        alpha = POSITION_PRIOR_SMOOTHING * alpha_scale
+        denom = total_weighted + 4 * alpha
+        priors[pid] = [(x + alpha) / denom for x in weighted]
     return priors
 
 
@@ -1300,11 +1463,7 @@ def _measure_strength_lineup_support(db, player_ids, ref_date=None):
 
 
 def _adaptive_strength_position_weights(player_ids, rc_by_player):
-    """Derive A/B/C/D slot weights from RC gaps within the quartet.
-
-    Tight RC spread uses a narrow fixed gradient (never equal weights). Larger
-    gaps at the top (clear #1) raise A; larger gaps at the bottom lower D.
-    """
+    """Monotone A>=B>=C>=D slot weights derived from RC gaps within the quartet."""
     rc_values = sorted(
         _resolve_rc_rating(pid, rc_by_player, player_ids) for pid in player_ids
     )
@@ -1316,10 +1475,14 @@ def _adaptive_strength_position_weights(player_ids, rc_by_player):
     normalized = [gap / total_gap for gap in gaps]
     w_min = STRENGTH_POSITION_WEIGHT_MIN
     w_span = STRENGTH_POSITION_WEIGHT_MAX - STRENGTH_POSITION_WEIGHT_MIN
+    # Top gap (2nd-strongest vs strongest) raises A; bottom gap lowers D.
     w_a = w_min + w_span * (0.25 + 0.75 * normalized[2])
-    w_d = w_min + w_span * (0.25 + 0.75 * normalized[0])
-    w_b = w_min + w_span * (0.25 + 0.75 * (normalized[1] + normalized[2]) / 2.0)
+    w_d = w_min + w_span * (0.25 + 0.75 * (1.0 - normalized[0]))
+    w_b = w_min + w_span * (0.25 + 0.75 * (normalized[2] + normalized[1]) / 2.0)
     w_c = w_min + w_span * (0.25 + 0.75 * (normalized[0] + normalized[1]) / 2.0)
+    w_b = min(w_a, w_b)
+    w_c = min(w_b, w_c)
+    w_d = min(w_c, w_d)
     return (w_a, w_b, w_c, w_d)
 
 
@@ -1368,6 +1531,7 @@ def _lineup_cohesion(db, player_ids, ref_date=None):
     cached = _lineup_cohesion_cache.get(cache_key)
     if cached is not None:
         return cached
+    rounds_map = _build_match_rounds_ago(db, ref_date)
     rows = db.execute(text(f"""
         SELECT m.id AS match_id, m.match_date, mp.side, mp.external_player_id::text AS player_id
         FROM xttv_matches m
@@ -1382,12 +1546,15 @@ def _lineup_cohesion(db, player_ids, ref_date=None):
     by_lineup = {}
     for row in rows:
         key = (row['match_id'], row['side'])
-        entry = by_lineup.setdefault(key, {'players': set(), 'match_date': row['match_date']})
+        entry = by_lineup.setdefault(key, {'players': set(), 'match_date': row['match_date'], 'match_id': row['match_id']})
         entry['players'].add(str(row['player_id']))
     for entry in by_lineup.values():
         lineup = entry['players']
         overlap = lineup & actual
-        weight = _lineup_recency_weight(entry['match_date'], ref_date)
+        weight = _lineup_recency_weight(
+            entry['match_date'], ref_date,
+            match_id=entry.get('match_id'), rounds_map=rounds_map,
+        )
         if len(overlap) == 4:
             exact += 1
             exact_mass += weight
@@ -1406,20 +1573,38 @@ def _lineup_cohesion(db, player_ids, ref_date=None):
     return result
 
 
+def _global_strength_weight_scale(db, ref_date=None):
+    """Scale strength-prior trust from measured league-wide RC-on-A/D support (F10)."""
+    support, _, _, total = _measure_global_strength_lineup_support(db, ref_date)
+    if total < GLOBAL_STRENGTH_MIN_SAMPLE:
+        return 1.0
+    min_support = (GLOBAL_STRENGTH_MIN_TOP_RATE + GLOBAL_STRENGTH_MIN_BOTTOM_RATE) / 2.0
+    if support >= min_support + 0.03:
+        return 1.0
+    if support <= min_support - 0.02:
+        return 0.4
+    span = 0.05
+    return 0.4 + max(0.0, (support - (min_support - 0.02)) / span) * 0.6
+
+
 def _adaptive_strength_weight(db, player_ids, ref_date=None):
     """Strength weight based on recurrence of the four-player group."""
+    ref_date = ref_date or _reference_date(db)
     exact, exact_mass, trio, trio_mass = _lineup_cohesion(db, player_ids, ref_date)
     if exact >= COHESIVE_QUARTET_MIN_MATCHES and exact_mass >= COHESIVE_QUARTET_MIN_RECENCY_MASS:
-        return 0.15, exact, trio
-    if trio >= COHESIVE_TRIO_MIN_MATCHES and trio_mass >= COHESIVE_TRIO_MIN_RECENCY_MASS:
-        return 0.30, exact, trio
-    if exact >= MEDIUM_GROUP_MIN_MATCHES and exact_mass >= 2.0:
-        return 0.40, exact, trio
-    if exact == 0 and trio == 0:
-        return 0.80, exact, trio
-    if exact <= 1 and trio <= 1:
-        return 0.80, exact, trio
-    return 0.70, exact, trio
+        strength_weight = 0.15
+    elif trio >= COHESIVE_TRIO_MIN_MATCHES and trio_mass >= COHESIVE_TRIO_MIN_RECENCY_MASS:
+        strength_weight = 0.30
+    elif exact >= MEDIUM_GROUP_MIN_MATCHES and exact_mass >= 2.0:
+        strength_weight = 0.40
+    elif exact == 0 and trio == 0:
+        strength_weight = 0.80
+    elif exact <= 1 and trio <= 1:
+        strength_weight = 0.80
+    else:
+        strength_weight = 0.70
+    strength_weight *= _global_strength_weight_scale(db, ref_date)
+    return min(0.80, max(0.0, strength_weight)), exact, trio
 
 
 def _normalize_scenario_map(scenario_map):
@@ -1653,10 +1838,11 @@ def _load_player_profiles(db, ids, ref_date):
     rc_stmt = text("""
         SELECT xp.external_player_id::text AS player_id,
                snap.rc_rating,
+               snap.rc_deviation,
                snap.observed_at
         FROM xttv_players xp
         JOIN LATERAL (
-            SELECT rc_rating, observed_at
+            SELECT rc_rating, rc_deviation, observed_at
             FROM player_rating_snapshots
             WHERE player_id = xp.id
               AND source = 'ratingscentral'
@@ -1668,7 +1854,10 @@ def _load_player_profiles(db, ids, ref_date):
     for r in db.execute(rc_stmt, params).mappings():
         pid = str(r['player_id'])
         profiles.setdefault(pid, _empty_profile())
-        profiles[pid]['rc_rating'] = float(r['rc_rating']) if r['rc_rating'] is not None else None
+        raw_rc = float(r['rc_rating']) if r['rc_rating'] is not None else None
+        deviation = float(r['rc_deviation']) if r.get('rc_deviation') is not None else None
+        profiles[pid]['rc_deviation'] = deviation
+        profiles[pid]['rc_rating'] = _effective_rc(raw_rc, deviation)
 
     # Load the statistics horizon; _compute_trend_metrics narrows this to the
     # date span of the latest <=25 singles (not to a calendar year).
@@ -1776,6 +1965,7 @@ def _load_player_profiles(db, ids, ref_date):
     matchups = {}
     for r in db.execute(h2h_stmt, params).mappings():
         matchups[(str(r['player_id']), str(r['opponent_id']))] = (int(r['wins'] or 0), int(r['games'] or 0))
+    _impute_missing_rc_ratings(profiles, ids)
     return names, profiles, matchups
 
 
@@ -1785,10 +1975,12 @@ def _load_latest_rc_map(db, ids):
     if not ids:
         return {}
     stmt = text("""
-        SELECT xp.external_player_id::text AS player_id, snap.rc_rating
+        SELECT xp.external_player_id::text AS player_id,
+               snap.rc_rating,
+               snap.rc_deviation
         FROM xttv_players xp
         JOIN LATERAL (
-            SELECT rc_rating
+            SELECT rc_rating, rc_deviation
             FROM player_rating_snapshots
             WHERE player_id = xp.id AND source = 'ratingscentral'
             ORDER BY observed_at DESC
@@ -1798,8 +1990,9 @@ def _load_latest_rc_map(db, ids):
     """).bindparams(bindparam('ids', expanding=True))
     out = {}
     for row in db.execute(stmt, {'ids': ids}).mappings():
-        if row['rc_rating'] is not None:
-            out[str(row['player_id'])] = float(row['rc_rating'])
+        effective = _effective_rc(row['rc_rating'], row.get('rc_deviation'))
+        if effective is not None:
+            out[str(row['player_id'])] = effective
     return out
 
 
@@ -2003,6 +2196,8 @@ def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, st
     for own_order in orders:
         placement, agg, win5, win10, agg5, agg10 = _evaluate_lineup_for_perm(
             own_order, scenario_cache, matchup_p, schedule,
+            profiles=profiles, matchups=matchups, own_is_home=own_is_home,
+            use_spieltyp=use_spieltyp,
         )
         if fixed_doubles_on in (5, 10) and placement != fixed_doubles_on:
             placement = fixed_doubles_on
@@ -2068,13 +2263,19 @@ def _merge_orientations(home_eval, away_eval):
     return merged
 
 
-def _explain_recommendation(own_order, scenarios, matchup_p, profiles, names, evaluated, own_is_home=None, own_double_pairs=None, stronger_double_pair=1, doubles_stats=None, recommended_doubles_on=5, own_on_letters=None, fixed_game_pairs=None):
+def _explain_recommendation(
+    own_order, scenarios, matchup_p, profiles, names, evaluated, own_is_home=None,
+    own_double_pairs=None, stronger_double_pair=1, doubles_stats=None,
+    recommended_doubles_on=5, own_on_letters=None, fixed_game_pairs=None,
+    matchups=None, use_spieltyp=False,
+):
     """Create a human-readable, model-grounded explanation for the top lineup."""
     weighted_games = [0.0] * TOTAL_GAMES
     weighted_double = [0.0, 0.0]
     position_rates = {pid: [0.0] * 4 for pid in own_order}
     pair_a, pair_b = _normalize_own_double_pairs(own_order, own_double_pairs, profiles)
 
+    matchups = matchups or {}
     schedule = _schedule_for_orientation(
         (True if own_is_home is not False else False) if own_on_letters is None else own_on_letters
     )
@@ -2084,6 +2285,8 @@ def _explain_recommendation(own_order, scenarios, matchup_p, profiles, names, ev
             own_order, opp_order, schedule, matchup_p, pair_a, pair_b, profiles, doubles_stats or {},
             recommended_doubles_on, stronger_double_pair,
             fixed_game_pairs=fixed_game_pairs,
+            matchups=matchups, own_is_home=bool(own_is_home) if own_is_home is not None else True,
+            use_spieltyp=use_spieltyp,
         )
         played = _game_play_probabilities(game_probs)
         for i, p in enumerate(game_probs):
@@ -2094,7 +2297,11 @@ def _explain_recommendation(own_order, scenarios, matchup_p, profiles, names, ev
         for pid in own_order:
             for position in range(4):
                 rate = sum(
-                    matchup_p.get((pid, opp_order[opp_idx]), 0.5) * played[game_index]
+                    _lookup_matchup_probability(
+                        matchup_p, pid, opp_order[opp_idx], profiles, matchups,
+                        own_is_home=bool(own_is_home) if own_is_home is not None else True,
+                        use_spieltyp=use_spieltyp,
+                    ) * played[game_index]
                     for single_index, (own_idx, opp_idx) in enumerate(schedule)
                     if own_idx == position
                     for game_index in [SINGLE_GAME_PROBABILITY_INDICES[single_index]]
@@ -2184,14 +2391,20 @@ def _expected_singles_wins_for_lineup(
     own_order, scenarios, matchup_p, own_is_home, own_on_letters=None,
     own_double_pairs=None, profiles=None, doubles_stats=None,
     stronger_double_pair=1, recommended_doubles_on=5,
+    matchups=None, use_spieltyp=False,
 ):
     """Expected singles wins, weighted by the probability each game is played."""
+    matchups = matchups or {}
+    profiles = profiles or {}
     schedule = _schedule_for_orientation(bool(own_is_home) if own_on_letters is None else own_on_letters)
     expected = {pid: 0.0 for pid in own_order}
-    pair_a, pair_b = _normalize_own_double_pairs(own_order, own_double_pairs, profiles or {})
+    pair_a, pair_b = _normalize_own_double_pairs(own_order, own_double_pairs, profiles)
     for scenario_probability, opp_order in scenarios:
         singles = [
-            matchup_p.get((own_order[own_idx], opp_order[opp_idx]), 0.5)
+            _lookup_matchup_probability(
+                matchup_p, own_order[own_idx], opp_order[opp_idx],
+                profiles, matchups, own_is_home=bool(own_is_home), use_spieltyp=use_spieltyp,
+            )
             for own_idx, opp_idx in schedule
         ]
         doubles5, doubles10 = _doubles_probs_for_scenario(
@@ -2211,11 +2424,14 @@ def _expected_singles_breakdown_for_lineup(
     own_order, scenarios, matchup_p, names, own_is_home, own_on_letters=None,
     own_double_pairs=None, profiles=None, doubles_stats=None,
     stronger_double_pair=1, recommended_doubles_on=5,
+    matchups=None, use_spieltyp=False,
 ):
     """Per-player singles matchups with played and conditional win probability."""
+    matchups = matchups or {}
+    profiles = profiles or {}
     schedule = _schedule_for_orientation(bool(own_is_home) if own_on_letters is None else own_on_letters)
     breakdown = {pid: [] for pid in own_order}
-    pair_a, pair_b = _normalize_own_double_pairs(own_order, own_double_pairs, profiles or {})
+    pair_a, pair_b = _normalize_own_double_pairs(own_order, own_double_pairs, profiles)
     for game_idx, (own_idx, opp_idx) in enumerate(schedule):
         pid = own_order[own_idx]
         weighted_prob = 0.0
@@ -2223,11 +2439,17 @@ def _expected_singles_breakdown_for_lineup(
         for scenario_probability, opp_order in scenarios:
             opp_id = opp_order[opp_idx]
             opponent_weights[opp_id] += scenario_probability
-            weighted_prob += scenario_probability * matchup_p.get((pid, opp_id), 0.5)
+            weighted_prob += scenario_probability * _lookup_matchup_probability(
+                matchup_p, pid, opp_id, profiles, matchups,
+                own_is_home=bool(own_is_home), use_spieltyp=use_spieltyp,
+            )
         play_probability = 0.0
         for scenario_probability, opp_order in scenarios:
             singles = [
-                matchup_p.get((own_order[o], opp_order[a]), 0.5)
+                _lookup_matchup_probability(
+                    matchup_p, own_order[o], opp_order[a], profiles, matchups,
+                    own_is_home=bool(own_is_home), use_spieltyp=use_spieltyp,
+                )
                 for o, a in schedule
             ]
             doubles5, doubles10 = _doubles_probs_for_scenario(
@@ -2396,6 +2618,7 @@ def _build_info_summary(
     own, scenarios, profiles, names, matchups, recommendation, evaluated, explanation,
     opponent_team, ref_date, opponent_pool, source, orientation_note, matchup_p=None, own_is_home=None, own_on_letters=None,
     own_double_pairs=None, stronger_double_pair=1, doubles_stats=None, actual_opponent_ids=None,
+    use_spieltyp=False,
 ):
     own_order = recommendation['own_player_ids']
     expected_singles = {}
@@ -2405,11 +2628,13 @@ def _build_info_summary(
             own_order, scenarios, matchup_p, own_is_home, own_on_letters,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
+            matchups=matchups, use_spieltyp=use_spieltyp,
         )
         singles_breakdown = _expected_singles_breakdown_for_lineup(
             own_order, scenarios, matchup_p, names, own_is_home, own_on_letters,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
+            matchups=matchups, use_spieltyp=use_spieltyp,
         )
     elif matchup_p is not None and own_is_home is None:
         schedule_orientation = True if own_on_letters is None else own_on_letters
@@ -2417,6 +2642,7 @@ def _build_info_summary(
             own_order, scenarios, matchup_p, True, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
+            matchups=matchups, use_spieltyp=use_spieltyp,
         )
         away_matchup = _build_matchup_table(
             set(own_order) | {pid for _, order in scenarios for pid in order},
@@ -2428,17 +2654,20 @@ def _build_info_summary(
             own_order, scenarios, away_matchup, False, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
+            matchups=matchups, use_spieltyp=use_spieltyp,
         )
         expected_singles = {pid: (home[pid] + away[pid]) / 2.0 for pid in own_order}
         home_breakdown = _expected_singles_breakdown_for_lineup(
             own_order, scenarios, matchup_p, names, True, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
+            matchups=matchups, use_spieltyp=use_spieltyp,
         )
         away_breakdown = _expected_singles_breakdown_for_lineup(
             own_order, scenarios, away_matchup, names, False, schedule_orientation,
             own_double_pairs, profiles, doubles_stats, stronger_double_pair,
             recommendation.get('recommended_doubles_on', 5),
+            matchups=matchups, use_spieltyp=use_spieltyp,
         )
         singles_breakdown = {
             pid: [
@@ -2680,6 +2909,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         recommended_doubles_on=recommendation.get('recommended_doubles_on', 5),
         own_on_letters=own_on_letters,
         fixed_game_pairs=fixed_game_pairs,
+        matchups=matchups, use_spieltyp=use_spieltyp,
     )
     for item in evaluated:
         item['ranking_team_win_probability'] = item['team_win_probability']
@@ -2725,13 +2955,12 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             display_dist['expected_opponent_wins'],
         )
     opponent_doubles_by_order = {}
-    model_probability_by_order = {tuple(order): probability for probability, order in scenarios}
     opponent_predictions = [
         {
             'player_ids': list(order),
             'players': _players_for_ids(order, names),
             'probability': round(probability, 6),
-            'model_probability': round(model_probability_by_order.get(tuple(order), probability), 6),
+            'model_probability': round(probability, 6),
             'doubles': _cached_opponent_doubles(order, doubles_stats, profiles, names, opponent_doubles_by_order),
         }
         for probability, order in display_scenarios
@@ -2743,7 +2972,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         opponent_team, ref_date, opponent_pool, source, orientation_note,
         matchup_p=matchup_p, own_is_home=own_is_home, own_on_letters=own_on_letters,
         own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair,
-        doubles_stats=doubles_stats, actual_opponent_ids=actual,
+        doubles_stats=doubles_stats, actual_opponent_ids=actual, use_spieltyp=use_spieltyp,
     )
 
     return {
@@ -2790,15 +3019,18 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
                 f'{RC_BASELINE:.0f} fixed neutral midpoint: snapshots have no league association, '
                 'so no leakage-safe league baseline can be derived from the available schema'
             ),
-            'h2h_weight': f'up to {int(H2H_MAX_WEIGHT * 100)}% when direct singles exist',
+            'h2h_weight': (
+                f'blend of shrinkage toward RC base ((w + {H2H_SHRINKAGE_MATCHES:.0f}·p_base) / (g + {H2H_SHRINKAGE_MATCHES:.0f})) '
+                f'and legacy weighted direct record ({H2H_SHRINKAGE_BLEND:.0%} legacy weight)'
+            ),
             'home_away': (
                 f'overall record is the base; smoothed home/away delta is separate and capped at ±{HOME_AWAY_MAX_COMPONENT:.2f} '
                 f'after {HOME_AWAY_MIN_GAMES} venue games ({HOME_AWAY_MIN_OVERALL_GAMES} overall games required)'
             ),
             'opponent_lineups': (
                 f'historical position orders from last {STATS_YEARS} years with recurrence-adaptive RC '
-                f'strength-lineup prior (strength weight 10–70% based on exact 4-/best 3-player recurrence); '
-                f'scenario sharpening p^α (α={SCENARIO_SHARPENING_ALPHA:.1f}); '
+                f'strength-lineup prior (global RC-on-A/D support from measured league data); '
+                f'recency by league rounds (half-life {LINEUP_RECENCY_HALF_LIFE_MATCHES:.0f} matches); '
                 f'player pool last {OPPONENT_POOL_YEARS} years'
             ),
             'scenario_sharpening_alpha': SCENARIO_SHARPENING_ALPHA,
@@ -2808,6 +3040,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         'data_quality': {
             'scenario_variants': len(scenarios),
             'scenario_sharpening_alpha': SCENARIO_SHARPENING_ALPHA,
+            'lineup_recency_half_life_matches': LINEUP_RECENCY_HALF_LIFE_MATCHES,
             'own_orders_evaluated': 24,
             'reference_date': ref_date.isoformat(),
             'stats_window_years': STATS_YEARS,

@@ -129,14 +129,14 @@ def test_lineup_spread_covers_doubles_swap_delta():
 
 
 def test_sharpen_scenarios_concentrates_probability():
-    from app.analysis_service import _sharpen_scenarios, SCENARIO_SHARPENING_ALPHA
+    from app.analysis_service import _sharpen_scenarios
 
     scenarios = [
         (0.10, ('a', 'b', 'c', 'd')),
         (0.07, ('b', 'a', 'c', 'd')),
         (0.05, ('c', 'd', 'a', 'b')),
     ]
-    sharpened = _sharpen_scenarios(scenarios, alpha=SCENARIO_SHARPENING_ALPHA)
+    sharpened = _sharpen_scenarios(scenarios, alpha=2.5)
     assert sharpened[0][0] > scenarios[0][0]
     assert round(sum(probability for probability, _ in sharpened), 6) == 1.0
 
@@ -154,6 +154,7 @@ def test_phase_c_lineup_spread_with_scenario_sharpening():
     recs = result.get('recommendations') or []
     if len(recs) < 2:
         return
-    spread_pp = (recs[0]['team_win_probability'] - recs[-1]['team_win_probability']) * 100
+    spread_pp = result['recommendation'].get('lineup_spread_pp')
+    assert spread_pp is not None
     assert spread_pp >= 1.0
     assert result['model']['scenario_sharpening_alpha'] == 2.5

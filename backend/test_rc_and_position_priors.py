@@ -1,5 +1,5 @@
 from datetime import date
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from app.analysis_service import (
     DEFAULT_RC_RATING,
@@ -34,10 +34,11 @@ def test_strength_prior_uses_team_average_for_missing_rc():
 def test_position_priors_weight_recent_positions_higher():
     ref_date = date(2026, 3, 1)
     rows = [
-        {'player_id': '1', 'position': 'A', 'match_date': '01.01.2024 19:00'},
-        {'player_id': '1', 'position': 'D', 'match_date': '01.02.2026 19:00'},
+        {'player_id': '1', 'position': 'A', 'match_date': '01.01.2024 19:00', 'match_id': 10},
+        {'player_id': '1', 'position': 'D', 'match_date': '01.02.2026 19:00', 'match_id': 20},
     ]
     db = MagicMock()
     db.execute.return_value.mappings.return_value = rows
-    priors = _load_player_position_priors(db, ['1'], ref_date=ref_date)
+    with patch('app.analysis_service._build_match_rounds_ago', return_value={10: 12, 20: 0}):
+        priors = _load_player_position_priors(db, ['1'], ref_date=ref_date)
     assert priors['1'][0] < priors['1'][3]
