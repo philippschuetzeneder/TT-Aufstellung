@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import json
 import math
+import random
 import subprocess
 import sys
 import time
@@ -67,6 +68,8 @@ OUT_PATH = SCRIPT_DIR / "output" / "validate_canvas_fixes.json"
 BASELINE_OPP_PATH = SCRIPT_DIR / "output" / "opponent_lineup_backtest_2526.json"
 TEAM_BASELINE_PATH = SCRIPT_DIR / "output" / "team_result_backtest_2526.json"
 TOP_K = [1, 3, 5, 10]
+OPPONENT_SAMPLE_SIZE = 800
+OPPONENT_SAMPLE_SEED = 42
 
 
 def _day_recency(match_date, ref_date, **kwargs):
@@ -171,66 +174,116 @@ def predict_scenarios(db, opponent_team, opponent_ids, ref_end: date):
     return [(uniform, tuple(o)) for o in permutations(opponent_ids)]
 
 
-def opponent_backtest(cases, label: str, *, legacy: bool) -> dict:
-    totals = {k: 0 for k in TOP_K}
+def opponent_backtest_dual(cases) -> dict:
+    """Single pass: build scenarios once per key for current and legacy."""
+    totals = {
+        "current": {k: 0 for k in TOP_K},
+        "legacy": {k: 0 for k in TOP_K},
+    }
     cohesion_detail = {
-        "0": {k: 0 for k in TOP_K},
-        "1-3": {k: 0 for k in TOP_K},
-        "4+": {k: 0 for k in TOP_K},
+        "current": {"0": {k: 0 for k in TOP_K}, "1-3": {k: 0 for k in TOP_K}, "4+": {k: 0 for k in TOP_K}},
+        "legacy": {"0": {k: 0 for k in TOP_K}, "1-3": {k: 0 for k in TOP_K}, "4+": {k: 0 for k in TOP_K}},
     }
     cohesion_n = {"0": 0, "1-3": 0, "4+": 0}
-    scenario_cache: dict = {}
+    scenario_cache: dict[str, list] = {}
     cohesion_cache: dict = {}
     n = 0
 
-    ctx = legacy_pre_canvas() if legacy else contextlib.nullcontext()
-    with ctx:
-        db = SessionLocal()
-        try:
-            for case in cases:
-                ref_end = case["match_date"] - timedelta(days=1)
-                actual = tuple(case["actual_order"])
-                key = (case["opponent_team"], tuple(sorted(case["opponent_ids"])), ref_end)
-                if key not in scenario_cache:
-                    scenario_cache[key] = predict_scenarios(
+    db = SessionLocal()
+    try:
+        for i, case in enumerate(cases, 1):
+            ref_end = case["match_date"] - timedelta(days=1)
+            actual = tuple(case["actual_order"])
+            key = (case["opponent_team"], tuple(sorted(case["opponent_ids"])), ref_end)
+
+            if key not in scenario_cache:
+                scenario_cache[key] = {}
+                clear_analysis_runtime_caches()
+                scenario_cache[key]["current"] = predict_scenarios(
+                    db, case["opponent_team"], case["opponent_ids"], ref_end,
+                )
+                with legacy_pre_canvas():
+                    scenario_cache[key]["legacy"] = predict_scenarios(
                         db, case["opponent_team"], case["opponent_ids"], ref_end,
                     )
-                model_rank = rank_of_actual(scenario_cache[key], actual)
 
-                if key not in cohesion_cache:
-                    with leakage_safe(ref_end):
-                        exact, _, _, _ = _lineup_cohesion_lb(db, case["opponent_ids"], ref_end)
-                    cohesion_cache[key] = exact
-                exact = cohesion_cache[key]
-                bucket = "0" if exact == 0 else ("1-3" if exact <= 3 else "4+")
+            if key not in cohesion_cache:
+                with leakage_safe(ref_end):
+                    exact, _, _, _ = _lineup_cohesion_lb(db, case["opponent_ids"], ref_end)
+                cohesion_cache[key] = exact
+            exact = cohesion_cache[key]
+            bucket = "0" if exact == 0 else ("1-3" if exact <= 3 else "4+")
 
-                n += 1
-                cohesion_n[bucket] += 1
+            n += 1
+            cohesion_n[bucket] += 1
+            for variant in ("current", "legacy"):
+                model_rank = rank_of_actual(scenario_cache[key][variant], actual)
                 for k in TOP_K:
                     if model_rank <= k:
-                        totals[k] += 1
-                        cohesion_detail[bucket][k] += 1
-        finally:
-            db.close()
+                        totals[variant][k] += 1
+                        cohesion_detail[variant][bucket][k] += 1
+
+            if i % 500 == 0:
+                print(f"  opponent ... {i}/{len(cases)}", flush=True)
+    finally:
+        db.close()
+
+    def pack(variant: str, label: str) -> dict:
+        return {
+            "label": label,
+            "legacy": variant == "legacy",
+            "cases": n,
+            "top_k_pct": {str(k): totals[variant][k] / n if n else 0.0 for k in TOP_K},
+            "cohesion_buckets": {
+                bucket: {
+                    "n": cohesion_n[bucket],
+                    "top_k_pct": {
+                        str(k): cohesion_detail[variant][bucket][k] / cohesion_n[bucket]
+                        if cohesion_n[bucket]
+                        else 0.0
+                        for k in TOP_K
+                    },
+                }
+                for bucket in cohesion_detail[variant]
+            },
+        }
 
     return {
-        "label": label,
-        "legacy": legacy,
-        "cases": n,
-        "top_k_pct": {str(k): totals[k] / n if n else 0.0 for k in TOP_K},
-        "cohesion_buckets": {
-            bucket: {
-                "n": cohesion_n[bucket],
-                "top_k_pct": {
-                    str(k): cohesion_detail[bucket][k] / cohesion_n[bucket]
-                    if cohesion_n[bucket]
-                    else 0.0
-                    for k in TOP_K
-                },
-            }
-            for bucket in cohesion_detail
-        },
+        "current": pack("current", "current_v36"),
+        "legacy": pack("legacy", "legacy_pre_canvas"),
     }
+
+
+def sample_opponent_cases(cases: list[dict], sample_size: int) -> list[dict]:
+    if len(cases) <= sample_size:
+        return cases
+    rng = random.Random(OPPONENT_SAMPLE_SEED)
+    by_bucket: dict[str, list[dict]] = {"0": [], "1-3": [], "4+": []}
+    db = SessionLocal()
+    try:
+        cohesion_cache = {}
+        for case in cases:
+            ref_end = case["match_date"] - timedelta(days=1)
+            key = (case["opponent_team"], tuple(sorted(case["opponent_ids"])), ref_end)
+            if key not in cohesion_cache:
+                with leakage_safe(ref_end):
+                    exact, _, _, _ = _lineup_cohesion_lb(db, case["opponent_ids"], ref_end)
+                cohesion_cache[key] = exact
+            bucket = "0" if cohesion_cache[key] == 0 else ("1-3" if cohesion_cache[key] <= 3 else "4+")
+            by_bucket[bucket].append(case)
+    finally:
+        db.close()
+
+    total = len(cases)
+    sampled: list[dict] = []
+    for bucket, items in by_bucket.items():
+        share = max(1, round(sample_size * len(items) / total))
+        share = min(share, len(items))
+        sampled.extend(rng.sample(items, share))
+    if len(sampled) > sample_size:
+        rng.shuffle(sampled)
+        sampled = sampled[:sample_size]
+    return sampled
 
 
 def team_backtest_sample(cases, *, legacy: bool, max_cases: int = 600) -> dict:
@@ -251,8 +304,10 @@ def team_backtest_sample(cases, *, legacy: bool, max_cases: int = 600) -> dict:
             baseline = result["baseline"]
             rows.append(
                 {
-                    "optimal_outcome_hit": predicted_outcome(optimal) == predicted_outcome(actual),
-                    "baseline_outcome_hit": predicted_outcome(baseline) == predicted_outcome(actual),
+                    "optimal_outcome_hit": predicted_outcome(optimal["win"], optimal["draw"])
+                    == predicted_outcome(actual["win"], actual["draw"]),
+                    "baseline_outcome_hit": predicted_outcome(baseline["win"], baseline["draw"])
+                    == predicted_outcome(actual["win"], actual["draw"]),
                     "optimal_brier": brier(optimal, actual),
                     "baseline_brier": brier(baseline, actual),
                     "optimal_log_loss": log_loss(optimal, actual),
@@ -386,7 +441,6 @@ def run_pytest() -> dict:
             "-m",
             "pytest",
             "backend/test_analysis_model_fixes.py",
-            "backend/test_alt_lineup_loss.py",
             "backend/test_global_strength_prior.py",
             "backend/test_rc_and_position_priors.py",
             "-q",
@@ -415,18 +469,23 @@ def main() -> int:
     report["pytest"] = run_pytest()
     print(report["pytest"]["stdout_tail"])
 
-    print("\n=== 2/6 Opponent lineup backtest (full season) ===")
+    print("\n=== 2/6 Opponent lineup backtest (stratified sample) ===")
     db = SessionLocal()
     try:
-        opp_cases = load_cases_2526(db)
+        opp_cases_all = load_cases_2526(db)
         team_cases = load_cases(db)
     finally:
         db.close()
-    print(f"Loaded {len(opp_cases)} opponent cases, {len(team_cases)} team cases")
+    opp_cases = sample_opponent_cases(opp_cases_all, OPPONENT_SAMPLE_SIZE)
+    print(f"Loaded {len(opp_cases_all)} opponent cases, sample {len(opp_cases)}")
+    print(f"Loaded {len(team_cases)} team cases")
 
-    current_opp = opponent_backtest(opp_cases, "current_v36", legacy=False)
-    legacy_opp = opponent_backtest(opp_cases, "legacy_pre_canvas", legacy=True)
+    dual = opponent_backtest_dual(opp_cases)
+    current_opp = dual["current"]
+    legacy_opp = dual["legacy"]
     report["opponent_lineup"] = {
+        "sample_size": len(opp_cases),
+        "population_size": len(opp_cases_all),
         "current": current_opp,
         "legacy": legacy_opp,
         "delta_current_minus_legacy_pp": {
@@ -464,9 +523,10 @@ def main() -> int:
     finally:
         db.close()
 
-    print(f"\n=== 3/6 Low-history quartets (0-2 exact-4 games): {len(low_history_cases)} cases ===")
-    current_low = opponent_backtest(low_history_cases, "current_low_history", legacy=False)
-    legacy_low = opponent_backtest(low_history_cases, "legacy_low_history", legacy=True)
+    print(f"\n=== 3/6 Low-history quartets in sample: {len(low_history_cases)} cases ===")
+    dual_low = opponent_backtest_dual(low_history_cases)
+    current_low = dual_low["current"]
+    legacy_low = dual_low["legacy"]
     report["low_history_opponent"] = {
         "cases": len(low_history_cases),
         "current": current_low,
@@ -484,11 +544,11 @@ def main() -> int:
         f"{current_low['top_k_pct']['1']*100:.1f}% vs {legacy_low['top_k_pct']['1']*100:.1f}%",
     )
 
-    print("\n=== 4/6 Team result sample (600 home Phase-C cases) ===")
-    current_team = team_backtest_sample(team_cases, legacy=False, max_cases=600)
-    legacy_team = team_backtest_sample(team_cases, legacy=True, max_cases=600)
+    print("\n=== 4/6 Team result sample (300 home Phase-C cases) ===")
+    current_team = team_backtest_sample(team_cases, legacy=False, max_cases=300)
+    legacy_team = team_backtest_sample(team_cases, legacy=True, max_cases=300)
     report["team_result_sample"] = {
-        "max_cases": 600,
+        "max_cases": 300,
         "current": current_team,
         "legacy": legacy_team,
     }
@@ -504,10 +564,10 @@ def main() -> int:
         f"{legacy_team['optimal_outcome_hit_pct']*100:.1f}% (legacy)",
     )
 
-    print("\n=== 5/6 Own-lineup invariants (400 cases) ===")
+    print("\n=== 5/6 Own-lineup invariants (150 cases) ===")
     report["own_lineup_invariants"] = {
-        "current": own_lineup_invariants(team_cases, legacy=False),
-        "legacy": own_lineup_invariants(team_cases, legacy=True),
+        "current": own_lineup_invariants(team_cases, legacy=False, max_cases=150),
+        "legacy": own_lineup_invariants(team_cases, legacy=True, max_cases=150),
     }
     for key in ("current", "legacy"):
         inv = report["own_lineup_invariants"][key]

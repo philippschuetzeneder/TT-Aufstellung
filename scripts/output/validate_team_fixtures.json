@@ -1,0 +1,82 @@
+{
+  "team_current": {
+    "label": "current_v36",
+    "legacy": false,
+    "n": 200,
+    "optimal_outcome_hit_pct": 0.555,
+    "baseline_outcome_hit_pct": 0.55,
+    "optimal_mean_brier": 0.608407895565905,
+    "baseline_mean_brier": 0.6081973490207649,
+    "optimal_mean_log_loss": 1.0738590242630286,
+    "baseline_mean_log_loss": 1.0725977475306085,
+    "optimal_ge_baseline_win_pct": 1.0
+  },
+  "team_legacy": {
+    "label": "legacy_pre_canvas",
+    "legacy": true,
+    "n": 200,
+    "optimal_outcome_hit_pct": 0.56,
+    "baseline_outcome_hit_pct": 0.56,
+    "optimal_mean_brier": 0.60953583144981,
+    "baseline_mean_brier": 0.60901093048846,
+    "optimal_mean_log_loss": 1.0745126653335486,
+    "baseline_mean_log_loss": 1.0729085086526506,
+    "optimal_ge_baseline_win_pct": 1.0
+  },
+  "inv_current": {
+    "label": "current_v36",
+    "checked": 0,
+    "optimal_lt_strength_violations": 0,
+    "mean_lineup_spread_pp": null,
+    "median_lineup_spread_pp": null
+  },
+  "inv_legacy": {
+    "label": "legacy_pre_canvas",
+    "checked": 0,
+    "optimal_lt_strength_violations": 0,
+    "mean_lineup_spread_pp": null,
+    "median_lineup_spread_pp": null
+  },
+  "fixtures": [
+    {
+      "fixture": "Lasberg 1 (Tragwein/Kamig 3, Heim, 4/4 Gegner)",
+      "legacy": false,
+      "model_version": "rc-h2h-homeaway-v36-sharpen-blend",
+      "win_pct": 27.95,
+      "lineup_spread_pp": 7.24,
+      "advantage_vs_strength_pp": 7.1,
+      "alt2_loss_pp": 0.52,
+      "alt5_loss_pp": 2.62
+    },
+    {
+      "fixture": "Lasberg 1 (Tragwein/Kamig 3, Heim, 4/4 Gegner)",
+      "legacy": true,
+      "model_version": "rc-h2h-homeaway-v36-sharpen-blend",
+      "win_pct": 28.26,
+      "lineup_spread_pp": 7.09,
+      "advantage_vs_strength_pp": 6.44,
+      "alt2_loss_pp": 0.23,
+      "alt5_loss_pp": 2.12
+    },
+    {
+      "fixture": "Alberndorf 2 (Phase C, Spread-Check)",
+      "legacy": false,
+      "model_version": "rc-h2h-homeaway-v36-sharpen-blend",
+      "win_pct": 59.03,
+      "lineup_spread_pp": 1.11,
+      "advantage_vs_strength_pp": 0.0,
+      "alt2_loss_pp": 0.0,
+      "alt5_loss_pp": 0.0
+    },
+    {
+      "fixture": "Alberndorf 2 (Phase C, Spread-Check)",
+      "legacy": true,
+      "model_version": "rc-h2h-homeaway-v36-sharpen-blend",
+      "win_pct": 59.2,
+      "lineup_spread_pp": 1.03,
+      "advantage_vs_strength_pp": 0.0,
+      "alt2_loss_pp": 0.0,
+      "alt5_loss_pp": 0.0
+    }
+  ]
+}

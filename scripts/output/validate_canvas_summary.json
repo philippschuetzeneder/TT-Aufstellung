@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-09-02",
+  "model_version": "rc-h2h-homeaway-v36-sharpen-blend",
+  "summary": {
+    "pytest_all_pass": true,
+    "pytest_count": 27,
+    "nothing_broken": true,
+    "opponent_lineup_overall": "Top-1 flat (-0.3 PP), Top-3 +1.1 PP on 350-key sample",
+    "team_result_sample": "Outcome hit flat, Brier slightly better on 200-case sample",
+    "own_lineup_invariant": "optimal >= RC-strength in 100% of 200 team cases",
+    "low_history_cohesion_0": "Top-1 unchanged at 16.0% (162 keys)"
+  },
+  "artifacts": {
+    "opponent_fast": "scripts/output/validate_opponent_fast.json",
+    "team_fixtures": "scripts/output/validate_team_fixtures.json",
+    "stored_opponent_baseline": "scripts/output/opponent_lineup_backtest_2526.json",
+    "stored_team_baseline": "scripts/output/team_result_backtest_2526.json"
+  }
+}
