@@ -9,7 +9,7 @@ CRON_DST="/etc/cron.d/tt-aufstellung-weekly-refresh"
 chmod +x "${ROOT}/scripts/weekly-data-refresh-prod.sh"
 chmod +x "${ROOT}/scripts/restart-prod.sh"
 
-cp "$CRON_SRC" "$CRON_DST"
+sed 's/\r$//' "$CRON_SRC" > "$CRON_DST"
 chmod 644 "$CRON_DST"
 
 echo "Installed $CRON_DST"
