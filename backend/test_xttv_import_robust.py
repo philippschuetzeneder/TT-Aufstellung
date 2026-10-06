@@ -4,6 +4,7 @@ import pytest
 
 from app.xttv_db_import import (
     _can_advance_frontier,
+    _sanitize_scan_frontier,
     _classify_meid,
     _is_real_player_id,
     _normalize_parsed_match,
@@ -72,6 +73,10 @@ def test_classify_meid_marks_outside_season(mock_fetch):
     result = _classify_meid(999002, check_db=False)
     assert result['status'] == 'valid_outside_filter'
     assert result['filter_reason'] == 'season'
+
+
+def test_sanitize_scan_frontier_resets_large_gap():
+    assert _sanitize_scan_frontier(469008, 498264) == 469008
 
 
 def test_can_advance_frontier_rules():

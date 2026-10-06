@@ -69,11 +69,18 @@ def _set_scan_frontier(meid: int) -> None:
         )
 
 
+# Max gap between last imported MEID and persisted frontier before we rescan the hole.
+_MAX_FRONTIER_AHEAD_OF_IMPORT = 5000
+
+
 def _sanitize_scan_frontier(last_known: int | None, frontier: int | None) -> int | None:
     """Ignore legacy bootstrap jumps that skipped MEIDs without scanning them."""
     if last_known is None or frontier is None:
         return frontier
     if frontier >= last_known + SCAN_HORIZON_BOOTSTRAP_OFFSET:
+        _set_scan_frontier(last_known)
+        return last_known
+    if frontier > last_known + _MAX_FRONTIER_AHEAD_OF_IMPORT:
         _set_scan_frontier(last_known)
         return last_known
     if frontier < last_known:
