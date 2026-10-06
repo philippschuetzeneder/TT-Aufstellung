@@ -69,13 +69,20 @@ def _set_scan_frontier(meid: int) -> None:
         )
 
 
-def _resolve_scan_frontier(last_known: int | None) -> int | None:
-    frontier = _get_scan_frontier()
-    if frontier is not None or last_known is None:
+def _sanitize_scan_frontier(last_known: int | None, frontier: int | None) -> int | None:
+    """Ignore legacy bootstrap jumps that skipped MEIDs without scanning them."""
+    if last_known is None or frontier is None:
         return frontier
-    seeded = last_known + SCAN_HORIZON_BOOTSTRAP_OFFSET
-    _set_scan_frontier(seeded)
-    return seeded
+    if frontier >= last_known + SCAN_HORIZON_BOOTSTRAP_OFFSET:
+        _set_scan_frontier(last_known)
+        return last_known
+    if frontier < last_known:
+        return last_known
+    return frontier
+
+
+def _resolve_scan_frontier(last_known: int | None) -> int | None:
+    return _sanitize_scan_frontier(last_known, _get_scan_frontier())
 
 
 def _is_valid_4_player_report(parsed: dict) -> bool:
