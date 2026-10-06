@@ -8,9 +8,18 @@ from sqlalchemy.orm import selectinload
 from .db import SessionLocal, create_all
 from .models import MatchPlayer, XttvMatch
 from .opponent_prediction_service import predict_opponent_lineups
+from .xttv_db_import import get_target_seasons
 
 WIN_TARGET = 8
-CURRENT_SEASON = "2025/2026"
+
+
+def current_season() -> str:
+    """Newest season in the rolling import window (e.g. 2026/2027 after season rollover)."""
+    return max(get_target_seasons(), key=lambda label: tuple(int(x) for x in label.split("/")))
+
+
+# Backward-compatible alias for scripts.
+CURRENT_SEASON = current_season()
 _LEAGUE_SEASON_SUFFIX = re.compile(r"\s+(20\d{2}/20\d{2})\s*$")
 
 
@@ -44,20 +53,22 @@ def resolve_latest_league_season(session, league_group: str) -> str | None:
         return None
     group = league_group.strip()
     for row in rows:
-        if _league_group(row) == group and _season_label(row) == CURRENT_SEASON:
+        season = current_season()
+        if _league_group(row) == group and _season_label(row) == season:
             return row
     return None
 
 
 def list_leagues():
     """Distinct league groups with counts for the active season only."""
+    season = current_season()
     with SessionLocal() as session:
         rows = session.execute(text(
             "SELECT league, COUNT(*) AS c FROM xttv_matches WHERE league IS NOT NULL GROUP BY league ORDER BY league"
         )).mappings()
         by_group: dict[str, list[tuple[str, int]]] = {}
         for row in rows:
-            if _season_label(row["league"]) != CURRENT_SEASON:
+            if _season_label(row["league"]) != season:
                 continue
             group = _league_group(row["league"])
             if not group:
