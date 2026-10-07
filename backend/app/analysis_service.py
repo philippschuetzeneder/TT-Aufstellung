@@ -33,7 +33,7 @@ SINGLE_GAMES = 12
 DOUBLE_GAMES = 2
 TOTAL_GAMES = 14
 WIN_TARGET = 8
-MAX_ANALYSIS_SECONDS = 5.0
+MAX_ANALYSIS_SECONDS = 7.0
 STATS_YEARS = 2
 OPPONENT_POOL_YEARS = 2
 # Recency decay by completed league rounds (matches), not calendar days.
@@ -353,6 +353,30 @@ def _build_match_rounds_ago(db, ref_date) -> dict[int, int]:
         ORDER BY {_SQL_MATCH_DAY} DESC, m.id DESC
         """),
         {'ref_date': ref_date, 'cutoff': _cutoff(ref_date, STATS_YEARS)},
+    ).mappings()
+    result = {int(row['match_id']): idx for idx, row in enumerate(rows)}
+    _match_rounds_ago_cache[cache_key] = result
+    return result
+
+
+def _build_team_match_rounds_ago(db, team: str, ref_date) -> dict[int, int]:
+    """Team-scoped rounds map — avoids scanning every league match on each analysis."""
+    ref_date = ref_date or _reference_date(db)
+    cache_key = ('team', team, str(ref_date), str(_cutoff(ref_date, STATS_YEARS)))
+    cached = _match_rounds_ago_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    rows = db.execute(
+        text(f"""
+        SELECT m.id AS match_id
+        FROM xttv_matches m
+        WHERE (m.home_team = :team OR m.away_team = :team)
+          AND {_SQL_MATCH_DAY} IS NOT NULL
+          AND {_SQL_MATCH_DAY} <= :ref_date
+          AND {_MATCH_DAY_FILTER}
+        ORDER BY {_SQL_MATCH_DAY} DESC, m.id DESC
+        """),
+        {'team': team, 'ref_date': ref_date, 'cutoff': _cutoff(ref_date, STATS_YEARS)},
     ).mappings()
     result = {int(row['match_id']): idx for idx, row in enumerate(rows)}
     _match_rounds_ago_cache[cache_key] = result
@@ -884,7 +908,7 @@ def _evaluate_lineup_for_perm(
 
 def _check_analysis_budget(started):
     if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-        raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
+        raise RuntimeError('Analysis exceeded the internal 7-second safety budget')
 
 
 def _empty_match_agg():
@@ -939,13 +963,13 @@ def _compute_lineup_configuration_spread_pp(
     own, scenarios, profiles, matchups, names,
     use_spieltyp=False, own_double_pairs=None, stronger_double_pair=1,
     doubles_stats=None, own_on_letters=None, own_is_home=None,
+    started=None,
 ):
     """Spread across singles orders, doubles pair splits, and Spiel-5 vs Spiel-10 assignment.
 
     When own_double_pairs is set (UI edit / fixed doubles), only that pair split is
     considered — matching what the user can change (24 singles × 2 Spiel-5/10 slots).
   """
-    spread_started = time.monotonic()
     if own_double_pairs:
         pair_a, pair_b = _normalize_own_double_pairs(own, own_double_pairs, profiles)
         pair_partitions = [(pair_a, pair_b)]
@@ -970,6 +994,7 @@ def _compute_lineup_configuration_spread_pp(
         for home in orientations
     }
 
+    budget_started = started if started is not None else time.monotonic()
     wins = []
     for part_a, part_b in pair_partitions:
         for game5_pair, game10_pair in ((part_a, part_b), (part_b, part_a)):
@@ -984,7 +1009,7 @@ def _compute_lineup_configuration_spread_pp(
             for own_order in permutations(own):
                 orientation_wins = []
                 for home in orientations:
-                    _check_analysis_budget(spread_started)
+                    _check_analysis_budget(budget_started)
                     _, agg, _, _, _, _ = _evaluate_lineup_for_perm(
                         own_order,
                         caches_by_orientation[home],
@@ -1164,7 +1189,7 @@ def _load_opponent_pool(db, team, ref_date):
 def _raw_team_lineup_scenarios(db, team, required_ids=None, ref_date=None, opponent_pool=None):
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
-    rounds_map = _build_match_rounds_ago(db, ref_date)
+    rounds_map = _build_team_match_rounds_ago(db, team, ref_date)
     opponent_pool = opponent_pool or _load_opponent_pool(db, team, ref_date)
     rows = db.execute(text(f"""
         SELECT m.id AS match_id, m.match_date, mp.external_player_id AS player_id,
@@ -1220,7 +1245,11 @@ def _known_quartet_lineup_scenarios(db, player_ids, ref_date=None, team=None):
     """Historical position orders for an exact known quartet (optionally team-scoped)."""
     ref_date = ref_date or _reference_date(db)
     stats_cutoff = _cutoff(ref_date, STATS_YEARS)
-    rounds_map = _build_match_rounds_ago(db, ref_date)
+    rounds_map = (
+        _build_team_match_rounds_ago(db, team, ref_date)
+        if team
+        else _build_match_rounds_ago(db, ref_date)
+    )
     ids = [str(x) for x in player_ids]
     bind_names = [f'known_id_{i}' for i in range(len(ids))]
     id_params = {name: value for name, value in zip(bind_names, ids)}
@@ -2212,7 +2241,7 @@ def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, st
             'doubles_win_probability_on_10': round(win10, 6),
         })
         if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-            raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
+            raise RuntimeError('Analysis exceeded the internal 7-second safety budget')
     return evaluated, matchup_p
 
 
@@ -2930,12 +2959,19 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         )
     recommendation['advantage_vs_strength_lineup_pp'] = advantage_vs_strength_pp
     recommendation['strength_lineup_player_ids'] = strength_order
-    recommendation['lineup_spread_pp'] = _compute_lineup_configuration_spread_pp(
-        own, scenarios, profiles, matchups, names,
-        use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
-        stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
-        own_on_letters=own_on_letters, own_is_home=own_is_home,
-    )
+    try:
+        recommendation['lineup_spread_pp'] = _compute_lineup_configuration_spread_pp(
+            own, scenarios, profiles, matchups, names,
+            use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
+            stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
+            own_on_letters=own_on_letters, own_is_home=own_is_home,
+            started=started,
+        )
+    except RuntimeError as exc:
+        if 'safety budget' not in str(exc).lower():
+            raise
+        recommendation['lineup_spread_pp'] = None
+        warnings.append('Konfigurations-Spread konnte wegen Zeitlimit nicht berechnet werden.')
     # The lineup ranking remains unchanged. For the result card, however,
     # use the same scenario-aggregated 14-game vector shown by the
     # explanation instead of aggregating separately from marginal matchups.

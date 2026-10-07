@@ -9,6 +9,8 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
+from sqlalchemy import func
+
 from .db import SessionLocal, create_all
 from .models import PlayerRatingSnapshot, RawSourceDocument, XttvPlayer
 
@@ -31,10 +33,14 @@ def _persist_parsed_history(
     player: XttvPlayer,
     raw: RawSourceDocument,
     parsed: dict,
+    *,
+    only_after: datetime | None = None,
 ) -> int:
     saved = 0
     for observation in list(parsed["history"]) + [parsed["current"]]:
         observed_at = datetime.fromisoformat(observation["observed_at"])
+        if only_after is not None and observed_at <= only_after:
+            continue
         snapshot = session.query(PlayerRatingSnapshot).filter_by(
             player_id=player.id, observed_at=observed_at, source="ratingscentral",
         ).one_or_none()
@@ -202,6 +208,74 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, xt
         if xttv_club: player.club = xttv_club
         saved = _persist_parsed_history(session, player, raw, parsed)
     return {"ok": True, "rc_player_id": rc_player_id, "name": parsed["name"], "xttv_player_id": player.external_player_id, "current": parsed["current"], "historical_observations": len(parsed["history"]), "snapshots_upserted": saved}
+
+
+def import_rc_player_updates(
+    rc_player_id: int,
+    *,
+    xttv_player_id: str | None = None,
+    xttv_external_player_id: str | None = None,
+    xttv_name: str | None = None,
+    xttv_club: str | None = None,
+    cutoff: date | None = None,
+) -> dict:
+    """Refresh PlayerHistory from RC but persist only snapshots newer than the latest stored row."""
+    create_all()
+    html, content_type = fetch_player_history(rc_player_id)
+    parsed = parse_player_history(html, cutoff=cutoff)
+    source_external_id = f"playerhistory:{rc_player_id}"
+    url = f"{RC_BASE}/PlayerHistory.php?PlayerID={rc_player_id}"
+    with SessionLocal.begin() as session:
+        raw = session.query(RawSourceDocument).filter_by(
+            source="ratingscentral", external_id=source_external_id,
+        ).one_or_none()
+        if raw is None:
+            raw = RawSourceDocument(
+                source="ratingscentral", external_id=source_external_id, url=url, content=html,
+            )
+            session.add(raw)
+            session.flush()
+        else:
+            raw.url, raw.content, raw.fetched_at, raw.content_type = url, html, datetime.utcnow(), content_type
+        raw.http_status = 200
+        player = _find_xttv_player(
+            session, rc_player_id, parsed["name"], xttv_player_id, xttv_external_player_id,
+        )
+        if player is None and xttv_external_player_id:
+            player = session.query(XttvPlayer).filter_by(
+                external_player_id=xttv_external_player_id,
+            ).one_or_none()
+        if player is None:
+            raise ValueError(f"No XTTV player mapping found for RC {rc_player_id} ({parsed['name']}).")
+        if player.rc_player_id not in (None, rc_player_id):
+            raise ValueError(
+                f"XTTV player {player.external_player_id} is already mapped to RC {player.rc_player_id}"
+            )
+        player.rc_player_id = rc_player_id
+        if xttv_name:
+            player.name = xttv_name
+        if xttv_club:
+            player.club = xttv_club
+        max_observed = session.query(func.max(PlayerRatingSnapshot.observed_at)).filter(
+            PlayerRatingSnapshot.player_id == player.id,
+            PlayerRatingSnapshot.source == "ratingscentral",
+        ).scalar()
+        if max_observed is None:
+            saved = _persist_parsed_history(session, player, raw, parsed)
+            mode = "full"
+        else:
+            saved = _persist_parsed_history(session, player, raw, parsed, only_after=max_observed)
+            mode = "incremental"
+    return {
+        "ok": True,
+        "mode": mode,
+        "rc_player_id": rc_player_id,
+        "name": parsed["name"],
+        "xttv_player_id": player.external_player_id,
+        "current": parsed["current"],
+        "historical_observations": len(parsed["history"]),
+        "snapshots_upserted": saved,
+    }
 
 
 def match_and_import_rc(limit: int = 30, offset: int = 0) -> dict:

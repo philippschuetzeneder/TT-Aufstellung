@@ -16,7 +16,7 @@ Der 5.10.2026 ist bewusst gewählt: Saisonwechsel im Import (`2026/2027` statt `
 
 1. Cron auf dem VPS startet `scripts/weekly-data-refresh-prod.sh`
 2. Skript prüft Sommerpause (`DATA_REFRESH_NOT_BEFORE`, Standard `2026-10-05`)
-3. Im App-Container: `run_data_refresh()` — inkrementeller XTTV-MEID-Scan, RC-Nachzug für neue Spieler, Analysis-Cache
+3. Im App-Container: `run_data_refresh()` — inkrementeller XTTV-MEID-Scan, RC-Nachzug für Spieler aus neuen Berichten (nur **neue** RC-Snapshot-Zeilen wenn Historie schon da; voller Import nur ohne Snapshots), Analysis-Cache
 4. Bei neuen Daten: `docker compose -f docker-compose.prod.yml restart app`
 5. **Eine Report-E-Mail** an `p.schuetzeneder@gmail.com` (Status grün/rot, alle Kennzahlen + JSON-Anhang im Body)
 

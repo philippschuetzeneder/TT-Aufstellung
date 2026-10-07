@@ -7,4 +7,4 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CRON_TZ=Europe/Vienna
 
-0 4 * * 1 root DATA_REFRESH_NOT_BEFORE=2026-10-05 /opt/tt-aufstellung/scripts/weekly-data-refresh-prod.sh
+0 4 * * 1 root DATA_REFRESH_NOT_BEFORE=2026-10-05 /bin/bash /opt/tt-aufstellung/scripts/weekly-data-refresh-prod.sh >> /opt/tt-aufstellung/logs/cron-weekly-refresh.log 2>&1

@@ -11,11 +11,13 @@ import time
 from datetime import date
 from pathlib import Path
 
+from sqlalchemy import func
+
 from .analysis_cache import refresh_analysis_cache
 from .analysis_service import clear_analysis_runtime_caches
 from .db import SessionLocal, create_all
-from .models import XttvPlayer
-from .rc_import import import_rc_player
+from .models import PlayerRatingSnapshot, XttvPlayer
+from .rc_import import import_rc_player, import_rc_player_updates
 from .rc_matching import apply_matches_all
 from .xttv_db_import import import_new_reports, player_ids_from_meids
 
@@ -39,10 +41,10 @@ def _refresh_paused() -> tuple[bool, str | None]:
 
 
 def _import_rc_for_players(external_ids: list[str]) -> dict:
-    """Fetch full Ratings Central PlayerHistory (not index sync — that is only one point)."""
+    """Update RC for players in new XTTV reports — incremental when history already exists."""
     external_ids = sorted({str(x) for x in external_ids if x})
     if not external_ids:
-        return {"imported": 0, "errors": 0, "targets": 0}
+        return {"imported": 0, "errors": 0, "targets": 0, "full_imports": 0, "incremental_updates": 0}
     with SessionLocal() as session:
         players = (
             session.query(XttvPlayer)
@@ -52,20 +54,47 @@ def _import_rc_for_players(external_ids: list[str]) -> dict:
             )
             .all()
         )
-    imported = errors = 0
+        snapshot_counts = {
+            row.player_id: row.cnt
+            for row in session.query(
+                PlayerRatingSnapshot.player_id,
+                func.count(PlayerRatingSnapshot.id).label("cnt"),
+            )
+            .filter(
+                PlayerRatingSnapshot.source == "ratingscentral",
+                PlayerRatingSnapshot.player_id.in_([p.id for p in players]),
+            )
+            .group_by(PlayerRatingSnapshot.player_id)
+        }
+    imported = errors = full_imports = incremental_updates = 0
     for player in players:
         try:
-            import_rc_player(
+            importer = (
+                import_rc_player_updates
+                if snapshot_counts.get(player.id, 0) > 0
+                else import_rc_player
+            )
+            result = importer(
                 int(player.rc_player_id),
                 xttv_external_player_id=str(player.external_player_id),
                 xttv_name=player.name,
                 xttv_club=player.club,
             )
             imported += 1
+            if result.get("mode") == "incremental":
+                incremental_updates += 1
+            else:
+                full_imports += 1
         except Exception as exc:
             errors += 1
             logger.warning("RC import %s: %s", player.external_player_id, exc)
-    return {"imported": imported, "errors": errors, "targets": len(players)}
+    return {
+        "imported": imported,
+        "errors": errors,
+        "targets": len(players),
+        "full_imports": full_imports,
+        "incremental_updates": incremental_updates,
+    }
 
 
 def run_data_refresh(*, restart_server: bool = False) -> dict:

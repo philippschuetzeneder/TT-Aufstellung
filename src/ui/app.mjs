@@ -75,15 +75,30 @@ async function api(path, { timeoutMs = 5000 } = {}) {
   }
 }
 
+function isTragweinKamigTeamName(name) {
+  return /tragwein/i.test(name || '') && /kamig/i.test(name || '');
+}
+
+function tragweinKamigSquadNumber(name) {
+  const match = String(name || '').match(/(\d+)\s*$/);
+  return match ? Number(match[1]) : 0;
+}
+
 function pickOwnTeam(teams) {
-  const exact = teams.find((t) => t.id === DEFAULT_OWN_TEAM);
-  if (exact) return exact.id;
-  const fuzzy = teams.find((t) => /tragwein/i.test(t.name) && /kamig/i.test(t.name) && /3/.test(t.name));
-  return fuzzy?.id || teams[0]?.id || '';
+  const clubTeams = teams.filter((t) => isTragweinKamigTeamName(t.name));
+  if (!clubTeams.length) return '';
+  if (clubTeams.length === 1) return clubTeams[0].id;
+  const preferred = clubTeams.find((t) => t.id === DEFAULT_OWN_TEAM);
+  if (preferred) return preferred.id;
+  const sorted = [...clubTeams].sort(
+    (a, b) => tragweinKamigSquadNumber(b.name) - tragweinKamigSquadNumber(a.name),
+  );
+  return sorted[0]?.id || '';
 }
 
 function pickOpponentTeam(teams, ownId) {
-  return teams.find((t) => t.id !== ownId)?.id || ownId || '';
+  if (!ownId) return '';
+  return teams.find((t) => t.id !== ownId)?.id || '';
 }
 
 function syncHeader() {
@@ -199,10 +214,24 @@ async function loadTeamPlayers() {
   syncHeader();
   const leagueQ = state.league ? '&league=' + encodeURIComponent(state.league) : '';
   try {
-    const [own, opp] = await Promise.all([
-      api('/api/teams/players?team=' + encodeURIComponent(state.ownTeam) + leagueQ),
-      api('/api/teams/players?team=' + encodeURIComponent(state.opponentTeam) + leagueQ),
-    ]);
+    if (!state.ownTeam) {
+      state.ownPlayers = [];
+      state.opponentPlayers = [];
+      state.selectedOwn = [];
+      state.selectedOpp = [];
+      state.opponentDirection = '';
+      state.doublePair1Ids = [];
+      state.doublesSuggestion = null;
+      state.result = null;
+      state.optimalResult = null;
+      state.editMode = false;
+      return;
+    }
+    const ownPromise = api('/api/teams/players?team=' + encodeURIComponent(state.ownTeam) + leagueQ);
+    const oppPromise = state.opponentTeam
+      ? api('/api/teams/players?team=' + encodeURIComponent(state.opponentTeam) + leagueQ)
+      : Promise.resolve({ players: [] });
+    const [own, opp] = await Promise.all([ownPromise, oppPromise]);
     state.ownPlayers = own.players;
     state.opponentPlayers = opp.players;
     state.selectedOwn = [];
@@ -348,8 +377,11 @@ function setupPanelHtml(own, opp, opponents) {
   const analyzeDisabled = !canAnalyze();
   const analyzeLabel = state.analysisLoading ? 'Berechnung läuft …' : 'Optimale Aufstellung berechnen';
   const oppComplete = state.selectedOpp.length === 4;
-  const phaseBlock = `<div class="phase-primary-block${oppComplete ? ' complete' : ''}"><h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}${opponentDirectionHtml()}</div>`;
-  return `<h2 class="section-title">Einstellungen</h2><div class="setup-teams-block"><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}</div><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}${phaseBlock}<details class="collapsible setup-advanced"><summary><span class="collapsible-title">Erweitert</span></summary><div class="collapsible-body"><label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp inkludieren</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p></div></details><button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button>`;
+  const oppHint = state.selectedOpp.length === 0 && !state.loadingPlayers
+    ? '<p class="muted setup-opp-hint">Optional — ohne Auswahl nutzt die Berechnung typische Aufstellungen aus der Gegner-Historie.</p>'
+    : '';
+  const phaseBlock = `<div class="phase-primary-block${oppComplete ? ' complete' : ''}"><h3>Bekannte Gegner <span class="selection-count">${state.selectedOpp.length}/4</span></h3>${oppHint}${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(opp, state.selectedOpp, 'opp')}${opponentDirectionHtml()}</div>`;
+  return `<div class="setup-teams-block"><div class="setup-team-row">${select('Eigene Mannschaft', 'ownTeam', state.teams)}${venueSelect()}</div>${select('Gegner', 'opponentTeam', opponents)}</div><h3>Eigene Spieler <span class="selection-count">${state.selectedOwn.length}/4</span></h3>${state.loadingPlayers ? '<div class="empty">Spieler werden geladen …</div>' : players(own, state.selectedOwn, 'own')}${doublesSetupHtml()}${phaseBlock}<details class="collapsible setup-advanced"><summary><span class="collapsible-title">Erweitert (Beta)</span></summary><div class="collapsible-body"><label class="option-check"><input type="checkbox" data-field="useSpieltyp" ${state.useSpieltyp ? 'checked' : ''} ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}><span>Spielertyp inkludieren</span></label><p class="muted option-hint">Offensiv/Noppen/Defensiv/Normal</p></div></details><button class="primary setup-analyze" data-action="analyze" ${analyzeDisabled ? 'disabled' : ''}>${analyzeLabel}</button>`;
 }
 
 function opponentDirectionHtml() {
@@ -395,7 +427,12 @@ function render() {
 }
 
 function select(label, field, items) {
-  return `<label>${label}<select data-field="${field}" ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}>${items.map((x) => `<option value="${escapeHtml(x.id)}" ${state[field] === x.id ? 'selected' : ''}>${escapeHtml(x.name)}</option>`).join('')}</select></label>`;
+  const current = state[field];
+  const placeholder = `<option value="" ${!current ? 'selected' : ''}>— wählen —</option>`;
+  const options = items.map(
+    (x) => `<option value="${escapeHtml(x.id)}" ${current === x.id ? 'selected' : ''}>${escapeHtml(x.name)}</option>`,
+  ).join('');
+  return `<label>${label}<select data-field="${field}" ${state.loadingPlayers || state.analysisLoading ? 'disabled' : ''}>${placeholder}${options}</select></label>`;
 }
 
 function rcLabel(p) {

@@ -14,6 +14,7 @@
 .hero-controls{align-items:stretch;width:100%}
 .hero-controls-league{flex:1 1 auto;margin-left:0}
 .header-league{margin:0;width:100%;min-width:0;display:grid;gap:6px}
+.header-league-label{text-transform:none;letter-spacing:0;font-size:.76rem}
 .header-league-select-native{display:none}
 .header-league-trigger{width:100%;min-width:0;border:1px solid rgba(255,255,255,.28);border-radius:14px;padding:10px 12px;background:rgba(7,25,43,.35);color:white;backdrop-filter:blur(6px);font-size:.78rem;line-height:1.25;display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;cursor:pointer;font-weight:700}
 .header-league-trigger:disabled{opacity:.65;cursor:not-allowed}

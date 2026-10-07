@@ -128,7 +128,7 @@ export function renderHeaderLeague(leagues, league, {
     ${controlsRefresh}
     ${adminTokenHtml}
     <div class="header-league">
-      <span class="header-league-label">Liga</span>
+      <span class="header-league-label">Liga-Auswahl</span>
       <button type="button" class="header-league-trigger" id="header-league-trigger" ${disabled || dataRefreshRunning ? 'disabled' : ''} aria-haspopup="dialog" aria-controls="header-league-modal">
         <span class="header-league-trigger-text">${escapeHtml(leagueLabel(current))}</span>
         <span class="header-league-trigger-chevron" aria-hidden="true"></span>
