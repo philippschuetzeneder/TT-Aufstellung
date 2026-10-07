@@ -72,10 +72,13 @@
 .profile-results{margin-top:12px}.profile-results li{border-top:1px solid #e7eef4;padding:7px 0}
 .profile-season-block{margin-top:18px}
 .profile-subheading{margin:18px 0 10px;font-size:.95rem}
-.profile-league-list{list-style:none;margin:0;padding:0;display:grid;gap:4px}
-.profile-league-list li{align-items:baseline;background:#fff;border:1px solid #e7eef4;border-radius:8px;display:flex;flex-wrap:wrap;gap:6px 10px;padding:5px 10px}
-.profile-league-season{color:#087058;font-size:.78rem;font-weight:800;white-space:nowrap}
-.profile-league-name{color:#334155;font-size:.82rem;line-height:1.35;min-width:0}
+.profile-league-list{list-style:none;margin:0;padding:0;display:grid;gap:3px}
+.profile-league-list li{align-items:center;background:#fff;border:1px solid #e7eef4;border-radius:8px;display:flex;flex-wrap:nowrap;gap:6px;padding:4px 10px;min-width:0}
+.profile-league-season{color:#087058;flex:0 0 auto;font-size:.76rem;font-weight:800;white-space:nowrap}
+.profile-league-sep{color:#b8c5d1;flex:0 0 auto;font-size:.76rem;font-weight:800;line-height:1}
+.profile-league-name{color:#334155;flex:1 1 auto;font-size:.82rem;line-height:1.25;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.profile-rc-period{font-size:.78rem;font-weight:700;color:#627487;white-space:normal}
+.profile-compact-heading .profile-rc-period{text-transform:none;letter-spacing:0}
 .form-games-table{width:100%;border-collapse:separate;border-spacing:0;font-size:.88rem}
 .form-games-desktop{display:block}
 .form-games-mobile-wrap{display:none}

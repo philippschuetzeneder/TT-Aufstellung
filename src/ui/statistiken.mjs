@@ -8,7 +8,7 @@ const state = {
   leagues: [], league: '', players: [], search: '', team: '',
   sort: 'rc_rating', direction: 'desc',
   profile: null,
-  profileScope: 'season',
+  profileScope: 'cross_season',
   dataRefreshRunning: false,
   adminRequired: false,
   forceDesktopView: false,
@@ -35,9 +35,10 @@ state.forceDesktopView = readDesktopViewPreference();
 function readProfileScopePreference() {
   try {
     const value = localStorage.getItem(PROFILE_SCOPE_KEY);
-    return value === 'cross_season' ? 'cross_season' : 'season';
+    if (value === 'season' || value === 'cross_season') return value;
+    return 'cross_season';
   } catch {
-    return 'season';
+    return 'cross_season';
   }
 }
 
@@ -312,19 +313,40 @@ function statCard(label, value) {
   return `<div class="profile-stat"><span class="muted">${escapeHtml(label)}</span><strong>${value}</strong></div>`;
 }
 
-function historySvg(history) {
-  const values = (history || []).map((item) => Number(item.rc_rating)).filter(Number.isFinite);
-  if (values.length < 2) return '<p class="muted">Keine ausreichenden RC-Snapshots vorhanden.</p>';
-  const min = Math.min(...values), max = Math.max(...values), range = max - min || 1;
-  const points = values.map((value, index) => `${(index / (values.length - 1) * 100).toFixed(1)},${(38 - ((value - min) / range) * 32).toFixed(1)}`).join(' ');
-  return `<svg class="rc-chart" viewBox="0 0 100 42" role="img" aria-label="RC-Verlauf"><polyline points="${points}" fill="none" stroke="currentColor" stroke-width="1.8" vector-effect="non-scaling-stroke"/></svg>`;
-}
-
 function formatProfileDate(iso) {
   if (!iso) return '-';
   const parts = String(iso).split('-');
   if (parts.length !== 3) return escapeHtml(iso);
   return `${parts[2]}.${parts[1]}.${parts[0]}`;
+}
+
+function rcHistoryPeriodRange(history) {
+  const dated = (history || []).filter((item) => item?.date);
+  if (dated.length < 2) return null;
+  return {
+    from: formatProfileDate(dated[0].date),
+    to: formatProfileDate(dated[dated.length - 1].date),
+  };
+}
+
+function rcHistoryPeriodSuffix(history) {
+  const range = rcHistoryPeriodRange(history);
+  if (!range) return '';
+  return ` <span class="profile-rc-period">(${range.from} – ${range.to})</span>`;
+}
+
+function historySvg(history) {
+  const values = (history || []).map((item) => Number(item.rc_rating)).filter(Number.isFinite);
+  if (values.length < 2) return '<p class="muted">Keine ausreichenden RC-Snapshots vorhanden.</p>';
+  const min = Math.min(...values), max = Math.max(...values), range = max - min || 1;
+  const points = values.map((value, index) => `${(index / (values.length - 1) * 100).toFixed(1)},${(38 - ((value - min) / range) * 32).toFixed(1)}`).join(' ');
+  const period = rcHistoryPeriodRange(history);
+  const ariaPeriod = period ? ` (${period.from} – ${period.to})` : '';
+  return `<svg class="rc-chart" viewBox="0 0 100 42" role="img" aria-label="RC-Verlauf${escapeHtml(ariaPeriod)}"><polyline points="${points}" fill="none" stroke="currentColor" stroke-width="1.8" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+function homeAwayStrengthLabel(side) {
+  return side === 'home' ? 'Heim-Stärke' : 'Auswärts-Stärke';
 }
 
 function resultBadge(row) {
@@ -364,7 +386,7 @@ function leagueHistoryList(leagues) {
     if (typeof entry === 'string') {
       return `<li><span class="profile-league-name">${escapeHtml(entry)}</span></li>`;
     }
-    return `<li><span class="profile-league-season">${escapeHtml(entry.season || '–')}</span><span class="profile-league-name">${escapeHtml(entry.name || '')}</span></li>`;
+    return `<li><span class="profile-league-season">${escapeHtml(entry.season || '–')}</span><span class="profile-league-sep" aria-hidden="true">·</span><span class="profile-league-name">${escapeHtml(entry.name || '')}</span></li>`;
   }).join('')}</ul>`;
 }
 
@@ -394,7 +416,7 @@ function profileScopedSectionHtml(data, scopedPlayer, form, homeAway) {
     const seasonStats = data.current_season || {};
     return `<h3>Aktuelle Saison ${escapeHtml(data.season || '-')}</h3>
       <div class="profile-stats">${statCard('Spiele', profileValue(seasonStats.games))}${statCard('Siege', profileValue(seasonStats.wins))}${statCard('Niederlagen', profileValue(seasonStats.losses))}${statCard('Siegquote', profileValue(seasonStats.win_rate == null ? null : Math.round(seasonStats.win_rate * 100), ' %'))}</div>
-      <h3>Heim / Auswärts</h3><div class="profile-stats">${['home', 'away'].map((side) => { const value = homeAway?.[side] || {}; return statCard(side === 'home' ? 'Heimspiele' : 'Auswärtsspiele', profileValue(value.games)) + statCard(`${side === 'home' ? 'Heim' : 'Auswärts'}-Siege`, profileValue(value.wins)) + statCard('Quote', profileValue(value.win_rate == null ? null : Math.round(value.win_rate * 100), ' %')) + statCard('Stärke', profileValue(value.strength, ' %')); }).join('')}</div>
+      <h3>Heim / Auswärts</h3><div class="profile-stats">${['home', 'away'].map((side) => { const value = homeAway?.[side] || {}; return statCard(side === 'home' ? 'Heimspiele' : 'Auswärtsspiele', profileValue(value.games)) + statCard(`${side === 'home' ? 'Heim' : 'Auswärts'}-Siege`, profileValue(value.wins)) + statCard('Quote', profileValue(value.win_rate == null ? null : Math.round(value.win_rate * 100), ' %')) + statCard(homeAwayStrengthLabel(side), profileValue(value.strength, ' %')); }).join('')}</div>
       <h3>Form und Entwicklung</h3>
       <div class="profile-stats">${statCard('Letzte 5 Spiele', `${profileValue(form.last_5?.wins)} / ${profileValue(form.last_5?.games)}`)}${statCard('Quote letzte 5', profileValue(form.last_5?.win_rate == null ? null : Math.round(form.last_5.win_rate * 100), ' %'))}${statCard('Letzte 10 Spiele', `${profileValue(form.last_10?.wins)} / ${profileValue(form.last_10?.games)}`)}${statCard('Quote letzte 10', profileValue(form.last_10?.win_rate == null ? null : Math.round(form.last_10.win_rate * 100), ' %'))}</div>
       <h4 class="profile-subheading">Letzte Spiele</h4>
@@ -408,7 +430,7 @@ function profileScopedSectionHtml(data, scopedPlayer, form, homeAway) {
     <h3>Grundstatistik</h3>
     <div class="profile-stats">${statCard('Spiele', profileValue(scopedPlayer.matches))}${statCard('Siege', profileValue(scopedPlayer.wins))}${statCard('Niederlagen', profileValue(scopedPlayer.losses))}${statCard('Unentschieden', profileValue(scopedPlayer.draws))}${statCard('Siegquote', profileValue(scopedPlayer.win_rate == null ? null : Math.round(scopedPlayer.win_rate * 100), ' %'))}</div>
     <h3>Heim / Auswärts</h3>
-    <div class="profile-stats">${['home', 'away'].map((side) => { const value = homeAway?.[side] || {}; return statCard(side === 'home' ? 'Heimspiele' : 'Auswärtsspiele', profileValue(value.games)) + statCard(`${side === 'home' ? 'Heim' : 'Auswärts'}-Siege`, profileValue(value.wins)) + statCard('Quote', profileValue(value.win_rate == null ? null : Math.round(value.win_rate * 100), ' %')) + statCard('Stärke', profileValue(value.strength, ' %')); }).join('')}</div>
+    <div class="profile-stats">${['home', 'away'].map((side) => { const value = homeAway?.[side] || {}; return statCard(side === 'home' ? 'Heimspiele' : 'Auswärtsspiele', profileValue(value.games)) + statCard(`${side === 'home' ? 'Heim' : 'Auswärts'}-Siege`, profileValue(value.wins)) + statCard('Quote', profileValue(value.win_rate == null ? null : Math.round(value.win_rate * 100), ' %')) + statCard(homeAwayStrengthLabel(side), profileValue(value.strength, ' %')); }).join('')}</div>
     <h3>Form</h3>
     <div class="profile-stats">${statCard('Letzte 5 Spiele', `${profileValue(form.last_5?.wins)} / ${profileValue(form.last_5?.games)}`)}${statCard('Quote letzte 5', profileValue(form.last_5?.win_rate == null ? null : Math.round(form.last_5.win_rate * 100), ' %'))}${statCard('Letzte 10 Spiele', `${profileValue(form.last_10?.wins)} / ${profileValue(form.last_10?.games)}`)}${statCard('Quote letzte 10', profileValue(form.last_10?.win_rate == null ? null : Math.round(form.last_10.win_rate * 100), ' %'))}</div>
     <h4 class="profile-subheading">Letzte Spiele</h4>
@@ -432,9 +454,8 @@ function renderProfile(data) {
   app.innerHTML = `<section class="card profile-card">
     <div class="profile-heading"><div><button type="button" class="ranking-back" data-back>← Rangliste</button><h2>${escapeHtml(player.name || '-')}</h2><p class="muted">${escapeHtml(player.team || '-')} · ${escapeHtml(data.latest_league || state.league)}</p></div></div>
     <section class="profile-section-fixed">
-      <p class="profile-section-label">Allgemein (unabhängig vom Zeitraum)</p>
       <div class="profile-stats">${statCard('Aktueller RC', profileValue(player.rc_rating == null ? null : Math.round(player.rc_rating)))}${statCard('RC-Trend', trend(rcTrend))}${statCard('Rang in der Liga', profileValue(player.rank))}</div>
-      <h3 class="profile-compact-heading">RC-Verlauf</h3>
+      <h3 class="profile-compact-heading">RC-Verlauf${rcHistoryPeriodSuffix(data.rc_history)}</h3>
       <div class="rc-chart-wrap">${historySvg(data.rc_history)}</div>
       <h3 class="profile-compact-heading">Ligen der letzten 3 Jahre</h3>
       ${leagueHistoryList(data.leagues_last_3_years)}

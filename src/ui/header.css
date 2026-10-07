@@ -1,8 +1,13 @@
 .hero{min-height:auto;padding:8px 12px}
 .hero-inner{align-items:stretch;flex-direction:column;gap:6px}
-.hero-title-row{display:flex;flex-wrap:wrap;align-items:center;gap:4px 8px;width:100%}
-.hero-copy{flex-basis:auto;width:100%}
-.hero-heading{min-width:0;flex:1 1 100%}
+.hero-title-row{display:flex;flex-wrap:nowrap;align-items:flex-start;gap:4px 8px;width:100%;min-width:0}
+.hero-copy{flex-basis:auto;width:100%;min-width:0}
+.hero-heading{min-width:0;flex:1 1 auto}
+.hero-title-row>h1{min-width:0;flex:1 1 auto;margin:0}
+.hero-refresh:empty{display:none}
+.hero-nav{flex:0 0 auto;margin-left:auto;align-self:flex-start}
+.hero-refresh:not(:empty){flex:0 0 auto;align-self:flex-start}
+.hero-refresh:not(:empty)+.hero-nav{margin-left:0}
 .hero-copy h1{margin:0;font-size:1.35rem;line-height:1.05;letter-spacing:-.04em}
 .hero-byline{margin:2px 0 0;color:rgba(255,255,255,.72);font-size:.66rem;font-weight:700;letter-spacing:.02em}
 .hero-refresh,.hero-nav{flex:0 0 auto}
