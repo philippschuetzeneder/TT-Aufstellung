@@ -33,6 +33,20 @@ main.app-shell,
 }
 
 @media (max-width: 799px) {
+  .setup-team-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 4.85rem);
+    gap: 6px;
+  }
+
+  .venue-label {
+    font-size: 0.72rem;
+  }
+
+  .venue-label select {
+    padding: 10px 6px;
+    font-size: 0.88rem;
+  }
+
   .card {
     box-shadow: 0 12px 32px rgba(36, 74, 104, 0.1);
   }
@@ -58,6 +72,10 @@ main.app-shell,
     font-size: 0.72rem;
     line-height: 1.25;
     text-align: right;
+  }
+
+  .player.player-club-extra {
+    border-style: dashed;
   }
 
   .doubles-setup-head {

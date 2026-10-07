@@ -11,6 +11,8 @@ from .opponent_prediction_service import predict_opponent_lineups
 from .xttv_db_import import get_target_seasons
 
 WIN_TARGET = 8
+CLUB_SQUAD_RC_WINDOW = 200.0
+_TEAM_NUMBER_SUFFIX = re.compile(r"^(.+?)\s+\d+$")
 
 
 def current_season() -> str:
@@ -52,11 +54,21 @@ def resolve_latest_league_season(session, league_group: str) -> str | None:
     if not rows:
         return None
     group = league_group.strip()
-    for row in rows:
-        season = current_season()
-        if _league_group(row) == group and _season_label(row) == season:
+    candidates = [row for row in rows if _league_group(row) == group]
+    if not candidates:
+        # Allow short numeric codes such as "421" for "421 RK Linz …".
+        candidates = [
+            row for row in rows
+            if _league_group(row).startswith(f"{group} ")
+            or (group.isdigit() and _league_group(row).split(" ", 1)[0] == group)
+        ]
+    if not candidates:
+        return None
+    season = current_season()
+    for row in candidates:
+        if _season_label(row) == season:
             return row
-    return None
+    return max(candidates, key=_season_sort_key)
 
 
 def list_leagues():
@@ -219,9 +231,161 @@ def list_teams(league: str | None = None):
         ]
         return {"ok": True, "teams": teams, "count": len(teams)}
 
+def _club_name_prefix(team_name: str) -> str | None:
+    """Vereins-/Klubpräfix ohne Mannschaftsnummer, z. B. 'Tragwein/Kamig' aus 'Tragwein/Kamig 2'."""
+    match = _TEAM_NUMBER_SUFFIX.match((team_name or "").strip())
+    return match.group(1).strip() if match else None
+
+
+def _league_average_rc(session, resolved_league: str) -> float | None:
+    row = session.execute(
+        text("""
+            SELECT avg(snap.rc_rating::float) AS avg_rc
+            FROM (
+                SELECT DISTINCT mp.external_player_id
+                FROM match_players mp
+                JOIN xttv_matches m ON m.id = mp.match_id
+                WHERE m.league = :league AND mp.external_player_id IS NOT NULL
+            ) league_players
+            JOIN xttv_players xp ON xp.external_player_id = league_players.external_player_id
+            JOIN LATERAL (
+                SELECT rc_rating
+                FROM player_rating_snapshots
+                WHERE player_id = xp.id AND source = 'ratingscentral'
+                ORDER BY observed_at DESC
+                LIMIT 1
+            ) snap ON snap.rc_rating IS NOT NULL
+        """),
+        {"league": resolved_league},
+    ).mappings().first()
+    if not row or row["avg_rc"] is None:
+        return None
+    return float(row["avg_rc"])
+
+
+def _team_player_rows(session, team_name: str, cutoff, league_pattern: str | None):
+    league_clause = ""
+    params = {"team": team_name}
+    if league_pattern:
+        params["league_pattern"] = league_pattern
+        league_clause = "AND m.league LIKE :league_pattern"
+    if cutoff:
+        params["cutoff"] = cutoff
+        league_clause += " AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff"
+    return session.execute(
+        text(f"""
+            WITH team_players AS (
+                SELECT mp.external_player_id::text AS external_id,
+                       max(mp.name) AS name
+                FROM match_players mp
+                JOIN xttv_matches m ON m.id = mp.match_id
+                WHERE mp.external_player_id IS NOT NULL
+                  AND (
+                    (m.home_team = :team AND mp.side = 'home')
+                    OR (m.away_team = :team AND mp.side = 'away')
+                  )
+                  {league_clause}
+                GROUP BY mp.external_player_id
+            )
+            SELECT tp.external_id AS id,
+                   tp.name,
+                   xp.rc_player_id,
+                   snap.rc_rating,
+                   snap.rc_deviation
+            FROM team_players tp
+            LEFT JOIN xttv_players xp ON xp.external_player_id = tp.external_id
+            LEFT JOIN LATERAL (
+                SELECT rc_rating, rc_deviation
+                FROM player_rating_snapshots
+                WHERE player_id = xp.id AND source = 'ratingscentral'
+                ORDER BY observed_at DESC
+                LIMIT 1
+            ) snap ON true
+            ORDER BY tp.name
+        """),
+        params,
+    ).mappings()
+
+
+def _club_player_rows(session, club_prefix: str, cutoff):
+    """Spieler aller Mannschaften mit gleichem Vereinspräfix (z. B. Tragwein/Kamig 1/2/3)."""
+    params = {"club_pattern": f"{club_prefix} %"}
+    date_clause = ""
+    if cutoff:
+        params["cutoff"] = cutoff
+        date_clause = " AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff"
+    return session.execute(
+        text(f"""
+            WITH team_players AS (
+                SELECT mp.external_player_id::text AS external_id,
+                       max(mp.name) AS name
+                FROM match_players mp
+                JOIN xttv_matches m ON m.id = mp.match_id
+                WHERE mp.external_player_id IS NOT NULL
+                  AND (
+                    (m.home_team LIKE :club_pattern AND mp.side = 'home')
+                    OR (m.away_team LIKE :club_pattern AND mp.side = 'away')
+                  )
+                  {date_clause}
+                GROUP BY mp.external_player_id
+            )
+            SELECT tp.external_id AS id,
+                   tp.name,
+                   xp.rc_player_id,
+                   snap.rc_rating,
+                   snap.rc_deviation
+            FROM team_players tp
+            LEFT JOIN xttv_players xp ON xp.external_player_id = tp.external_id
+            LEFT JOIN LATERAL (
+                SELECT rc_rating, rc_deviation
+                FROM player_rating_snapshots
+                WHERE player_id = xp.id AND source = 'ratingscentral'
+                ORDER BY observed_at DESC
+                LIMIT 1
+            ) snap ON true
+            ORDER BY tp.name
+        """),
+        params,
+    ).mappings()
+
+
+def _current_season_roster_ids(session, team_name: str, resolved_league: str) -> set[str]:
+    """Spieler mit mindestens einem Spiel in der aktuellen Liga-Saison für diese Mannschaft."""
+    rows = session.execute(
+        text("""
+            SELECT DISTINCT mp.external_player_id::text AS external_id
+            FROM match_players mp
+            JOIN xttv_matches m ON m.id = mp.match_id
+            WHERE mp.external_player_id IS NOT NULL
+              AND m.league = :resolved_league
+              AND (
+                (m.home_team = :team AND mp.side = 'home')
+                OR (m.away_team = :team AND mp.side = 'away')
+              )
+        """),
+        {"team": team_name, "resolved_league": resolved_league},
+    ).scalars().all()
+    return {str(row) for row in rows}
+
+
+def _row_to_player(row, *, squad_source: str, is_reserve: bool = False) -> dict:
+    out = {
+        "id": str(row["id"]),
+        "name": row["name"],
+        "rc_matched": row["rc_player_id"] is not None,
+        "rc_rating": float(row["rc_rating"]) if row["rc_rating"] is not None else None,
+        "rc_deviation": float(row["rc_deviation"]) if row["rc_deviation"] is not None else None,
+        "is_reserve": is_reserve,
+    }
+    if squad_source:
+        out["squad_source"] = squad_source
+    return out
+
+
 def list_players(team_name, league: str | None = None):
     if not team_name:
         return {"ok": False, "error": "team is required", "players": []}
+    league_avg = None
     with SessionLocal() as session:
         resolved = resolve_latest_league_season(session, league) if league else None
         ref_row = session.execute(text("""
@@ -232,62 +396,50 @@ def list_players(team_name, league: str | None = None):
         cutoff = None
         if ref_date:
             cutoff = ref_date - timedelta(days=int(round(2 * 365.25)))
-        league_clause = ""
-        params = {"team": team_name}
-        if resolved:
-            params["league_pattern"] = _league_group(resolved) + "%"
-            league_clause = "AND m.league LIKE :league_pattern"
-        if cutoff:
-            params["cutoff"] = cutoff
-            league_clause += " AND to_date(substring(m.match_date from 1 for 10), 'DD.MM.YYYY') >= :cutoff"
-        rows = session.execute(
-            text(f"""
-                WITH team_players AS (
-                    SELECT mp.external_player_id::text AS external_id,
-                           max(mp.name) AS name
-                    FROM match_players mp
-                    JOIN xttv_matches m ON m.id = mp.match_id
-                    WHERE mp.external_player_id IS NOT NULL
-                      AND (
-                        (m.home_team = :team AND mp.side = 'home')
-                        OR (m.away_team = :team AND mp.side = 'away')
-                      )
-                      {league_clause}
-                    GROUP BY mp.external_player_id
+        league_pattern = (_league_group(resolved) + "%") if resolved else None
+        core_ids = _current_season_roster_ids(session, team_name, resolved) if resolved else None
+        rows = _team_player_rows(session, team_name, cutoff, league_pattern)
+        players = [
+            _row_to_player(
+                row,
+                squad_source="league",
+                is_reserve=bool(core_ids is not None and str(row["id"]) not in core_ids),
+            )
+            for row in rows
+        ]
+        seen = {p["id"] for p in players}
+
+        club_prefix = _club_name_prefix(team_name)
+        if resolved and club_prefix:
+            league_avg = _league_average_rc(session, resolved)
+            club_rows = _club_player_rows(session, club_prefix, cutoff)
+            for row in club_rows:
+                pid = str(row["id"])
+                if pid in seen:
+                    continue
+                rc = row["rc_rating"]
+                if rc is None:
+                    continue
+                if league_avg is None:
+                    continue
+                if abs(float(rc) - league_avg) > CLUB_SQUAD_RC_WINDOW:
+                    continue
+                players.append(
+                    _row_to_player(
+                        row,
+                        squad_source="club",
+                        is_reserve=bool(core_ids is None or pid not in core_ids),
+                    )
                 )
-                SELECT tp.external_id AS id,
-                       tp.name,
-                       xp.rc_player_id,
-                       snap.rc_rating,
-                       snap.rc_deviation
-                FROM team_players tp
-                LEFT JOIN xttv_players xp ON xp.external_player_id = tp.external_id
-                LEFT JOIN LATERAL (
-                    SELECT rc_rating, rc_deviation
-                    FROM player_rating_snapshots
-                    WHERE player_id = xp.id AND source = 'ratingscentral'
-                    ORDER BY observed_at DESC
-                    LIMIT 1
-                ) snap ON true
-                ORDER BY tp.name
-            """),
-            params,
-        ).mappings()
-    players = [
-        {
-            "id": str(row["id"]),
-            "name": row["name"],
-            "rc_matched": row["rc_player_id"] is not None,
-            "rc_rating": float(row["rc_rating"]) if row["rc_rating"] is not None else None,
-            "rc_deviation": float(row["rc_deviation"]) if row["rc_deviation"] is not None else None,
-        }
-        for row in rows
-    ]
+                seen.add(pid)
+            players.sort(key=lambda p: (p.get("name") or "").lower())
+
     return {
         "ok": True,
         "team": team_name,
         "season": _season_label(resolved) if resolved else None,
         "player_window_years": 2,
+        "league_rc_average": round(league_avg, 1) if resolved and league_avg is not None else None,
         "players": players,
     }
 

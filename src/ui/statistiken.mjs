@@ -3,10 +3,12 @@ import { adminRequestHeaders, applyAdminTokenFromUrl } from './admin-auth.mjs';
 
 const app = document.querySelector('#app');
 const DESKTOP_VIEW_KEY = 'tt-statistiken-desktop-view';
+const PROFILE_SCOPE_KEY = 'tt-statistiken-profile-scope';
 const state = {
   leagues: [], league: '', players: [], search: '', team: '',
   sort: 'rc_rating', direction: 'desc',
   profile: null,
+  profileScope: 'season',
   dataRefreshRunning: false,
   adminRequired: false,
   forceDesktopView: false,
@@ -29,6 +31,25 @@ function storeDesktopViewPreference(value) {
 }
 
 state.forceDesktopView = readDesktopViewPreference();
+
+function readProfileScopePreference() {
+  try {
+    const value = localStorage.getItem(PROFILE_SCOPE_KEY);
+    return value === 'cross_season' ? 'cross_season' : 'season';
+  } catch {
+    return 'season';
+  }
+}
+
+function storeProfileScopePreference(value) {
+  try {
+    localStorage.setItem(PROFILE_SCOPE_KEY, value);
+  } catch {
+    /* ignore */
+  }
+}
+
+state.profileScope = readProfileScopePreference();
 
 async function api(path, { timeoutMs = 60000 } = {}) {
   const controller = new AbortController();
@@ -191,11 +212,11 @@ function header(label, key) {
 function sortOptionsHtml() {
   const options = [
     ['rc_rating', 'RC'],
-    ['rc_trend', 'RC-Trend (letzte 10 Spiele)'],
+    ['rc_trend', 'RC-Trend'],
     ['home_strength', 'Heimstärke'],
     ['away_strength', 'Auswärtsstärke'],
-    ['games', 'Spiele'],
-    ['wins', 'Siege'],
+    ['games', 'Spiele (Saison)'],
+    ['wins', 'Siege (Saison)'],
     ['name', 'Name'],
     ['team', 'Mannschaft'],
   ];
@@ -211,8 +232,8 @@ function playerMobileCard(player) {
       <div><dt>Trend</dt><dd>${trend(player.rc_trend)}</dd></div>
       <div><dt>Heim</dt><dd>${display(player.home_strength, ' %')}</dd></div>
       <div><dt>Ausw.</dt><dd>${display(player.away_strength, ' %')}</dd></div>
-      <div><dt>Spiele</dt><dd>${display(player.games)}</dd></div>
-      <div><dt>Siege</dt><dd>${display(player.wins)}</dd></div>
+      <div><dt>Spiele (Saison)</dt><dd>${display(player.games)}</dd></div>
+      <div><dt>Siege (Saison)</dt><dd>${display(player.wins)}</dd></div>
     </dl>
   </article>`;
 }
@@ -241,8 +262,8 @@ function render(data) {
       <label>Spieler suchen<input type="search" data-player-search value="${escapeHtml(state.search)}" placeholder="Name oder Verein/Mannschaft"></label>
       <label>Mannschaft/Verein<select data-team-filter><option value="">Alle Mannschaften/Vereine</option>${teams}</select></label>
     </div>
-    ${rows ? `<div class="ranking-desktop"><div class="table-scroll"><table class="ranking-table"><thead><tr>${header('Spieler', 'name')}${header('Verein / Mannschaft', 'team')}${header('Aktueller RC', 'rc_rating')}${header('RC-Trend (letzte 10 Spiele)', 'rc_trend')}${header('Heimstärke', 'home_strength')}${header('Auswärtsstärke', 'away_strength')}${header('Spiele', 'games')}${header('Siege', 'wins')}</tr></thead><tbody>${rows}</tbody></table></div></div><div class="ranking-mobile"><label class="ranking-mobile-sort">Sortierung<select data-mobile-sort>${sortOptionsHtml()}</select><select data-mobile-direction><option value="desc"${state.direction === 'desc' ? ' selected' : ''}>Absteigend</option><option value="asc"${state.direction === 'asc' ? ' selected' : ''}>Aufsteigend</option></select></label><div class="ranking-mobile-list">${mobileCards}</div></div>` : '<div class="empty">Keine Spieler für diese Liga gefunden.</div>'}
-    <p class="muted ranking-note">RC-Trend (letzte 10 Spiele) = robuste mittlere RC-Veränderung der letzten bis zu 10 RC-Snapshots; einzelne Ausreißer dominieren nicht. Wertebereich: −100 bis +100 RC-Punkte. Stärke = geglättete Einzel-Siegquote aus den verfügbaren Ligaspielen. Fehlende Werte werden als „-“ angezeigt.</p>
+    ${rows ? `<div class="ranking-desktop"><div class="table-scroll"><table class="ranking-table"><thead><tr>${header('Spieler', 'name')}${header('Verein / Mannschaft', 'team')}${header('Aktueller RC', 'rc_rating')}${header('RC-Trend', 'rc_trend')}${header('Heimstärke', 'home_strength')}${header('Auswärtsstärke', 'away_strength')}${header('Spiele (Saison)', 'games')}${header('Siege (Saison)', 'wins')}</tr></thead><tbody>${rows}</tbody></table></div></div><div class="ranking-mobile"><label class="ranking-mobile-sort">Sortierung<select data-mobile-sort>${sortOptionsHtml()}</select><select data-mobile-direction><option value="desc"${state.direction === 'desc' ? ' selected' : ''}>Absteigend</option><option value="asc"${state.direction === 'asc' ? ' selected' : ''}>Aufsteigend</option></select></label><div class="ranking-mobile-list">${mobileCards}</div></div>` : '<div class="empty">Keine Spieler für diese Liga gefunden.</div>'}
+    <p class="muted ranking-note">RC-Trend (letzte bis zu 10 RC-Snapshots) und Heim-/Auswärtsstärke gelten saison- und ligaübergreifend über alle importierten Einzel. Spiele und Siege in der Tabelle nur aktuelle Saison. Stärke = geglättete Einzel-Siegquote. Fehlende Werte: „-“.</p>
   </section>`;
   app.querySelector('[data-toggle-desktop-view]')?.addEventListener('click', () => {
     state.forceDesktopView = !state.forceDesktopView;
@@ -320,23 +341,30 @@ function formGamesMobile(games) {
   </article>`).join('')}</div>`;
 }
 
+function sortFormGamesNewestFirst(games) {
+  return [...(games || [])].sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+}
+
 function formGamesTable(games) {
   if (!games?.length) return '<p class="muted">Keine gültigen Spiele vorhanden.</p>';
-  const rows = games.map((row) => `<tr>
+  const ordered = sortFormGamesNewestFirst(games);
+  const rows = ordered.map((row) => `<tr>
     <td>${formatProfileDate(row.date)}</td>
     <td>${escapeHtml(row.opponent || '-')}</td>
     <td>${resultBadge(row)}</td>
     <td class="number score-cell">${profileValue(row.own_score)}:${profileValue(row.opp_score)}</td>
     <td>${row.side === 'home' ? 'Heim' : 'Auswärts'}</td>
   </tr>`).join('');
-  return `<div class="form-games-desktop"><div class="table-scroll"><table class="form-games-table"><thead><tr><th>Datum</th><th>Gegner</th><th>Ergebnis</th><th>Score</th><th>Ort</th></tr></thead><tbody>${rows}</tbody></table></div></div><div class="form-games-mobile-wrap">${formGamesMobile(games)}</div>`;
+  return `<div class="form-games-desktop"><div class="table-scroll"><table class="form-games-table"><thead><tr><th>Datum</th><th>Gegner</th><th>Ergebnis</th><th>Score</th><th>Ort</th></tr></thead><tbody>${rows}</tbody></table></div></div><div class="form-games-mobile-wrap">${formGamesMobile(ordered)}</div>`;
 }
 
 function leagueHistoryList(leagues) {
   if (!leagues?.length) return '<p class="muted">Keine Ligadaten in den letzten 3 Jahren.</p>';
   return `<ul class="profile-league-list">${leagues.map((entry) => {
-    if (typeof entry === 'string') return `<li><span>${escapeHtml(entry)}</span></li>`;
-    return `<li><strong>${escapeHtml(entry.season || '-')}</strong><span>${escapeHtml(entry.name || '')}</span></li>`;
+    if (typeof entry === 'string') {
+      return `<li><span class="profile-league-name">${escapeHtml(entry)}</span></li>`;
+    }
+    return `<li><span class="profile-league-season">${escapeHtml(entry.season || '–')}</span><span class="profile-league-name">${escapeHtml(entry.name || '')}</span></li>`;
   }).join('')}</ul>`;
 }
 
@@ -347,34 +375,81 @@ function matchupList(rows, tone = 'difficult') {
     : '<li class="muted">Keine passenden Matchups vorhanden.</li>';
 }
 
+function activeProfileScope(data) {
+  if (!data.scopes) return null;
+  return data.scopes[state.profileScope] || data.scopes.season;
+}
+
+function profileScopeToggleHtml(data) {
+  if (!data.scopes) return '';
+  const seasonActive = state.profileScope === 'season';
+  return `<div class="profile-scope-toggle" role="group" aria-label="Statistik-Zeitraum">
+    <button type="button" class="profile-scope-btn${seasonActive ? ' active' : ''}" data-profile-scope="season">Nur diese Saison</button>
+    <button type="button" class="profile-scope-btn${!seasonActive ? ' active' : ''}" data-profile-scope="cross_season">Saisonübergreifend</button>
+  </div>`;
+}
+
+function profileScopedSectionHtml(data, scopedPlayer, form, homeAway) {
+  if (!data.scopes) {
+    const seasonStats = data.current_season || {};
+    return `<h3>Aktuelle Saison ${escapeHtml(data.season || '-')}</h3>
+      <div class="profile-stats">${statCard('Spiele', profileValue(seasonStats.games))}${statCard('Siege', profileValue(seasonStats.wins))}${statCard('Niederlagen', profileValue(seasonStats.losses))}${statCard('Siegquote', profileValue(seasonStats.win_rate == null ? null : Math.round(seasonStats.win_rate * 100), ' %'))}</div>
+      <h3>Heim / Auswärts</h3><div class="profile-stats">${['home', 'away'].map((side) => { const value = homeAway?.[side] || {}; return statCard(side === 'home' ? 'Heimspiele' : 'Auswärtsspiele', profileValue(value.games)) + statCard(`${side === 'home' ? 'Heim' : 'Auswärts'}-Siege`, profileValue(value.wins)) + statCard('Quote', profileValue(value.win_rate == null ? null : Math.round(value.win_rate * 100), ' %')) + statCard('Stärke', profileValue(value.strength, ' %')); }).join('')}</div>
+      <h3>Form und Entwicklung</h3>
+      <div class="profile-stats">${statCard('Letzte 5 Spiele', `${profileValue(form.last_5?.wins)} / ${profileValue(form.last_5?.games)}`)}${statCard('Quote letzte 5', profileValue(form.last_5?.win_rate == null ? null : Math.round(form.last_5.win_rate * 100), ' %'))}${statCard('Letzte 10 Spiele', `${profileValue(form.last_10?.wins)} / ${profileValue(form.last_10?.games)}`)}${statCard('Quote letzte 10', profileValue(form.last_10?.win_rate == null ? null : Math.round(form.last_10.win_rate * 100), ' %'))}</div>
+      <h4 class="profile-subheading">Letzte Spiele</h4>
+      ${formGamesTable(form.games)}`;
+  }
+  const scopeLabel = escapeHtml(data.scopes[state.profileScope]?.label || '');
+  return `<section class="profile-section-scoped" aria-labelledby="profile-scoped-heading">
+    <p class="profile-section-label" id="profile-scoped-heading">Zeitraum wählen</p>
+    ${profileScopeToggleHtml(data)}
+    ${scopeLabel ? `<p class="muted profile-scope-note">${scopeLabel}</p>` : ''}
+    <h3>Grundstatistik</h3>
+    <div class="profile-stats">${statCard('Spiele', profileValue(scopedPlayer.matches))}${statCard('Siege', profileValue(scopedPlayer.wins))}${statCard('Niederlagen', profileValue(scopedPlayer.losses))}${statCard('Unentschieden', profileValue(scopedPlayer.draws))}${statCard('Siegquote', profileValue(scopedPlayer.win_rate == null ? null : Math.round(scopedPlayer.win_rate * 100), ' %'))}</div>
+    <h3>Heim / Auswärts</h3>
+    <div class="profile-stats">${['home', 'away'].map((side) => { const value = homeAway?.[side] || {}; return statCard(side === 'home' ? 'Heimspiele' : 'Auswärtsspiele', profileValue(value.games)) + statCard(`${side === 'home' ? 'Heim' : 'Auswärts'}-Siege`, profileValue(value.wins)) + statCard('Quote', profileValue(value.win_rate == null ? null : Math.round(value.win_rate * 100), ' %')) + statCard('Stärke', profileValue(value.strength, ' %')); }).join('')}</div>
+    <h3>Form</h3>
+    <div class="profile-stats">${statCard('Letzte 5 Spiele', `${profileValue(form.last_5?.wins)} / ${profileValue(form.last_5?.games)}`)}${statCard('Quote letzte 5', profileValue(form.last_5?.win_rate == null ? null : Math.round(form.last_5.win_rate * 100), ' %'))}${statCard('Letzte 10 Spiele', `${profileValue(form.last_10?.wins)} / ${profileValue(form.last_10?.games)}`)}${statCard('Quote letzte 10', profileValue(form.last_10?.win_rate == null ? null : Math.round(form.last_10.win_rate * 100), ' %'))}</div>
+    <h4 class="profile-subheading">Letzte Spiele</h4>
+    ${formGamesTable(form.games)}
+  </section>`;
+}
+
 function renderProfile(data) {
   const player = data.player;
-  const form = data.form || {};
+  const scope = activeProfileScope(data);
+  const scopedPlayer = scope
+    ? { ...player, matches: scope.matches, wins: scope.wins, losses: scope.losses, draws: scope.draws, win_rate: scope.win_rate }
+    : player;
+  const form = scope?.form || data.form || {};
+  const homeAway = scope?.home_away || data.home_away || {};
   const detail = data.opponent_detail;
   const resultList = detail?.results?.length
     ? formGamesTable(detail.results)
     : '';
-  const seasonStats = data.current_season || {};
+  const rcTrend = player.rc_trend ?? player.rc_trend_momentum;
   app.innerHTML = `<section class="card profile-card">
     <div class="profile-heading"><div><button type="button" class="ranking-back" data-back>← Rangliste</button><h2>${escapeHtml(player.name || '-')}</h2><p class="muted">${escapeHtml(player.team || '-')} · ${escapeHtml(data.latest_league || state.league)}</p></div></div>
-    <div class="profile-stats">${statCard('Aktueller RC', profileValue(player.rc_rating == null ? null : Math.round(player.rc_rating)))}${statCard('RC-Trend', trend(player.rc_trend))}${statCard('Rang in der Liga', profileValue(player.rank))}</div>
-    <h3>Grundstatistik</h3><div class="profile-stats">${statCard('Spiele', profileValue(player.matches))}${statCard('Siege', profileValue(player.wins))}${statCard('Niederlagen', profileValue(player.losses))}${statCard('Unentschieden', profileValue(player.draws))}${statCard('Siegquote', profileValue(player.win_rate == null ? null : Math.round(player.win_rate * 100), ' %'))}</div>
-    <div class="profile-season-block">
-      <h3>Aktuelle Saison ${escapeHtml(data.season || '-')}</h3>
-      <div class="profile-stats">${statCard('Spiele', profileValue(seasonStats.games))}${statCard('Siege', profileValue(seasonStats.wins))}${statCard('Niederlagen', profileValue(seasonStats.losses))}${statCard('Siegquote', profileValue(seasonStats.win_rate == null ? null : Math.round(seasonStats.win_rate * 100), ' %'))}</div>
-    </div>
-    <div class="profile-season-block">
-      <h3>Ligen der letzten 3 Jahre</h3>
+    <section class="profile-section-fixed">
+      <p class="profile-section-label">Allgemein (unabhängig vom Zeitraum)</p>
+      <div class="profile-stats">${statCard('Aktueller RC', profileValue(player.rc_rating == null ? null : Math.round(player.rc_rating)))}${statCard('RC-Trend', trend(rcTrend))}${statCard('Rang in der Liga', profileValue(player.rank))}</div>
+      <h3 class="profile-compact-heading">RC-Verlauf</h3>
+      <div class="rc-chart-wrap">${historySvg(data.rc_history)}</div>
+      <h3 class="profile-compact-heading">Ligen der letzten 3 Jahre</h3>
       ${leagueHistoryList(data.leagues_last_3_years)}
-    </div>
-    <h3>Heim / Auswärts</h3><div class="profile-stats">${['home','away'].map((side) => { const value = data.home_away?.[side] || {}; return statCard(side === 'home' ? 'Heimspiele' : 'Auswärtsspiele', profileValue(value.games)) + statCard(`${side === 'home' ? 'Heim' : 'Auswärts'}-Siege`, profileValue(value.wins)) + statCard('Quote', profileValue(value.win_rate == null ? null : Math.round(value.win_rate * 100), ' %')) + statCard('Stärke', profileValue(value.strength, ' %')); }).join('')}</div>
-    <h3>Form und Entwicklung</h3><div class="rc-chart-wrap">${historySvg(data.rc_history)}<span class="muted">Trend: ${trend(player.rc_trend)}</span></div>
-    <div class="profile-stats">${statCard('Letzte 5 Spiele', `${profileValue(form.last_5?.wins)} / ${profileValue(form.last_5?.games)}`)}${statCard('Quote letzte 5', profileValue(form.last_5?.win_rate == null ? null : Math.round(form.last_5.win_rate * 100), ' %'))}${statCard('Letzte 10 Spiele', `${profileValue(form.last_10?.wins)} / ${profileValue(form.last_10?.games)}`)}${statCard('Quote letzte 10', profileValue(form.last_10?.win_rate == null ? null : Math.round(form.last_10.win_rate * 100), ' %'))}</div>
-    <h4 class="profile-subheading">Letzte Spiele</h4>
-    ${formGamesTable(form.games)}
+    </section>
+    ${profileScopedSectionHtml(data, scopedPlayer, form, homeAway)}
     <h3>Matchups <span class="muted">(mindestens 3 Begegnungen)</span></h3>
     ${detail ? `<div class="matchup-detail"><button type="button" class="ranking-back" data-back>← Matchups</button><h4>Gegen ${escapeHtml(detail.opponent)}</h4><p>${profileValue(detail.matches)} Spiele · ${profileValue(detail.wins)} Siege · ${profileValue(detail.losses)} Niederlagen · ${profileValue(detail.win_rate == null ? null : Math.round(detail.win_rate * 100), ' %')}</p>${resultList}</div>` : `<div class="matchup-columns"><div><h4>Beste Matchups</h4><ul>${matchupList(data.matchups.best, 'best')}</ul></div><div><h4>Schwierige Matchups</h4><ul>${matchupList(data.matchups.difficult, 'difficult')}</ul></div></div>`}
   </section>`;
+  app.querySelectorAll('[data-profile-scope]').forEach((button) => button.addEventListener('click', () => {
+    const next = button.dataset.profileScope;
+    if (!next || next === state.profileScope) return;
+    state.profileScope = next;
+    storeProfileScopePreference(next);
+    renderProfile(data);
+  }));
   app.querySelectorAll('[data-back]').forEach((button) => button.addEventListener('click', () => {
     if (detail) loadProfile(player.id);
     else { state.profile = null; render({ players: state.players, latest_league: data.latest_league, count: state.players.length }); }

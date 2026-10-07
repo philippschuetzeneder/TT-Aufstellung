@@ -83,6 +83,7 @@ TREND_MAX_COMPONENT = 0.08
 TREND_MAX_SINGLES = 25
 TREND_MIN_SINGLES = 5
 TREND_RECENT_SINGLES = 10
+TREND_MAX_SNAPSHOTS = 10
 SPIELTYP_MAX_COMPONENT = 0.12
 SPIELTYP_MIN_GAMES = 2
 TREND_COMPONENT_FULL_SCALE = 80.0
@@ -545,39 +546,20 @@ def _recent_singles_all_3_0(recent_singles: list[dict]) -> bool:
     return True
 
 
-def _trend_snapshot_window(snapshots: list[dict], recent_singles: list[dict]) -> list[dict]:
-    """Select snapshots spanning the latest <=25 singles, stichtag-safe.
+def _latest_rc_snapshots_for_trend(
+    snapshots: list[dict],
+    *,
+    limit: int = TREND_MAX_SNAPSHOTS,
+) -> list[dict]:
+    """Latest RC observations used for trend (typically one snapshot per league round)."""
+    valid = _valid_rc_snapshots(snapshots)
+    return valid[-limit:]
 
-    The latest snapshot on or before the first selected game is retained as
-    the opening level. This supplies the actual start level without allowing
-    a snapshot from after the first game to leak backwards.
-    """
-    ordered_singles = _recent_singles_window(recent_singles)
-    if not ordered_singles:
-        return []
-    def day(value):
-        return value.date() if hasattr(value, 'date') else value
 
-    first_game = min(day(row['match_day']) for row in ordered_singles)
-    ref_date = max(day(row['match_day']) for row in ordered_singles)
-    eligible = [
-        snapshot for snapshot in snapshots
-        if day(snapshot['observed_at']) <= ref_date
-    ]
-    before_start = [
-        snapshot for snapshot in eligible
-        if day(snapshot['observed_at']) <= first_game
-    ]
-    opening = max(before_start, key=lambda snapshot: snapshot['observed_at'], default=None)
-    in_window = [
-        snapshot for snapshot in eligible
-        if day(snapshot['observed_at']) >= first_game
-    ]
-    result = ([opening] if opening is not None else []) + in_window
-    return sorted(
-        {id(snapshot): snapshot for snapshot in result}.values(),
-        key=lambda snapshot: snapshot['observed_at'],
-    )
+def _trend_snapshot_window(snapshots: list[dict], recent_singles: list[dict] | None = None) -> list[dict]:
+    """RC snapshots in the trend window (last ``TREND_MAX_SNAPSHOTS`` observations)."""
+    del recent_singles
+    return _latest_rc_snapshots_for_trend(snapshots)
 
 
 def _recent_segment_boundary(recent_singles: list[dict]):
@@ -618,30 +600,17 @@ def _compute_trend_metrics(
 ) -> tuple[float | None, float]:
     """Return (bounded RC trend for display, model component).
 
-    Trend is based on the latest at most 25 singles; fewer than five singles
-    makes it unavailable (None, 0.0). For the statistics view, the latest
-    available RC snapshot may be included. The trend uses only the latest
-    ten RC observations and a robust median; the model component remains
-    capped separately.
+    Statistics and lineup use the same rule: the latest up to
+    ``TREND_MAX_SNAPSHOTS`` RC observations (typically one per league round
+    after Ratings Central updates). At least two snapshots are required.
+    XTTV singles are not used to define this window.
     """
-    recent_singles = _recent_singles_window(recent_singles)
-    if len(recent_singles) < TREND_MIN_SINGLES:
+    del recent_singles, include_latest_snapshot
+    window = _latest_rc_snapshots_for_trend(snapshots_1y)
+    if len(window) < 2:
         return None, 0.0
-
-    trend_snapshots = (
-        _valid_rc_snapshots(snapshots_1y)[-25:]
-        if include_latest_snapshot
-        else _trend_snapshot_window(snapshots_1y, recent_singles)
-    )
-    if len(_valid_rc_snapshots(trend_snapshots)) < 2:
-        return None, 0.0
-    valid = _valid_rc_snapshots(trend_snapshots)
-    if len(valid) < 2:
-        return None, 0.0
-    boundary = _recent_segment_boundary(recent_singles)
-    momentum = _weighted_rc_momentum(valid, recent_boundary=boundary)
+    momentum = _weighted_rc_momentum(window)
     momentum = max(TREND_MIN_RC, min(TREND_MAX_RC, momentum))
-
     component = max(
         -TREND_MAX_COMPONENT,
         min(TREND_MAX_COMPONENT, momentum / TREND_COMPONENT_FULL_SCALE * TREND_MAX_COMPONENT),
@@ -1123,15 +1092,37 @@ def _team_result_probabilities(probs):
     return dist['win'], dist['draw'], dist['loss']
 
 
-def _format_match_score_display(win_prob, expected_own, expected_opp):
+def _format_match_score_display(
+    win_prob,
+    expected_own,
+    expected_opp,
+    *,
+    loss_prob=None,
+    draw_prob=None,
+):
     """Show the expected winner's TT score, not the draw probability."""
+    win_prob = float(win_prob or 0)
     own = float(expected_own or 0)
     opp = float(expected_opp or 0)
+    loss_prob = float(loss_prob) if loss_prob is not None else None
+    draw_prob = float(draw_prob) if draw_prob is not None else None
 
-    # A non-draw win probability does not make 7:7 a useful score display.
-    # Use the expected score direction; the probability fields still show
-    # the full win/draw/loss distribution separately.
-    if own >= opp + 0.25:
+    favor_us = own >= opp + 0.25 or (
+        loss_prob is not None
+        and draw_prob is not None
+        and win_prob > loss_prob
+        and win_prob > draw_prob
+        and own >= opp
+    )
+    favor_them = opp >= own + 0.25 or (
+        loss_prob is not None
+        and draw_prob is not None
+        and loss_prob > win_prob
+        and loss_prob > draw_prob
+        and opp >= own
+    )
+
+    if favor_us:
         opp_r = int(opp)
         if opp_r <= 0 and opp < 0.5:
             return '10:0'
@@ -1139,7 +1130,7 @@ def _format_match_score_display(win_prob, expected_own, expected_opp):
             return '9:1'
         return f'8:{max(2, min(6, opp_r))}'
 
-    if opp >= own + 0.25:
+    if favor_them:
         own_r = int(own)
         if own_r >= 2:
             return f'{max(2, min(7, own_r))}:8'
@@ -1938,7 +1929,6 @@ def _load_player_profiles(db, ids, ref_date):
         profiles.setdefault(pid, _empty_profile())
         net_change, component = _compute_trend_metrics(snapshots, recent_singles_rows.get(pid, []))
         profiles[pid]['rc_trend'] = net_change
-        trend_snapshots = _trend_snapshot_window(snapshots, recent_singles_rows.get(pid, []))
         profiles[pid]['rc_trend_momentum'] = net_change
         profiles[pid]['trend_component'] = component
 
@@ -2210,7 +2200,13 @@ def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, st
             'team_loss_probability': round(agg['loss'], 6),
             'expected_own_wins': round(agg['expected_own_wins'], 3),
             'expected_opponent_wins': round(agg['expected_opponent_wins'], 3),
-            'expected_score_display': _format_match_score_display(agg['win'], agg['expected_own_wins'], agg['expected_opponent_wins']),
+            'expected_score_display': _format_match_score_display(
+                agg['win'],
+                agg['expected_own_wins'],
+                agg['expected_opponent_wins'],
+                loss_prob=agg['loss'],
+                draw_prob=agg['draw'],
+            ),
             'recommended_doubles_on': placement,
             'doubles_win_probability_on_5': round(win5, 6),
             'doubles_win_probability_on_10': round(win10, 6),
@@ -2255,6 +2251,8 @@ def _merge_orientations(home_eval, away_eval):
                 (home_item['team_win_probability'] + away_item['team_win_probability']) / 2.0,
                 (home_item['expected_own_wins'] + away_item['expected_own_wins']) / 2.0,
                 (home_item['expected_opponent_wins'] + away_item['expected_opponent_wins']) / 2.0,
+                loss_prob=(home_item['team_loss_probability'] + away_item['team_loss_probability']) / 2.0,
+                draw_prob=(home_item['team_draw_probability'] + away_item['team_draw_probability']) / 2.0,
             ),
             'recommended_doubles_on': home_item.get('recommended_doubles_on', 5) if home_item['team_win_probability'] >= away_item['team_win_probability'] else away_item.get('recommended_doubles_on', 5),
             'doubles_win_probability_on_5': round((home_item.get('doubles_win_probability_on_5', 0) + away_item.get('doubles_win_probability_on_5', 0)) / 2.0, 6),
@@ -2953,6 +2951,8 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             display_dist['win'],
             display_dist['expected_own_wins'],
             display_dist['expected_opponent_wins'],
+            loss_prob=display_dist['loss'],
+            draw_prob=display_dist['draw'],
         )
     opponent_doubles_by_order = {}
     opponent_predictions = [
@@ -3010,8 +3010,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             'strength_formula': (
                 f'RC ({RC_COMPONENT_WEIGHT:.2f} * (RC - {RC_BASELINE:.0f}) / {RC_SCALE:.0f}) + '
                 f'singles record ({SINGLES_RECORD_WEIGHT:.2f} * smoothed win-rate delta) + '
-                f'time-weighted net-level RC trend (age weight floor {TREND_LEVEL_WEIGHT_FLOOR:.2f}, '
-                f'last {TREND_RECENT_SINGLES} singles ×{TREND_RECENT_SNAPSHOT_MULTIPLIER:.2f}; '
+                f'time-weighted net-level RC trend (last {TREND_MAX_SNAPSHOTS} RC snapshots; '
                 f'max ±{TREND_MAX_COMPONENT:.2f}) + '
                 f'venue adjustment (max ±{HOME_AWAY_MAX_COMPONENT:.2f})'
             ),

@@ -3,6 +3,7 @@
 .secondary{border:1px solid #cdd8df;border-radius:10px;padding:6px 10px;background:#eef2f4;color:#52616d;font-size:.78rem;font-weight:800;cursor:pointer;white-space:nowrap;flex:0 0 auto}
 .secondary:disabled{opacity:.5;cursor:not-allowed}
 .edit-button{margin:0}
+.result-edit-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex-shrink:0}
 .editable-lineup{padding:3px;border:2px solid #8fcfc0;border-radius:16px;background:#e9faf5}
 .optimal-result.editing{border-color:#0d9e7b;box-shadow:0 0 0 3px rgba(13,158,123,.12)}
 .optimal-result.fixed{border-color:#d6b656;box-shadow:0 0 0 3px rgba(214,182,86,.16);background:#fffbea}

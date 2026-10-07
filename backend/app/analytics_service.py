@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import timedelta
+from datetime import date, timedelta
 from itertools import combinations
 import re
 import time
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import selectinload
 
 from .analysis_cache import ensure_analysis_cache, ensure_analysis_schema
@@ -15,15 +15,18 @@ from .models import MatchGame, MatchPlayer, PlayerRatingSnapshot, XttvMatch, Xtt
 from .analysis_service import (
     _compute_trend_metrics,
     _recent_singles_window,
-    _trend_snapshot_window,
     _parse_match_date,
     _weighted_rc_momentum,
     _win_rate,
 )
-from .player_analysis_service import resolve_latest_league_season, _season_label
+from .player_analysis_service import _league_group, _season_label, resolve_latest_league_season
 
 MATCHUP_MIN_GAMES = 3
 _LEAGUE_STATS_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _singles_chronological_key(row: dict) -> date:
+    return _parse_match_date(row.get("date")) or date.min
 _LEAGUE_STATS_TTL_SEC = 120.0
 
 _PLAYER_MATCHUPS_SQL = text("""
@@ -87,6 +90,114 @@ _PLAYER_SINGLES_SQL = text("""
     ORDER BY m.match_date NULLS LAST, m.id
 """)
 
+_LEAGUE_GROUP_PLAYER_SINGLES_SQL = text("""
+    SELECT
+        mp.external_player_id::text AS player_id,
+        mp.side AS player_side,
+        m.match_date,
+        m.id AS match_id,
+        CASE WHEN mp.side = 'home'
+            THEN split_part(trim(g.result), ':', 1)::int
+            ELSE split_part(trim(g.result), ':', 2)::int
+        END AS own_score,
+        CASE WHEN mp.side = 'home'
+            THEN split_part(trim(g.result), ':', 2)::int
+            ELSE split_part(trim(g.result), ':', 1)::int
+        END AS opp_score
+    FROM match_players mp
+    JOIN xttv_matches m ON m.id = mp.match_id
+    JOIN match_games g ON g.match_id = m.id
+        AND g.game_type = 'singles'
+        AND (
+            (mp.side = 'home' AND g.home_position = mp.position)
+            OR (mp.side = 'away' AND g.away_position = mp.position)
+        )
+    JOIN match_players hp ON hp.match_id = m.id AND hp.side = 'home' AND hp.position = g.home_position
+    JOIN match_players ap ON ap.match_id = m.id AND ap.side = 'away' AND ap.position = g.away_position
+    WHERE m.league LIKE :liga_prefix
+      AND mp.external_player_id::text IN :player_ids
+      AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+    ORDER BY m.id, g.sequence NULLS LAST
+""").bindparams(bindparam("player_ids", expanding=True))
+
+_ALL_LEAGUES_PLAYER_SINGLES_SQL = text("""
+    SELECT
+        mp.external_player_id::text AS player_id,
+        mp.side AS player_side,
+        m.match_date,
+        m.id AS match_id,
+        CASE WHEN mp.side = 'home'
+            THEN split_part(trim(g.result), ':', 1)::int
+            ELSE split_part(trim(g.result), ':', 2)::int
+        END AS own_score,
+        CASE WHEN mp.side = 'home'
+            THEN split_part(trim(g.result), ':', 2)::int
+            ELSE split_part(trim(g.result), ':', 1)::int
+        END AS opp_score
+    FROM match_players mp
+    JOIN xttv_matches m ON m.id = mp.match_id
+    JOIN match_games g ON g.match_id = m.id
+        AND g.game_type = 'singles'
+        AND (
+            (mp.side = 'home' AND g.home_position = mp.position)
+            OR (mp.side = 'away' AND g.away_position = mp.position)
+        )
+    JOIN match_players hp ON hp.match_id = m.id AND hp.side = 'home' AND hp.position = g.home_position
+    JOIN match_players ap ON ap.match_id = m.id AND ap.side = 'away' AND ap.position = g.away_position
+    WHERE mp.external_player_id::text IN :player_ids
+      AND g.result ~ '^\\s*[0-9]+\\s*:\\s*[0-9]+\\s*$'
+    ORDER BY m.id, g.sequence NULLS LAST
+""").bindparams(bindparam("player_ids", expanding=True))
+
+
+def _aggregate_player_singles_rows(rows) -> tuple[dict, dict]:
+    cross_stats = defaultdict(lambda: {
+        "home_games": 0, "home_wins": 0, "away_games": 0, "away_wins": 0,
+    })
+    cross_recent_singles = defaultdict(list)
+    cross_trend_index = defaultdict(int)
+    for row in rows:
+        pid = str(row["player_id"])
+        side = row["player_side"]
+        own = int(row["own_score"])
+        opp = int(row["opp_score"])
+        won = own > opp
+        entry = cross_stats[pid]
+        entry[f"{side}_games"] += 1
+        entry[f"{side}_wins"] += int(won)
+        day = _parse_match_date(row["match_date"])
+        _append_cross_trend_single(
+            cross_recent_singles[pid],
+            own_score=own,
+            opp_score=opp,
+            match_day=day,
+            fallback_index=cross_trend_index[pid],
+        )
+        cross_trend_index[pid] += 1
+    return cross_stats, cross_recent_singles
+
+
+def _cross_league_singles_for_players(db, liga_group: str, player_ids: set[str]) -> tuple[dict, dict]:
+    """Singles in one league group (e.g. all seasons of 421 RK Linz)."""
+    if not liga_group or not player_ids:
+        return _aggregate_player_singles_rows([])
+    rows = db.execute(
+        _LEAGUE_GROUP_PLAYER_SINGLES_SQL,
+        {"liga_prefix": liga_group + "%", "player_ids": list(player_ids)},
+    ).mappings().all()
+    return _aggregate_player_singles_rows(rows)
+
+
+def _all_leagues_singles_for_players(db, player_ids: set[str]) -> tuple[dict, dict]:
+    """All imported singles for venue strength (cross-season, cross-league)."""
+    if not player_ids:
+        return _aggregate_player_singles_rows([])
+    rows = db.execute(
+        _ALL_LEAGUES_PLAYER_SINGLES_SQL,
+        {"player_ids": list(player_ids)},
+    ).mappings().all()
+    return _aggregate_player_singles_rows(rows)
+
 
 def _load_player_singles(db, player_id: str) -> list[dict]:
     rows = db.execute(_PLAYER_SINGLES_SQL, {"player_id": player_id}).mappings().all()
@@ -106,6 +217,7 @@ def _load_player_singles(db, player_id: str) -> list[dict]:
             "draw": own == opp,
             "league": row["league"],
         })
+    singles.sort(key=_singles_chronological_key)
     return singles
 
 
@@ -227,9 +339,9 @@ def player_stats() -> dict:
 def league_player_stats(league: str | None = None) -> dict:
     """Return one batch of player metrics for the selected, latest league season.
 
-    The RC trend and venue rates deliberately use the same helpers and
-    smoothing thresholds as the lineup analysis, but are calculated only from
-    matches in this league and from a league-specific reference date.
+    Spiele/Siege refer to the current season row only. RC trend uses full RC
+    history; home/away strength uses all imported singles (cross-season,
+    cross-league), aligned with the profile cross-season scope.
     """
     cache_key = league or ""
     now = time.monotonic()
@@ -265,7 +377,10 @@ def _compute_league_player_stats(league: str | None = None) -> dict:
         ref_date = max((match_day(m) for m in matches if match_day(m)), default=None)
         stats_cutoff = ref_date - timedelta(days=round(3 * 365.25)) if ref_date else None
         stats = {}
-        recent_singles = defaultdict(list)
+        cross_stats = defaultdict(lambda: {
+            "home_games": 0, "home_wins": 0, "away_games": 0, "away_wins": 0,
+        })
+        cross_recent_singles = defaultdict(list)
         names = {}
         teams = defaultdict(set)
 
@@ -282,10 +397,7 @@ def _compute_league_player_stats(league: str | None = None) -> dict:
                 team = match.home_team if player.side == "home" else match.away_team
                 if team:
                     teams[pid].add(team)
-                stats.setdefault(pid, {
-                    "games": 0, "wins": 0, "home_games": 0, "home_wins": 0,
-                    "away_games": 0, "away_wins": 0,
-                })
+                stats.setdefault(pid, {"games": 0, "wins": 0})
             for game in match.games:
                 score = re.fullmatch(r"\s*(\d+)\s*:\s*(\d+)\s*", game.result or "")
                 if game.game_type != "singles" or not score:
@@ -300,22 +412,12 @@ def _compute_league_player_stats(league: str | None = None) -> dict:
                     (away, "away", away_score > home_score),
                 ):
                     pid = str(player.external_player_id)
-                    entry = stats.setdefault(pid, {
-                        "games": 0, "wins": 0, "home_games": 0, "home_wins": 0,
-                        "away_games": 0, "away_wins": 0,
-                    })
+                    entry = stats.setdefault(pid, {"games": 0, "wins": 0})
                     entry["games"] += 1
                     entry["wins"] += int(won)
-                    entry[f"{side}_games"] += 1
-                    entry[f"{side}_wins"] += int(won)
-                    if day:
-                        recent_singles[pid].append({
-                            "own_score": home_score if side == "home" else away_score,
-                            "opp_score": away_score if side == "home" else home_score,
-                            "match_day": day,
-                        })
 
         player_ids = set(names)
+        cross_stats, cross_recent_singles = _all_leagues_singles_for_players(db, player_ids)
         db_players = db.query(XttvPlayer).filter(XttvPlayer.external_player_id.in_(player_ids)).all()
         player_by_db_id = {p.id: p for p in db_players}
         snapshot_rows = []
@@ -344,10 +446,12 @@ def _compute_league_player_stats(league: str | None = None) -> dict:
 
         output = []
         for pid, name in names.items():
-            entry = stats.get(pid, {"games": 0, "wins": 0, "home_games": 0, "home_wins": 0, "away_games": 0, "away_wins": 0})
+            entry = stats.get(pid, {"games": 0, "wins": 0})
+            cross = cross_stats.get(pid, {
+                "home_games": 0, "home_wins": 0, "away_games": 0, "away_wins": 0,
+            })
             series = snapshots.get(pid, [])
-            trend_singles = _recent_singles_window(recent_singles.get(pid, []))
-            trend_series = _trend_snapshot_window(series, trend_singles)
+            trend_singles = _recent_singles_window(cross_recent_singles.get(pid, []))
             trend, _ = _compute_trend_metrics(
                 series, trend_singles, include_latest_snapshot=True,
             )
@@ -359,8 +463,8 @@ def _compute_league_player_stats(league: str | None = None) -> dict:
                 "rc_rating": float(current_rc) if current_rc is not None else None,
                 "rc_trend": round(trend, 1) if trend is not None else None,
                 "rc_trend_momentum": round(trend, 1) if trend is not None else None,
-                "home_strength": round(_win_rate(entry["home_wins"], entry["home_games"]) * 100, 1) if entry["home_games"] else None,
-                "away_strength": round(_win_rate(entry["away_wins"], entry["away_games"]) * 100, 1) if entry["away_games"] else None,
+                "home_strength": round(_win_rate(cross["home_wins"], cross["home_games"]) * 100, 1) if cross["home_games"] else None,
+                "away_strength": round(_win_rate(cross["away_wins"], cross["away_games"]) * 100, 1) if cross["away_games"] else None,
                 "games": entry["games"],
                 "wins": entry["wins"],
             })
@@ -490,6 +594,96 @@ def _player_name_and_team(db, player_id: str, league: str) -> tuple[str | None, 
     return name, team
 
 
+def _form_stats_rows(rows: list[dict]) -> dict:
+    games = len(rows)
+    row_wins = sum(1 for row in rows if row["win"])
+    row_draws = sum(1 for row in rows if row["draw"])
+    return {
+        "games": games,
+        "wins": row_wins,
+        "losses": games - row_wins - row_draws,
+        "draws": row_draws,
+        "win_rate": round(row_wins / games, 4) if games else None,
+    }
+
+
+def _singles_rows_for_rc_trend(selected_singles: list[dict]) -> list[dict]:
+    """Map league singles to trend rows; undated games keep chronological order."""
+    fallback_base = date(2000, 1, 1)
+    rows = []
+    for index, row in enumerate(selected_singles):
+        match_day = _parse_match_date(row["date"]) if row.get("date") else None
+        if match_day is None:
+            match_day = fallback_base + timedelta(days=index)
+        rows.append({
+            "own_score": row["own_score"],
+            "opp_score": row["opp_score"],
+            "match_day": match_day,
+        })
+    return rows
+
+
+def _append_cross_trend_single(
+    bucket: list,
+    *,
+    own_score: int,
+    opp_score: int,
+    match_day,
+    fallback_index: int,
+) -> None:
+    day = match_day
+    if day is None:
+        day = date(2000, 1, 1) + timedelta(days=fallback_index)
+    bucket.append({
+        "own_score": own_score,
+        "opp_score": opp_score,
+        "match_day": day,
+    })
+
+
+def _venue_stats_for_singles(selected_singles: list[dict]) -> dict:
+    venue_stats = {}
+    for side in ("home", "away"):
+        rows = [row for row in selected_singles if row["side"] == side]
+        side_games = len(rows)
+        side_wins = sum(1 for row in rows if row["win"])
+        strength = round(_win_rate(side_wins, side_games) * 100, 1) if side_games else None
+        venue_stats[side] = {
+            "games": side_games,
+            "wins": side_wins,
+            "losses": side_games - side_wins - sum(1 for row in rows if row["draw"]),
+            "draws": sum(1 for row in rows if row["draw"]),
+            "win_rate": round(side_wins / side_games, 4) if side_games else None,
+            "strength": strength,
+        }
+    return venue_stats
+
+
+def _profile_scope_bundle(selected_singles: list[dict], snapshots: list) -> dict:
+    recent = sorted(selected_singles, key=_singles_chronological_key, reverse=True)
+    summary = _build_player_summary("", None, None, selected_singles, snapshots)
+    valid_games = len(selected_singles)
+    wins = sum(1 for row in selected_singles if row["win"])
+    draws = sum(1 for row in selected_singles if row["draw"])
+    return {
+        "matches": valid_games,
+        "wins": wins,
+        "losses": valid_games - wins - draws,
+        "draws": draws,
+        "win_rate": round(wins / valid_games, 4) if valid_games else None,
+        "rc_trend": summary.get("rc_trend"),
+        "home_strength": summary.get("home_strength"),
+        "away_strength": summary.get("away_strength"),
+        "form": {
+            "last_5": _form_stats_rows(recent[:5]),
+            "last_10": _form_stats_rows(recent[:10]),
+            "games": recent[:10],
+        },
+        "summary_stats": _form_stats_rows(selected_singles),
+        "home_away": _venue_stats_for_singles(selected_singles),
+    }
+
+
 def _build_player_summary(
     player_id: str,
     name: str | None,
@@ -506,16 +700,7 @@ def _build_player_summary(
         for item in snapshots
         if item.rc_rating is not None
     ]
-    recent_for_trend = [
-        {
-            "own_score": row["own_score"],
-            "opp_score": row["opp_score"],
-            "match_day": _parse_match_date(row["date"]) if row.get("date") else None,
-        }
-        for row in selected_singles
-        if row.get("date")
-    ]
-    trend_singles = _recent_singles_window(recent_for_trend)
+    trend_singles = _recent_singles_window(_singles_rows_for_rc_trend(selected_singles))
     trend, _ = _compute_trend_metrics(
         series, trend_singles, include_latest_snapshot=True,
     )
@@ -557,44 +742,43 @@ def player_profile(league: str | None, player_id: str, opponent_id: str | None =
 
         singles = _load_player_singles(db, player_id)
         matchups = _load_player_matchups(db, player_id)
-        snapshots = (
-            db.query(PlayerRatingSnapshot)
-            .join(XttvPlayer)
-            .filter(
-                XttvPlayer.external_player_id == player_id,
-                PlayerRatingSnapshot.source == "ratingscentral",
-            )
-            .order_by(PlayerRatingSnapshot.observed_at)
-            .all()
+        xttv_player = (
+            db.query(XttvPlayer)
+            .filter(XttvPlayer.external_player_id == str(player_id))
+            .one_or_none()
         )
-        selected_singles = [row for row in singles if row["league"] == resolved]
-        if not selected_singles:
+        snapshots = []
+        if xttv_player is not None:
+            snapshots = (
+                db.query(PlayerRatingSnapshot)
+                .filter(
+                    PlayerRatingSnapshot.player_id == xttv_player.id,
+                    PlayerRatingSnapshot.source == "ratingscentral",
+                )
+                .order_by(PlayerRatingSnapshot.observed_at)
+                .all()
+            )
+        league_group = _league_group(resolved)
+        season_singles = [row for row in singles if row["league"] == resolved]
+        group_singles = [row for row in singles if _league_group(row.get("league")) == league_group]
+        cross_league_singles = singles
+        selected_singles = season_singles
+        if not group_singles:
             return {"ok": False, "error": "Spieler oder Liga nicht gefunden"}
 
         ranked = ranking.get("players", []) if ranking else []
         player = next((row for row in ranked if str(row.get("id")) == player_id), None)
         if player is None:
             name, team = _player_name_and_team(db, player_id, resolved)
-            player = _build_player_summary(player_id, name, team, selected_singles, snapshots)
+            basis = season_singles or group_singles
+            player = _build_player_summary(player_id, name, team, basis, snapshots)
 
     season = ranking.get("season") if ranking else _season_label(resolved)
     valid_games = len(selected_singles)
     wins = sum(1 for row in selected_singles if row["win"])
     draws = sum(1 for row in selected_singles if row["draw"])
     losses = valid_games - wins - draws
-    recent = list(reversed(selected_singles))
-
-    def form_stats(rows):
-        games = len(rows)
-        row_wins = sum(1 for row in rows if row["win"])
-        row_draws = sum(1 for row in rows if row["draw"])
-        return {
-            "games": games,
-            "wins": row_wins,
-            "losses": games - row_wins - row_draws,
-            "draws": row_draws,
-            "win_rate": round(row_wins / games, 4) if games else None,
-        }
+    recent = sorted(selected_singles, key=_singles_chronological_key, reverse=True)
 
     snapshot_data = [
         {"date": item.observed_at.isoformat(), "rc_rating": item.rc_rating}
@@ -635,19 +819,10 @@ def player_profile(league: str | None, player_id: str, opponent_id: str | None =
             # Team name is not in singles SQL; keep ranking team unless we add it later.
             break
 
-    venue_stats = {}
+    venue_stats = _venue_stats_for_singles(selected_singles)
     for side in ("home", "away"):
-        rows = [row for row in selected_singles if row["side"] == side]
-        side_games = len(rows)
-        side_wins = sum(1 for row in rows if row["win"])
-        venue_stats[side] = {
-            "games": side_games,
-            "wins": side_wins,
-            "losses": side_games - side_wins - sum(1 for row in rows if row["draw"]),
-            "draws": sum(1 for row in rows if row["draw"]),
-            "win_rate": round(side_wins / side_games, 4) if side_games else None,
-            "strength": player.get(f"{side}_strength"),
-        }
+        if player.get(f"{side}_strength") is not None:
+            venue_stats[side]["strength"] = player.get(f"{side}_strength")
 
     positive_matchups = [row for row in matchups if row["wins"] > row["losses"]]
     negative_matchups = [row for row in matchups if row["losses"] > row["wins"]]
@@ -660,7 +835,7 @@ def player_profile(league: str | None, player_id: str, opponent_id: str | None =
         key=lambda row: (row["win_rate"], -row["matches"], row["opponent"]),
     )[:5]
 
-    return {
+    payload = {
         "ok": True,
         "league": league,
         "latest_league": resolved,
@@ -676,11 +851,11 @@ def player_profile(league: str | None, player_id: str, opponent_id: str | None =
             "win_rate": round(wins / valid_games, 4) if valid_games else None,
         },
         "form": {
-            "last_5": form_stats(recent[:5]),
-            "last_10": form_stats(recent[:10]),
-            "games": list(reversed(recent[:10])),
+            "last_5": _form_stats_rows(recent[:5]),
+            "last_10": _form_stats_rows(recent[:10]),
+            "games": recent[:10],
         },
-        "current_season": form_stats(selected_singles),
+        "current_season": _form_stats_rows(selected_singles),
         "home_away": venue_stats,
         "rc_history": snapshot_data[-40:],
         "leagues_last_3_years": [
@@ -694,4 +869,15 @@ def player_profile(league: str | None, player_id: str, opponent_id: str | None =
             "count": len(matchups),
         },
         "opponent_detail": selected_opponent,
+        "scopes": {
+            "season": {
+                "label": "Nur diese Saison",
+                **_profile_scope_bundle(season_singles, snapshots),
+            },
+            "cross_season": {
+                "label": "Saisonübergreifend (alle Ligen)",
+                **_profile_scope_bundle(cross_league_singles, snapshots),
+            },
+        },
     }
+    return payload

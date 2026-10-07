@@ -111,12 +111,22 @@
 
 .setup-team-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(88px, 0.36fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 5.75rem);
   gap: 8px;
   align-items: end;
+  width: 100%;
+  max-width: 100%;
 }
 
 .venue-label {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.venue-label select {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
   min-width: 0;
 }
 

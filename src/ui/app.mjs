@@ -39,6 +39,7 @@ const state = {
 };
 const app = document.querySelector('#app');
 let doublesSuggestionLoad = null;
+let editAnalysisTimer = null;
 
 function isPhaseThreeReady() {
   return state.selectedOpp.length === 4 && Boolean(state.opponentDirection);
@@ -369,9 +370,18 @@ function shouldShowResultPanel() {
   return false;
 }
 
-function resultPanelHtml(resultTitle, editLabel) {
+function resultPanelHtml(resultTitle) {
   if (!shouldShowResultPanel()) return '';
-  return `<div class="card highlight result-card" id="result-panel"><div class="result-card-heading"><h2 class="section-title">${resultTitle}</h2>${state.result?.recommendation ? `<button type="button" class="secondary edit-button" data-action="toggle-edit" ${state.analysisLoading ? 'disabled' : ''}>${editLabel}</button>` : ''}</div>${resultHtml()}</div>`;
+  const disabled = state.analysisLoading ? 'disabled' : '';
+  let editActions = '';
+  if (state.result?.recommendation) {
+    if (state.editMode) {
+      editActions = `<button type="button" class="secondary edit-button" data-action="reset-edit" ${disabled}>Zurück</button>`;
+    } else {
+      editActions = `<button type="button" class="secondary edit-button" data-action="toggle-edit" ${disabled}>Anpassen</button>`;
+    }
+  }
+  return `<div class="card highlight result-card" id="result-panel"><div class="result-card-heading"><h2 class="section-title">${resultTitle}</h2>${editActions}</div>${resultHtml()}</div>`;
 }
 
 function render() {
@@ -379,8 +389,7 @@ function render() {
   const opp = state.opponentPlayers;
   const opponents = state.teams.filter((t) => t.id !== state.ownTeam);
   const resultTitle = isPhaseThreeReady() ? 'Optimale Aufstellung' : 'Empfehlung';
-  const editLabel = state.editMode ? 'Neu berechnen' : 'Anpassen';
-  app.innerHTML = `<section class="grid two lineup-layout"><div class="card setup-card">${setupPanelHtml(own, opp, opponents)}</div>${resultPanelHtml(resultTitle, editLabel)}</section>`;
+  app.innerHTML = `<section class="grid two lineup-layout"><div class="card setup-card">${setupPanelHtml(own, opp, opponents)}</div>${resultPanelHtml(resultTitle)}</section>`;
   scheduleDoublesSuggestion();
   bind();
 }
@@ -412,7 +421,9 @@ function players(list, selected, group) {
   return `<div class="players">${sorted.map((p) => {
     const label = rcLabel(p);
     const small = label === 'unmatched' ? 'unmatched' : `RC ${label}`;
-    return `<button class="player ${selected.includes(p.id) ? 'selected' : ''}" data-player="${p.id}" data-group="${group}" ${state.analysisLoading ? 'disabled' : ''}><span><strong>${escapeHtml(p.name)}</strong></span><small>${escapeHtml(small)}</small></button>`;
+    const showReserve = group === 'own' && p.is_reserve;
+    const reserveHint = showReserve ? ' · Ersatz' : '';
+    return `<button class="player ${selected.includes(p.id) ? 'selected' : ''}${showReserve ? ' player-club-extra' : ''}" data-player="${p.id}" data-group="${group}" ${state.analysisLoading ? 'disabled' : ''}"><span><strong>${escapeHtml(p.name)}</strong></span><small>${escapeHtml(small)}${escapeHtml(reserveHint)}</small></button>`;
   }).join('')}</div>`;
 }
 
@@ -434,7 +445,7 @@ function ownLineup(ids, backendNames) {
 function editableLineupHtml() {
   const ids = state.editOwnOrder;
   const labels = state.opponentDirection === 'numbers' ? ['A', 'B', 'C', 'D'] : ['1', '2', '3', '4'];
-  return `<div class="optimal-players editable-lineup">${ids.map((id, i) => `<div class="optimal-player edit-player" draggable="${state.analysisLoading ? 'false' : 'true'}" data-edit-player="${escapeHtml(id)}" data-edit-index="${i}"><span>${labels[i]}</span><strong>${escapeHtml(ownNameById(id))}</strong></div>`).join('')}</div><div class="edit-hint muted">Spieler gedrückt halten und auf eine andere Position ziehen.</div>`;
+  return `<div class="optimal-players editable-lineup">${ids.map((id, i) => `<div class="optimal-player edit-player" draggable="${state.analysisLoading ? 'false' : 'true'}" data-edit-player="${escapeHtml(id)}" data-edit-index="${i}"><span>${labels[i]}</span><strong>${escapeHtml(ownNameById(id))}</strong></div>`).join('')}</div><div class="edit-hint muted">Spieler ziehen – Siegchance und Details aktualisieren sich automatisch.</div>`;
 }
 
 function editableDoublesHtml() {
@@ -588,14 +599,16 @@ function pct(v) {
   return `${(Number(v) * 100).toFixed(1).replace('.', ',')} %`;
 }
 
-function formatFromExpectedWins(win, own, opp) {
-  if (own >= 7.5 || (win > 0.55 && own >= opp)) {
+function formatFromExpectedWins(win, own, opp, loss = 0, draw = 0) {
+  const favorUs = win > loss && win > draw && own >= opp;
+  const favorThem = loss > win && loss > draw && opp >= own;
+  if (own >= 7.5 || (win > 0.55 && own >= opp) || favorUs) {
     const oppR = Math.round(opp);
     if (oppR <= 0 && opp < 0.5) return '10:0';
     if (oppR <= 1 && opp < 1.5) return '9:1';
     return `8:${Math.max(2, Math.min(6, oppR))}`;
   }
-  if (opp >= 7.5 || (win < 0.45 && opp >= own)) {
+  if (opp >= 7.5 || (win < 0.45 && opp >= own) || favorThem) {
     const ownR = Math.round(own);
     if (ownR >= 2) return `${Math.max(2, Math.min(7, ownR))}:8`;
     if (ownR <= 0 && own < 0.5) return '0:10';
@@ -607,10 +620,12 @@ function formatFromExpectedWins(win, own, opp) {
 
 function formatMatchScoreDisplay(recommendation) {
   const win = Number(recommendation?.team_win_probability ?? 0);
+  const loss = Number(recommendation?.team_loss_probability ?? 0);
+  const draw = Number(recommendation?.team_draw_probability ?? 0);
   const own = Number(recommendation?.expected_own_wins);
   const opp = Number(recommendation?.expected_opponent_wins);
   if (Number.isFinite(own) && Number.isFinite(opp)) {
-    return formatFromExpectedWins(win, own, opp);
+    return formatFromExpectedWins(win, own, opp, loss, draw);
   }
   if (recommendation?.expected_score_display) return recommendation.expected_score_display;
   return formatFromExpectedWins(win, 0, 0);
@@ -620,6 +635,15 @@ function scoreText(recommendation) {
   return formatMatchScoreDisplay(recommendation);
 }
 
+function scheduleEditAnalysis() {
+  if (!state.editMode || !canAnalyze()) return;
+  clearTimeout(editAnalysisTimer);
+  editAnalysisTimer = setTimeout(() => {
+    editAnalysisTimer = null;
+    if (state.editMode && canAnalyze()) runAnalysis();
+  }, 400);
+}
+
 function reorderEditOwnOrder(from, to) {
   if (!Number.isInteger(from) || !Number.isInteger(to) || from === to) return;
   const next = [...state.editOwnOrder];
@@ -627,6 +651,7 @@ function reorderEditOwnOrder(from, to) {
   next.splice(to, 0, moved);
   state.editOwnOrder = next;
   render();
+  scheduleEditAnalysis();
 }
 
 function swapEditDoubles() {
@@ -635,6 +660,7 @@ function swapEditDoubles() {
   [next.game5, next.game10] = [next.game10, next.game5];
   state.editDoubles = next;
   render();
+  scheduleEditAnalysis();
 }
 
 function bindEditableLineupControls() {
@@ -744,7 +770,7 @@ function lineupMetricLine(label, pp) {
 function lineupMetricsHtml(recommendation, spreadRecommendation = recommendation) {
   const metrics = [];
   if (recommendation?.advantage_vs_strength_lineup_pp != null) {
-    metrics.push(lineupMetricLine('Vorteil gegenüber trivialer Stärke-Aufstellung', recommendation.advantage_vs_strength_lineup_pp));
+    metrics.push(lineupMetricLine('Vorteil gegenüber reiner RC-Stärke-Reihenfolge (Aufstellung nach Stärke)', recommendation.advantage_vs_strength_lineup_pp));
   }
   if (spreadRecommendation?.lineup_spread_pp != null) {
     metrics.push(lineupMetricLine('Vorteil gegenüber schlechtester Aufstellung', spreadRecommendation.lineup_spread_pp));
@@ -818,10 +844,6 @@ function bind() {
     toggleDoublePair(e.currentTarget.dataset.doubleToggle);
   }));
   app.querySelector('[data-action="toggle-edit"]')?.addEventListener('click', () => {
-    if (state.editMode) {
-      runAnalysis();
-      return;
-    }
     const recommendation = state.result?.recommendation;
     if (!recommendation) return;
     state.optimalResult = state.optimalResult || state.result;
@@ -833,13 +855,16 @@ function bind() {
       : null;
     render();
   });
-  app.querySelector('[data-action="reset-edit"]')?.addEventListener('click', () => {
+  app.querySelectorAll('[data-action="reset-edit"]').forEach((el) => el.addEventListener('click', () => {
+    if (!state.optimalResult) return;
+    clearTimeout(editAnalysisTimer);
+    editAnalysisTimer = null;
     state.result = state.optimalResult;
     state.editMode = false;
     state.editOwnOrder = [];
     state.editDoubles = null;
     render();
-  });
+  }));
   bindEditableLineupControls();
   app.querySelectorAll('[data-player]').forEach((el) => el.addEventListener('click', async (e) => {
     const group = e.currentTarget.dataset.group;

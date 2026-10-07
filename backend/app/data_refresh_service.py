@@ -39,6 +39,7 @@ def _refresh_paused() -> tuple[bool, str | None]:
 
 
 def _import_rc_for_players(external_ids: list[str]) -> dict:
+    """Fetch full Ratings Central PlayerHistory (not index sync — that is only one point)."""
     external_ids = sorted({str(x) for x in external_ids if x})
     if not external_ids:
         return {"imported": 0, "errors": 0, "targets": 0}

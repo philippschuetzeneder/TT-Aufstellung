@@ -1,5 +1,8 @@
 import { adminRequestHeaders, applyAdminTokenFromUrl, bindAdminTokenInput, readAdminToken, storeAdminToken } from './admin-auth.mjs';
 
+/** Set true to show Admin-Token field and Daten-Refresh in the header again. */
+export const SHOW_HEADER_ADMIN_UI = false;
+
 const DEFAULT_LEAGUE = '411 RK Linz Umg. / MV Mitte';
 export const LEAGUE_STORAGE_KEY = 'tt-aufstellung-league';
 
@@ -100,7 +103,8 @@ export function renderHeaderLeague(leagues, league, {
   if (navHost) {
     navHost.innerHTML = navLink;
   }
-  const refreshBtn = showDataRefresh
+  const refreshEnabled = SHOW_HEADER_ADMIN_UI && showDataRefresh;
+  const refreshBtn = refreshEnabled
     ? `<button type="button" class="header-btn header-btn-warn header-btn-refresh" id="header-data-refresh" ${disabled || dataRefreshRunning ? 'disabled' : ''} title="Daten Refresh">${dataRefreshRunning ? 'Refresh …' : 'Refresh'}</button>`
     : '';
   if (refreshHost) {
@@ -117,7 +121,7 @@ export function renderHeaderLeague(leagues, league, {
   ).join('');
   const controlsNav = navHost ? '' : navLink;
   const controlsRefresh = refreshHost ? '' : refreshBtn;
-  const adminTokenHtml = adminRequired
+  const adminTokenHtml = SHOW_HEADER_ADMIN_UI && adminRequired
     ? `<label class="header-admin-token"><span class="header-admin-token-label">Admin-Token</span><input type="password" id="header-admin-token" class="header-admin-token-input" placeholder="für Daten-Refresh" value="${escapeHtml(readAdminToken())}" ${disabled || dataRefreshRunning ? 'disabled' : ''} autocomplete="off"></label>`
     : '';
   host.innerHTML = `

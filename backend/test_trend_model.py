@@ -133,9 +133,26 @@ def test_display_trend_is_bounded_weighted_level_change():
 
 
 def test_display_trend_is_missing_for_short_series():
-    trend, component = _compute_trend_metrics(_snap_series([1400, 1450]), _singles(4))
+    trend, component = _compute_trend_metrics(_snap_series([1400]), _singles(4))
     assert trend is None
     assert component == 0.0
+
+
+def test_lineup_trend_does_not_require_singles():
+    trend, component = _compute_trend_metrics(_snap_series([1400, 1450]), _singles(0))
+    assert trend is not None
+    assert component > 0
+
+
+def test_statistics_view_allows_rc_only_trend_with_few_singles():
+    trend, component = _compute_trend_metrics(
+        _snap_series([1400, 1450]),
+        _singles(2),
+        include_latest_snapshot=True,
+    )
+    assert trend is not None
+    assert trend > 0
+    assert component > 0
 
 
 def test_five_singles_make_trend_calculable():
@@ -144,15 +161,12 @@ def test_five_singles_make_trend_calculable():
     assert component > 0
 
 
-def test_trend_uses_at_most_25_latest_singles():
-    snapshots = _snap_series([1400, 1500, 1600])
-    singles = _singles(30)
-    selected = sorted(singles, key=lambda row: row['match_day'], reverse=True)[:25]
-    snapshots[0]['observed_at'] = datetime(2025, 6, 1)
-    snapshots[1]['observed_at'] = datetime(2025, 7, 1)
-    snapshots[2]['observed_at'] = datetime(2025, 8, 1)
-    trend, _ = _compute_trend_metrics(snapshots, singles)
-    assert _trend_snapshot_window(snapshots, selected) == _trend_snapshot_window(snapshots, singles)
+def test_trend_uses_at_most_ten_rc_snapshots():
+    snapshots = _snap_series(list(range(1400, 1415)))
+    window = _trend_snapshot_window(snapshots, _singles(30))
+    assert len(window) == 10
+    assert [row['rc_rating'] for row in window] == list(range(1405, 1415))
+    trend, _ = _compute_trend_metrics(snapshots, _singles(3))
     assert trend is not None
 
 
@@ -166,16 +180,15 @@ def test_recent_window_keeps_all_games_on_25th_day():
     assert len(window) == 27
 
 
-def test_snapshots_are_stichtag_safe_and_include_earliest_selected_day():
-    singles = _singles(5)
+def test_trend_snapshot_window_is_last_observations_only():
     snapshots = [
         {'observed_at': datetime(2024, 12, 31), 'rc_rating': 1300},
         {'observed_at': datetime(2025, 1, 1), 'rc_rating': 1400},
         {'observed_at': datetime(2025, 5, 1), 'rc_rating': 1500},
         {'observed_at': datetime(2025, 6, 1), 'rc_rating': 1600},
     ]
-    window = _trend_snapshot_window(snapshots, singles)
-    assert [row['rc_rating'] for row in window] == [1400, 1500]
+    window = _trend_snapshot_window(snapshots, _singles(5))
+    assert [row['rc_rating'] for row in window] == [1300, 1400, 1500, 1600]
 
 
 def test_recent_segment_has_stronger_weight_than_old_segment():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import unicodedata
 from datetime import date, datetime, timedelta
@@ -20,8 +21,81 @@ _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 def fetch_player_history(rc_player_id: int) -> tuple[str, str]:
     url = f"{RC_BASE}/PlayerHistory.php?PlayerID={rc_player_id}"
     request = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(request, timeout=15) as response:
+    timeout = int(os.environ.get("RC_FETCH_TIMEOUT", "15"))
+    with urlopen(request, timeout=timeout) as response:
         return response.read().decode("utf-8", errors="replace"), response.headers.get_content_type()
+
+
+def _persist_parsed_history(
+    session,
+    player: XttvPlayer,
+    raw: RawSourceDocument,
+    parsed: dict,
+) -> int:
+    saved = 0
+    for observation in list(parsed["history"]) + [parsed["current"]]:
+        observed_at = datetime.fromisoformat(observation["observed_at"])
+        snapshot = session.query(PlayerRatingSnapshot).filter_by(
+            player_id=player.id, observed_at=observed_at, source="ratingscentral",
+        ).one_or_none()
+        if snapshot is None:
+            snapshot = PlayerRatingSnapshot(
+                player_id=player.id, observed_at=observed_at, source="ratingscentral",
+            )
+            session.add(snapshot)
+        snapshot.rc_rating = observation["rc_rating"]
+        snapshot.rc_deviation = observation["rc_deviation"]
+        snapshot.source_document_id = raw.id
+        snapshot.imported_at = datetime.utcnow()
+        saved += 1
+    return saved
+
+
+def rehydrate_rc_player_history(
+    rc_player_id: int,
+    *,
+    xttv_external_player_id: str | None = None,
+    xttv_name: str | None = None,
+    xttv_club: str | None = None,
+) -> dict | None:
+    """Rebuild snapshots from cached PlayerHistory HTML (no network)."""
+    source_external_id = f"playerhistory:{rc_player_id}"
+    with SessionLocal.begin() as session:
+        raw = session.query(RawSourceDocument).filter_by(
+            source="ratingscentral", external_id=source_external_id,
+        ).one_or_none()
+        if not raw or not raw.content:
+            return None
+        parsed = parse_player_history(raw.content)
+        player = _find_xttv_player(
+            session, rc_player_id, parsed["name"], None, xttv_external_player_id,
+        )
+        if player is None and xttv_external_player_id:
+            player = session.query(XttvPlayer).filter_by(
+                external_player_id=xttv_external_player_id,
+            ).one_or_none()
+        if player is None:
+            return None
+        if player.rc_player_id not in (None, rc_player_id):
+            raise ValueError(
+                f"XTTV player {player.external_player_id} is already mapped to RC {player.rc_player_id}"
+            )
+        player.rc_player_id = rc_player_id
+        if xttv_name:
+            player.name = xttv_name
+        if xttv_club:
+            player.club = xttv_club
+        saved = _persist_parsed_history(session, player, raw, parsed)
+        xttv_id = player.external_player_id
+        hist_len = len(parsed["history"])
+    return {
+        "ok": True,
+        "mode": "rehydrate",
+        "rc_player_id": rc_player_id,
+        "xttv_player_id": xttv_id,
+        "historical_observations": hist_len,
+        "snapshots_upserted": saved,
+    }
 
 
 def _clean_text(value: str) -> str:
@@ -126,12 +200,7 @@ def import_rc_player(rc_player_id: int, *, xttv_player_id: str | None = None, xt
         player.rc_player_id = rc_player_id
         if xttv_name: player.name = xttv_name
         if xttv_club: player.club = xttv_club
-        saved = 0
-        for observation in list(parsed["history"]) + [parsed["current"]]:
-            observed_at = datetime.fromisoformat(observation["observed_at"])
-            snapshot = session.query(PlayerRatingSnapshot).filter_by(player_id=player.id, observed_at=observed_at, source="ratingscentral").one_or_none()
-            if snapshot is None: snapshot = PlayerRatingSnapshot(player_id=player.id, observed_at=observed_at, source="ratingscentral"); session.add(snapshot)
-            snapshot.rc_rating = observation["rc_rating"]; snapshot.rc_deviation = observation["rc_deviation"]; snapshot.source_document_id = raw.id; snapshot.imported_at = datetime.utcnow(); saved += 1
+        saved = _persist_parsed_history(session, player, raw, parsed)
     return {"ok": True, "rc_player_id": rc_player_id, "name": parsed["name"], "xttv_player_id": player.external_player_id, "current": parsed["current"], "historical_observations": len(parsed["history"]), "snapshots_upserted": saved}
 
 
