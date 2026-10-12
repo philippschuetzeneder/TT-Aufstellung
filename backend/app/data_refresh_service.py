@@ -19,7 +19,8 @@ from .db import SessionLocal, create_all
 from .models import PlayerRatingSnapshot, XttvPlayer
 from .rc_import import import_rc_player, import_rc_player_updates
 from .rc_matching import apply_matches_all
-from .xttv_db_import import import_new_reports, player_ids_from_meids
+from .xttv_db_import import MAX_IMPORT, import_new_reports, player_ids_from_meids
+from .xttv_schedule_import import import_missing_schedule_reports
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
@@ -114,20 +115,35 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
     summary: dict = {}
 
     try:
-        xttv = import_new_reports()
+        schedule = import_missing_schedule_reports(limit=MAX_IMPORT)
+        forward_budget = max(0, MAX_IMPORT - int(schedule.get("imported") or 0))
+        forward = import_new_reports(limit=forward_budget or MAX_IMPORT)
+
+        imported_meids = list(schedule.get("imported_meids") or []) + list(
+            forward.get("imported_meids") or []
+        )
+        xttv = {
+            "imported": len(imported_meids),
+            "imported_meids": imported_meids,
+            "schedule": schedule,
+            "forward": forward,
+        }
         summary["xttv"] = {
             "imported": xttv["imported"],
-            "checked": xttv["checked"],
-            "errors": xttv.get("errors", 0),
-            "last_known_meid": xttv["last_known_meid"],
-            "max_imported_meid": xttv.get("max_imported_meid"),
-            "range": xttv["range"],
-            "imported_meids": xttv.get("imported_meids") or [],
-            "stopped_after_empty_streak": bool(xttv.get("stopped_after_empty_streak")),
-            "scan_frontier_after": xttv.get("scan_frontier_after"),
+            "imported_meids": imported_meids,
+            "schedule_imported": schedule.get("imported", 0),
+            "forward_imported": forward.get("imported", 0),
+            "checked": int(schedule.get("checked") or 0) + int(forward.get("checked") or 0),
+            "errors": int(schedule.get("errors") or 0) + int(forward.get("errors") or 0),
+            "last_known_meid": forward.get("last_known_meid"),
+            "max_imported_meid": forward.get("max_imported_meid"),
+            "range": forward.get("range"),
+            "discovery": schedule.get("discovery"),
+            "stopped_after_empty_streak": bool(forward.get("stopped_after_empty_streak")),
+            "scan_frontier_after": forward.get("scan_frontier_after"),
         }
 
-        new_meids = xttv.get("imported_meids") or []
+        new_meids = imported_meids
         player_ids = player_ids_from_meids(new_meids) if new_meids else []
 
         rc_mapped = 0
@@ -162,7 +178,8 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
         "elapsed_seconds": round(time.monotonic() - started, 1),
         "summary": summary,
         "message": (
-            f"{xttv['imported']} neue Spielberichte importiert."
+            f"{xttv['imported']} neue Spielberichte importiert "
+            f"(Schedule: {schedule.get('imported', 0)}, Forward-Scan: {forward.get('imported', 0)})."
             if new_meids
             else "Keine neuen Spielberichte gefunden."
         ),

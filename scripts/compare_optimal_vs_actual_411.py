@@ -423,7 +423,7 @@ def _load_opponent_pool_leakage_safe(db, team, ref_date):
 def _load_analysis_data_leakage_safe(own, opponent_team, actual, use_spieltyp=False):
     db = SessionLocal()
     try:
-        db.execute(text("SET statement_timeout = '5000ms'"))
+        db.execute(text("SET statement_timeout = '30000ms'"))
         db.execute(text("SET lock_timeout = '500ms'"))
         own = [str(x) for x in own]
         actual = None if actual is None else [str(x) for x in actual]
@@ -455,7 +455,7 @@ def _load_analysis_data_leakage_safe(own, opponent_team, actual, use_spieltyp=Fa
             )
             source = "predicted-historical-raw"
             if not scenarios:
-                return {}, {}, {}, [], source, ref_date, opponent_pool
+                return {}, {}, {}, [], source, ref_date, opponent_pool, []
         if source != "all-24-uniform-fallback":
             scenarios = _filter_scenarios(scenarios, opponent_pool)
         relevant = set(own)
@@ -469,7 +469,7 @@ def _load_analysis_data_leakage_safe(own, opponent_team, actual, use_spieltyp=Fa
         for pid in ids:
             profiles.setdefault(pid, {})
             names.setdefault(pid, f"Spieler {pid}")
-        return names, profiles, matchups, scenarios, source, ref_date, opponent_pool
+        return names, profiles, matchups, scenarios, source, ref_date, opponent_pool, []
     finally:
         db.close()
 
