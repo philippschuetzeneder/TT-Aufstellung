@@ -56,12 +56,24 @@ def load_squad_by_name(db, team: str, name_hints: tuple[str, ...]) -> dict[str, 
         ),
         {"team": team},
     ).mappings().all()
+    # Prefer unambiguous surname+first-name matches for Trak (avoid Hannes → Auböck).
+    _own_patterns = {
+        "Niklas": ("friedinger", "niklas"),
+        "Julian": ("hahn", "julian"),
+        "Hannes": ("reithmayr", "hannes"),
+        "Martin": ("schmalzer", "martin"),
+    }
     out = {}
     for hint in name_hints:
         hint_l = hint.lower()
+        patterns = _own_patterns.get(hint)
         for r in rows:
             name = (r["name"] or "").lower()
-            if hint_l in name.split() or name.startswith(hint_l):
+            if patterns:
+                if all(p in name for p in patterns):
+                    out[hint] = r["pid"]
+                    break
+            elif hint_l in name.split() or name.startswith(hint_l):
                 out[hint] = r["pid"]
                 break
     return out

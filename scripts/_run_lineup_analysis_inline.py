@@ -61,8 +61,11 @@ def resolve_ids():
 
         own = [
             one_player(OWN_TEAM, "%Friedinger%Niklas%") or xp("%Friedinger%Niklas%") or "23784",
-            one_player(OWN_TEAM, "%Julian%") or xp("%Hahn%Julian%"),
-            one_player(OWN_TEAM, "%Hannes%") or one_player(OWN_TEAM, "%Meisinger%"),
+            one_player(OWN_TEAM, "%Hahn%Julian%") or xp("%Hahn%Julian%"),
+            one_player(OWN_TEAM, "%Reithmayr%Hannes%")
+            or one_player(OWN_TEAM, "%Hannes%Reithmayr%")
+            or xp("%Reithmayr%Hannes%")
+            or xp("%Hannes%Reithmayr%"),
             one_player(OWN_TEAM, "%Schmalzer%Martin%") or one_player(OWN_TEAM, "%Martin%Schmalzer%") or "22183",
         ]
         opp = [
