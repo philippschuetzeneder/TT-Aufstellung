@@ -11,7 +11,7 @@ import time
 from datetime import date
 from pathlib import Path
 
-from sqlalchemy import func
+from sqlalchemy import bindparam, func, text
 
 from .analysis_cache import refresh_analysis_cache
 from .analysis_service import clear_analysis_runtime_caches
@@ -39,6 +39,30 @@ def _refresh_paused() -> tuple[bool, str | None]:
     if today < not_before:
         return True, f"Sommerpause bis {not_before.isoformat()} (heute: {today.isoformat()})"
     return False, None
+
+
+def match_linked_player_external_ids(*, seasons: frozenset[str] | None = None) -> list[str]:
+    """Distinct Pass-Nr. from imported matches (default: rolling target seasons)."""
+    from .xttv_db_import import get_target_seasons
+
+    season_list = sorted(seasons or get_target_seasons())
+    if not season_list:
+        return []
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT DISTINCT mp.external_player_id::text AS pass_id
+                FROM match_players mp
+                JOIN xttv_matches m ON m.id = mp.match_id
+                WHERE mp.external_player_id IS NOT NULL
+                  AND m.season IN :seasons
+                ORDER BY pass_id
+                """
+            ).bindparams(bindparam("seasons", expanding=True)),
+            {"seasons": season_list},
+        ).scalars().all()
+    return [str(x) for x in rows if x]
 
 
 def _import_rc_for_players(external_ids: list[str]) -> dict:

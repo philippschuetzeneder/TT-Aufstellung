@@ -16,7 +16,7 @@ from .models import PlayerRatingSnapshot, RawSourceDocument, XttvPlayer
 
 RC_BASE = "https://www.ratingscentral.com"
 USER_AGENT = "TT-Aufstellung/0.1 (+public RatingsCentral history import)"
-_RATING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:±|\+/-|\+-)\s*(\d+(?:\.\d+)?)\s*$")
+_RATING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:\u00b1|\+/-|\+-)\s*(\d+(?:\.\d+)?)\s*$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 
@@ -37,9 +37,15 @@ def _persist_parsed_history(
     only_after: datetime | None = None,
 ) -> int:
     saved = 0
-    for observation in list(parsed["history"]) + [parsed["current"]]:
+    current_obs = parsed["current"]
+    for observation in list(parsed["history"]) + [current_obs]:
         observed_at = datetime.fromisoformat(observation["observed_at"])
-        if only_after is not None and observed_at <= only_after:
+        is_current = observation is current_obs
+        if (
+            not is_current
+            and only_after is not None
+            and observed_at <= only_after
+        ):
             continue
         snapshot = session.query(PlayerRatingSnapshot).filter_by(
             player_id=player.id, observed_at=observed_at, source="ratingscentral",
@@ -117,7 +123,7 @@ def _parse_rating(value: str) -> tuple[float, float] | None:
 
 def _clean_rc_name(value: str) -> str:
     value = _clean_text(value)
-    value = re.sub(r"\s+\d+(?:\.\d+)?\s*(?:±|\+/-|\+-)\s*\d+(?:\.\d+)?\s*$", "", value)
+    value = re.sub(r"\s+\d+(?:\.\d+)?\s*(?:\u00b1|\+/-|\+-)\s*\d+(?:\.\d+)?\s*$", "", value)
     return value.strip(" ,")
 
 
@@ -160,14 +166,14 @@ def parse_player_history(html: str, *, cutoff: date | None = None, today: date |
         raise ValueError("Could not find player name on PlayerHistory page")
     name = _clean_rc_name(raw_name)
     current_rating = current_deviation = None
-    for node in soup.find_all(string=re.compile(r"±|\+/-|\+-")):
+    for node in soup.find_all(string=re.compile(r"\u00b1|\+/-|\+-")):
         parsed = _parse_rating(str(node))
         if parsed:
             current_rating, current_deviation = parsed
             break
     if current_rating is None:
         text = _clean_text(" ".join(soup.stripped_strings))
-        match = re.search(r"(\d+)\s*(?:±|\+/-|\+-)\s*(\d+)", text)
+        match = re.search(r"(\d+)\s*(?:\u00b1|\+/-|\+-)\s*(\d+)", text)
         if not match:
             raise ValueError("Could not find current RC rating on PlayerHistory page")
         current_rating, current_deviation = float(match.group(1)), float(match.group(2))

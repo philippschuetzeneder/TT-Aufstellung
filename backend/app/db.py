@@ -30,7 +30,14 @@ class Base(DeclarativeBase):
     pass
 
 
+_SCHEMA_INITIALIZED = False
+
+
 def create_all() -> None:
+    """Create tables and apply lightweight PG patches once per process."""
+    global _SCHEMA_INITIALIZED
+    if _SCHEMA_INITIALIZED:
+        return
     from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
@@ -58,6 +65,7 @@ def create_all() -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_match_game_sequence "
                 "ON match_games (match_id, sequence) WHERE sequence IS NOT NULL"
             ))
+    _SCHEMA_INITIALIZED = True
 
 
 def database_health() -> dict:
