@@ -16,6 +16,9 @@ if [[ -n "$NOT_BEFORE" && "$TODAY" < "$NOT_BEFORE" ]]; then
   exit 0
 fi
 
+# Weekly: only current XTTV season (sjid) on schedules — no multi-season backlog replay.
+export DATA_REFRESH_SCHEDULE_SCOPE="${DATA_REFRESH_SCHEDULE_SCOPE:-current}"
+
 COMPOSE=(docker compose -f docker-compose.prod.yml)
 LOG_DIR="${ROOT}/logs"
 mkdir -p "$LOG_DIR"

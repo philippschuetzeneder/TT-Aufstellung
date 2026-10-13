@@ -98,8 +98,13 @@ def _import_rc_for_players(external_ids: list[str]) -> dict:
     }
 
 
+def _schedule_scope() -> str:
+    raw = os.environ.get("DATA_REFRESH_SCHEDULE_SCOPE", "current").strip().lower()
+    return raw if raw in {"all", "current"} else "current"
+
+
 def run_data_refresh(*, restart_server: bool = False) -> dict:
-    """Find new XTTV reports forward from max MEID; update RC only if needed."""
+    """Schedule gaps (current season by default) + forward MEID scan; RC if needed."""
     paused, pause_reason = _refresh_paused()
     if paused:
         return {
@@ -115,7 +120,8 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
     summary: dict = {}
 
     try:
-        schedule = import_missing_schedule_reports(limit=MAX_IMPORT)
+        schedule_scope = _schedule_scope()
+        schedule = import_missing_schedule_reports(limit=MAX_IMPORT, schedule_scope=schedule_scope)
         forward_budget = max(0, MAX_IMPORT - int(schedule.get("imported") or 0))
         forward = import_new_reports(limit=forward_budget or MAX_IMPORT)
 
@@ -139,6 +145,7 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
             "max_imported_meid": forward.get("max_imported_meid"),
             "range": forward.get("range"),
             "discovery": schedule.get("discovery"),
+            "schedule_scope": schedule_scope,
             "stopped_after_empty_streak": bool(forward.get("stopped_after_empty_streak")),
             "scan_frontier_after": forward.get("scan_frontier_after"),
         }
