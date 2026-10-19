@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import time
 import unicodedata
 from datetime import date, datetime, timedelta
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from bs4 import BeautifulSoup
 
@@ -22,10 +23,34 @@ _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 def fetch_player_history(rc_player_id: int) -> tuple[str, str]:
     url = f"{RC_BASE}/PlayerHistory.php?PlayerID={rc_player_id}"
-    request = Request(url, headers={"User-Agent": USER_AGENT})
     timeout = int(os.environ.get("RC_FETCH_TIMEOUT", "15"))
-    with urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", errors="replace"), response.headers.get_content_type()
+    retries = max(1, int(os.environ.get("RC_FETCH_RETRIES", "2") or "2"))
+    last_exc: Exception | None = None
+    proxy = (
+        os.environ.get("RC_HTTPS_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or ""
+    ).strip()
+    opener = build_opener(ProxyHandler({"http": proxy, "https": proxy})) if proxy else None
+
+    for attempt in range(retries):
+        request = Request(url, headers={"User-Agent": USER_AGENT})
+        try:
+            open_fn = opener.open if opener else urlopen
+            with open_fn(request, timeout=timeout) as response:
+                return (
+                    response.read().decode("utf-8", errors="replace"),
+                    response.headers.get_content_type(),
+                )
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 >= retries:
+                break
+            delay = float(os.environ.get("RC_FETCH_RETRY_DELAY", "1.5") or "1.5")
+            time.sleep(delay * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 def _persist_parsed_history(

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 
@@ -17,9 +18,9 @@ from .analysis_cache import refresh_analysis_cache
 from .analysis_service import clear_analysis_runtime_caches
 from .db import SessionLocal, create_all
 from .models import PlayerRatingSnapshot, XttvPlayer
-from .rc_import import import_rc_player, import_rc_player_updates
+from .rc_import import fetch_player_history, import_rc_player, import_rc_player_updates
 from .rc_matching import apply_matches_all
-from .xttv_db_import import MAX_IMPORT, import_new_reports, player_ids_from_meids
+from .xttv_db_import import MAX_IMPORT, import_new_reports
 from .xttv_schedule_import import import_missing_schedule_reports
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,17 @@ def external_ids_needing_rc_after_match(*, seasons: frozenset[str] | None = None
     return [str(x) for x in rows if x]
 
 
+def check_rc_connectivity(*, probe_player_id: int = 55291) -> tuple[bool, str]:
+    """Quick Ratings Central reachability check from this runtime (VPS / container)."""
+    try:
+        html, _ = fetch_player_history(int(probe_player_id))
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if len(html) < 500:
+        return False, f"response too short ({len(html)} bytes)"
+    return True, "ok"
+
+
 def _import_rc_for_players(external_ids: list[str]) -> dict:
     """Update RC for players in new XTTV reports — incremental when history already exists."""
     external_ids = sorted({str(x) for x in external_ids if x})
@@ -139,28 +151,52 @@ def _import_rc_for_players(external_ids: list[str]) -> dict:
             )
             .group_by(PlayerRatingSnapshot.player_id)
         }
-    imported = errors = full_imports = incremental_updates = 0
-    for player in players:
+    jobs = [
+        {
+            "external_player_id": str(player.external_player_id),
+            "rc_player_id": int(player.rc_player_id),
+            "name": player.name,
+            "club": player.club,
+            "incremental": snapshot_counts.get(player.id, 0) > 0,
+        }
+        for player in players
+    ]
+
+    def _run_one(job: dict) -> tuple[bool, str | None]:
         try:
-            importer = (
-                import_rc_player_updates
-                if snapshot_counts.get(player.id, 0) > 0
-                else import_rc_player
-            )
+            importer = import_rc_player_updates if job["incremental"] else import_rc_player
             result = importer(
-                int(player.rc_player_id),
-                xttv_external_player_id=str(player.external_player_id),
-                xttv_name=player.name,
-                xttv_club=player.club,
+                job["rc_player_id"],
+                xttv_external_player_id=job["external_player_id"],
+                xttv_name=job["name"],
+                xttv_club=job["club"],
             )
+            mode = result.get("mode")
+            return True, mode if mode in {"incremental", "full"} else "full"
+        except Exception as exc:
+            logger.warning("RC import %s: %s", job["external_player_id"], exc)
+            return False, None
+
+    imported = errors = full_imports = incremental_updates = 0
+    workers = max(1, min(int(os.environ.get("RC_IMPORT_WORKERS", "1") or "1"), 8))
+    if workers == 1:
+        outcomes = [_run_one(job) for job in jobs]
+    else:
+        outcomes = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_run_one, job) for job in jobs]
+            for fut in as_completed(futures):
+                outcomes.append(fut.result())
+
+    for ok, mode in outcomes:
+        if ok:
             imported += 1
-            if result.get("mode") == "incremental":
+            if mode == "incremental":
                 incremental_updates += 1
             else:
                 full_imports += 1
-        except Exception as exc:
+        else:
             errors += 1
-            logger.warning("RC import %s: %s", player.external_player_id, exc)
     return {
         "imported": imported,
         "errors": errors,
@@ -223,24 +259,49 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
         }
 
         new_meids = imported_meids
-        from_new_reports = player_ids_from_meids(new_meids) if new_meids else []
-        stale_after_match = external_ids_needing_rc_after_match()
-        player_ids = sorted({str(x) for x in from_new_reports} | {str(x) for x in stale_after_match})
-
         rc_mapped = 0
         rc_history = {"imported": 0, "errors": 0, "targets": 0}
-        if player_ids:
-            match_result = apply_matches_all(batch_size=200, import_history=True, only_unmapped=True)
-            rc_mapped = int(match_result.get("applied", 0) or 0)
+        rc_ok, rc_note = check_rc_connectivity()
+        summary["rc_preflight"] = {"ok": rc_ok, "detail": rc_note}
+        match_result = apply_matches_all(batch_size=200, import_history=True, only_unmapped=True)
+        rc_mapped = int(match_result.get("applied", 0) or 0)
+        stale_after_match = external_ids_needing_rc_after_match()
+        player_ids = stale_after_match
+        summary["rc_plan"] = {
+            "stale_after_match": len(stale_after_match),
+            "new_meids_this_run": len(new_meids),
+        }
+        if not rc_ok:
+            proxy = os.environ.get("RC_HTTPS_PROXY", "").strip()
+            hint = (
+                "Ratings Central von diesem Host nicht erreichbar. "
+                "RC_HTTPS_PROXY in .env setzen oder später erneut versuchen."
+            )
+            if proxy:
+                hint += f" (RC_HTTPS_PROXY={proxy!r} ist gesetzt — prüfen ob Proxy läuft.)"
+            summary["rc"] = {
+                "skipped": True,
+                "reason": "connectivity",
+                "detail": rc_note,
+                "hint": hint,
+                "newly_mapped": rc_mapped,
+                "stale_after_match": len(stale_after_match),
+                "targets_planned": len(player_ids),
+            }
+        elif not player_ids:
+            summary["rc"] = {
+                "skipped": True,
+                "reason": "no_stale_rc",
+                "newly_mapped": rc_mapped,
+                "stale_after_match": 0,
+            }
+        else:
             rc_history = _import_rc_for_players(player_ids)
             summary["rc"] = {
                 "newly_mapped": rc_mapped,
-                "from_new_reports": len(from_new_reports),
                 "stale_after_match": len(stale_after_match),
                 **rc_history,
             }
-        else:
-            summary["rc"] = {"skipped": True, "reason": "no_rc_targets"}
 
         data_changed = bool(new_meids) or rc_history.get("imported", 0) > 0 or rc_mapped > 0
         if data_changed:

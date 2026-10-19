@@ -22,7 +22,11 @@ from sqlalchemy import text
 
 from app.analysis_cache import refresh_analysis_cache
 from app.analysis_service import clear_analysis_runtime_caches
-from app.data_refresh_service import _import_rc_for_players, match_linked_player_external_ids
+from app.data_refresh_service import (
+    _import_rc_for_players,
+    external_ids_needing_rc_after_match,
+    match_linked_player_external_ids,
+)
 from app.db import SessionLocal, create_all
 from app.xttv_db_import import get_target_seasons
 
@@ -71,15 +75,26 @@ def main() -> int:
         action="store_true",
         help="do not refresh analysis cache / runtime caches after import",
     )
+    parser.add_argument(
+        "--stale-only",
+        action="store_true",
+        help="only players whose RC snapshot is older than their latest match (same as Monday refresh)",
+    )
     args = parser.parse_args()
     create_all()
 
     seasons = get_target_seasons()
-    external_ids = match_linked_player_external_ids(seasons=seasons)
+    if args.stale_only:
+        external_ids = external_ids_needing_rc_after_match(seasons=seasons)
+        scope = "stale_after_match"
+    else:
+        external_ids = match_linked_player_external_ids(seasons=seasons)
+        scope = "all_match_linked"
     mapped = _mapped_targets(external_ids) if external_ids else 0
 
     print(f"Target seasons: {', '.join(sorted(seasons))}")
-    print(f"Distinct Pass-Nr. in matches: {len(external_ids)}")
+    print(f"RC scope: {scope}")
+    print(f"Pass-Nr. to refresh: {len(external_ids)}")
     print(f"Mapped with rc_player_id: {mapped}")
 
     for pid in args.verify:

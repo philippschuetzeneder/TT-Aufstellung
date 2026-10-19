@@ -286,6 +286,75 @@ def send_weekly_refresh_report(
         return {"sent": False, "reason": f"{type(exc).__name__}: {exc}", "to": recipients}
 
 
+def send_sunday_preflight_report(checks: dict[str, Any], *, when: datetime | None = None) -> dict[str, Any]:
+    """E-mail before Monday cron: RC reachability + planned stale RC workload."""
+    when = when or datetime.now(VIENNA)
+    ok = bool(checks.get("ok"))
+    date_str = when.strftime("%d.%m.%Y")
+    result = {
+        "ok": ok,
+        "data_changed": False,
+        "message": checks.get("message") or ("Sonntags-Check OK" if ok else "Sonntags-Check FEHLER"),
+        "summary": {"preflight": checks},
+    }
+    if not smtp_configured():
+        return {"sent": False, "reason": "smtp_not_configured"}
+
+    recipients = report_recipients()
+    if not recipients:
+        return {"sent": False, "reason": "no_recipients"}
+
+    stale = checks.get("stale_rc_targets")
+    rc = checks.get("ratings_central") or {}
+    subject = (
+        f"[TT-Aufstellung] Sonntags-Check OK ({date_str}) — RC erreichbar, {stale} stale"
+        if ok
+        else f"[TT-Aufstellung] Sonntags-Check FEHLER ({date_str}) — RC nicht erreichbar"
+    )
+    plain_lines = [
+        "TT-Aufstellung — Sonntags-Preflight (Montag 04:00)",
+        f"Status: {'OK' if ok else 'FEHLER'}",
+        f"Zeitpunkt: {when.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        "",
+        _row("Ratings Central erreichbar", rc.get("ok")),
+        _row("RC-Detail", rc.get("detail")),
+        _row("Stale-RC-Ziele (Montag)", stale),
+        _row("Saisons", ", ".join(checks.get("target_seasons") or [])),
+        "",
+        result["message"],
+    ]
+    plain = "\n".join(plain_lines)
+    html = f"<pre style='font-family:sans-serif;font-size:14px;'>{plain}</pre>"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    from_addr = _env("SMTP_FROM") or _env("SMTP_USER") or DEFAULT_FROM
+    msg["From"] = from_addr
+    msg["To"] = ", ".join(recipients)
+    msg["Date"] = formatdate(localtime=True)
+    domain = from_addr.split("@", 1)[-1] if "@" in from_addr else "tt-aufstellung.at"
+    msg["Message-ID"] = make_msgid(domain=domain)
+    msg.attach(MIMEText(plain, "plain", "utf-8"))
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    host = _env("SMTP_HOST")
+    port = int(_env("SMTP_PORT", "25") or "25")
+    user = _env("SMTP_USER")
+    password = _env("SMTP_PASSWORD")
+    use_tls = _env("SMTP_USE_TLS", "0").lower() not in {"0", "false", "no"}
+
+    try:
+        with smtplib.SMTP(host, port, timeout=60) as server:
+            if use_tls:
+                server.starttls(context=ssl.create_default_context())
+            if smtp_use_auth():
+                server.login(user, password)
+            server.sendmail(from_addr, recipients, msg.as_string())
+        return {"sent": True, "to": recipients, "subject": subject}
+    except Exception as exc:
+        return {"sent": False, "reason": f"{type(exc).__name__}: {exc}", "to": recipients}
+
+
 def send_shell_failure_report(
     error_message: str,
     *,

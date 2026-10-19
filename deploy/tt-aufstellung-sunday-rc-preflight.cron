@@ -1,0 +1,7 @@
+# TT-Aufstellung — Sunday RC preflight (before Monday 04:00 refresh)
+# Install: sudo bash scripts/install-sunday-rc-preflight-cron.sh
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=Europe/Vienna
+
+0 18 * * 0 root /bin/bash /opt/tt-aufstellung/scripts/sunday-rc-preflight-prod.sh >> /opt/tt-aufstellung/logs/cron-sunday-rc-preflight.log 2>&1

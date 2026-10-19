@@ -28,6 +28,8 @@ services:
       PORT: 10000
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       RC_FETCH_TIMEOUT: ${RC_FETCH_TIMEOUT:-30}
+      RC_IMPORT_WORKERS: ${RC_IMPORT_WORKERS:-1}
+      RC_FETCH_RETRIES: ${RC_FETCH_RETRIES:-3}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     expose:
