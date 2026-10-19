@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import time
 import urllib.request
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -139,6 +140,7 @@ def collect_schedule_meids(*, sjids: list[int] | None = None) -> dict:
                 print(
                     f"[xttv-schedule] sjid={sjid} ({season_label}) Liga {idx}/{total_leagues}: "
                     f"{label[:50]!s} … MEIDs bisher {len(season_meids)}",
+                    file=sys.stderr,
                     flush=True,
                 )
             time.sleep(REQUEST_DELAY)
@@ -245,6 +247,7 @@ def drain_schedule_backlog(
     create_all()
     print(
         f"[xttv-schedule] Index/Spielpläne laden (scope={schedule_scope}) …",
+        file=sys.stderr,
         flush=True,
     )
     discovery = collect_schedule_meids(sjids=sjids_for_scope(schedule_scope))
@@ -255,6 +258,7 @@ def drain_schedule_backlog(
     print(
         f"[xttv-schedule] {discovery['meids_total']} MEIDs auf Plänen, "
         f"{len(missing)} fehlen in DB — Import startet …",
+        file=sys.stderr,
         flush=True,
     )
     total_imported: list[int] = []
@@ -266,6 +270,7 @@ def drain_schedule_backlog(
         rounds += 1
         print(
             f"[xttv-schedule] Runde {rounds}: noch {len(missing)} Kandidaten …",
+            file=sys.stderr,
             flush=True,
         )
         batch = import_meid_batch(missing, limit=batch_size)
@@ -274,6 +279,7 @@ def drain_schedule_backlog(
         print(
             f"[xttv-schedule] Runde {rounds}: +{batch.get('imported', 0)} importiert, "
             f"geprüft {batch.get('checked', 0)}",
+            file=sys.stderr,
             flush=True,
         )
         if not batch.get("imported_meids"):

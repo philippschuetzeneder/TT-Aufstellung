@@ -66,10 +66,26 @@ print(json.dumps(run_data_refresh(restart_server=False), ensure_ascii=False, def
     FAIL_MSG="docker compose exec / run_data_refresh fehlgeschlagen"
     echo "[weekly-data-refresh] $FAIL_MSG"
   else
-    printf '%s' "$RESULT" > "$RESULT_FILE"
     echo "$RESULT"
-
-    if ! python3 - "$RESULT_FILE" <<'PY'
+    if ! printf '%s' "$RESULT" | python3 - "$RESULT_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+raw = sys.stdin.read()
+json_line = None
+for line in raw.splitlines():
+    s = line.strip()
+    if s.startswith("{"):
+        json_line = s
+if not json_line:
+    print("[weekly-data-refresh] Keine JSON-Zeile in run_data_refresh-Ausgabe", file=sys.stderr)
+    raise SystemExit(2)
+Path(sys.argv[1]).write_text(json_line, encoding="utf-8")
+PY
+    then
+      FAILED=true
+      FAIL_MSG="Refresh-Ausgabe enthält kein parsebares JSON"
+      echo "[weekly-data-refresh] $FAIL_MSG"
+    elif ! python3 - "$RESULT_FILE" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 raise SystemExit(0 if data.get("ok", True) else 1)
