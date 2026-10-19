@@ -65,6 +65,54 @@ def match_linked_player_external_ids(*, seasons: frozenset[str] | None = None) -
     return [str(x) for x in rows if x]
 
 
+def external_ids_needing_rc_after_match(*, seasons: frozenset[str] | None = None) -> list[str]:
+    """Mapped players whose latest RC snapshot is older than their latest imported match."""
+    from .xttv_db_import import get_target_seasons
+
+    season_list = sorted(seasons or get_target_seasons())
+    if not season_list:
+        return []
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                WITH player_match AS (
+                    SELECT
+                        p.id AS player_id,
+                        p.external_player_id::text AS external_player_id,
+                        MAX(
+                            to_timestamp(
+                                (regexp_match(m.match_date, '(\\d{2}\\.\\d{2}\\.\\d{4})'))[1],
+                                'DD.MM.YYYY'
+                            )
+                        ) AS last_match
+                    FROM xttv_players p
+                    JOIN match_players mp
+                      ON mp.external_player_id::text = p.external_player_id
+                    JOIN xttv_matches m ON m.id = mp.match_id
+                    WHERE p.rc_player_id IS NOT NULL
+                      AND m.season IN :seasons
+                      AND m.match_date ~ '^\\d{2}\\.\\d{2}\\.\\d{4}'
+                    GROUP BY p.id, p.external_player_id
+                ),
+                player_rc AS (
+                    SELECT player_id, MAX(observed_at) AS last_rc
+                    FROM player_rating_snapshots
+                    WHERE source = 'ratingscentral'
+                    GROUP BY player_id
+                )
+                SELECT pm.external_player_id
+                FROM player_match pm
+                LEFT JOIN player_rc pr ON pr.player_id = pm.player_id
+                WHERE pr.last_rc IS NULL OR pr.last_rc < pm.last_match
+                ORDER BY pm.external_player_id
+                """
+            ).bindparams(bindparam("seasons", expanding=True)),
+            {"seasons": season_list},
+        ).scalars().all()
+    return [str(x) for x in rows if x]
+
+
 def _import_rc_for_players(external_ids: list[str]) -> dict:
     """Update RC for players in new XTTV reports — incremental when history already exists."""
     external_ids = sorted({str(x) for x in external_ids if x})
@@ -175,7 +223,9 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
         }
 
         new_meids = imported_meids
-        player_ids = player_ids_from_meids(new_meids) if new_meids else []
+        from_new_reports = player_ids_from_meids(new_meids) if new_meids else []
+        stale_after_match = external_ids_needing_rc_after_match()
+        player_ids = sorted({str(x) for x in from_new_reports} | {str(x) for x in stale_after_match})
 
         rc_mapped = 0
         rc_history = {"imported": 0, "errors": 0, "targets": 0}
@@ -183,9 +233,14 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
             match_result = apply_matches_all(batch_size=200, import_history=True, only_unmapped=True)
             rc_mapped = int(match_result.get("applied", 0) or 0)
             rc_history = _import_rc_for_players(player_ids)
-            summary["rc"] = {"newly_mapped": rc_mapped, **rc_history}
+            summary["rc"] = {
+                "newly_mapped": rc_mapped,
+                "from_new_reports": len(from_new_reports),
+                "stale_after_match": len(stale_after_match),
+                **rc_history,
+            }
         else:
-            summary["rc"] = {"skipped": True, "reason": "no_new_reports"}
+            summary["rc"] = {"skipped": True, "reason": "no_rc_targets"}
 
         data_changed = bool(new_meids) or rc_history.get("imported", 0) > 0 or rc_mapped > 0
         if data_changed:
