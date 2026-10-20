@@ -959,7 +959,7 @@ async function runAnalysis() {
       strongerPair = `&stronger_double_pair=${state.strongerDoublePair}`;
     }
     const ownTeam = `&own_team=${encodeURIComponent(state.ownTeam)}`;
-    const nextResult = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${direction}${spieltyp}${pairs}${strongerPair}${ownTeam}${fixedOrder}${fixedDoublesOn}`, { timeoutMs: 120000 });
+    const nextResult = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${direction}${spieltyp}${pairs}${strongerPair}${ownTeam}${fixedOrder}${fixedDoublesOn}`, { timeoutMs: 6000 });
     if (state.editMode) {
       state.result = nextResult;
       state.optimalResult = state.optimalResult || nextResult;

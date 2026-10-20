@@ -33,7 +33,11 @@ SINGLE_GAMES = 12
 DOUBLE_GAMES = 2
 TOTAL_GAMES = 14
 WIN_TARGET = 8
-MAX_ANALYSIS_SECONDS = 7.0
+MAX_ANALYSIS_SECONDS = 5.0
+MAX_OPPONENT_SCENARIOS_FOR_EVAL = 16
+MAX_PARTIAL_FILL_CANDIDATES = 10
+MAX_PARTIAL_OPPONENT_COMBOS = 28
+LINEUP_SPREAD_BUDGET_SECONDS = 3.5
 STATS_YEARS = 2
 OPPONENT_POOL_YEARS = 2
 # Recency decay by completed league rounds (matches), not calendar days.
@@ -908,7 +912,22 @@ def _evaluate_lineup_for_perm(
 
 def _check_analysis_budget(started):
     if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-        raise RuntimeError('Analysis exceeded the internal 7-second safety budget')
+        raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
+
+
+def _analysis_time_remaining(started):
+    return MAX_ANALYSIS_SECONDS - (time.monotonic() - started)
+
+
+def _cap_opponent_scenarios(scenarios, limit=MAX_OPPONENT_SCENARIOS_FOR_EVAL):
+    """Keep the most likely opponent lineups for evaluation (hard latency cap)."""
+    if not scenarios or len(scenarios) <= limit:
+        return scenarios
+    trimmed = sorted(scenarios, key=lambda item: (-item[0], item[1]))[:limit]
+    total = sum(probability for probability, _ in trimmed)
+    if total <= 0:
+        return trimmed
+    return [(probability / total, order) for probability, order in trimmed]
 
 
 def _empty_match_agg():
@@ -1764,8 +1783,16 @@ def _build_partial_opponent_scenarios(db, team, known_ids, opponent_pool, ref_da
             scenarios = _scenarios_from_strength_prior_lineup(db, quartet)
             return scenarios, names
         return [], names
+    if len(candidates) > MAX_PARTIAL_FILL_CANDIDATES:
+        rc_map = _load_latest_rc_map(db, candidates)
+        candidates = sorted(
+            candidates,
+            key=lambda pid: -_resolve_rc_rating(pid, rc_map, candidates),
+        )[:MAX_PARTIAL_FILL_CANDIDATES]
     weighted = Counter()
     combos = list(combinations(candidates, remaining))
+    if len(combos) > MAX_PARTIAL_OPPONENT_COMBOS:
+        combos = combos[:MAX_PARTIAL_OPPONENT_COMBOS]
     if not combos:
         return [], {}
 
@@ -2171,6 +2198,7 @@ def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
                 scenarios = filtered
         if not scenarios:
             return {}, {}, {}, [], source, ref_date, opponent_pool, warnings
+        scenarios = _cap_opponent_scenarios(scenarios)
         relevant = set(own)
         for _, order in scenarios:
             relevant.update(order)
@@ -2241,7 +2269,9 @@ def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, st
             'doubles_win_probability_on_10': round(win10, 6),
         })
         if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-            raise RuntimeError('Analysis exceeded the internal 7-second safety budget')
+            if evaluated:
+                break
+            raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
     return evaluated, matchup_p
 
 
@@ -2862,8 +2892,9 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             },
         }
 
-    display_scenarios = scenarios
-    scenarios = _sharpen_scenarios(scenarios)
+    sharpened = _sharpen_scenarios(scenarios)
+    display_scenarios = _cap_opponent_scenarios(sharpened, limit=12)
+    scenarios = _cap_opponent_scenarios(sharpened, MAX_OPPONENT_SCENARIOS_FOR_EVAL)
 
     opp_ids = set()
     for _, order in scenarios:
@@ -2876,8 +2907,14 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         own_on_letters = None if opponent_on_letters is None else not bool(opponent_on_letters)
         if own_is_home is None:
             home_eval, home_matchups = _evaluate_lineups(own, scenarios, profiles, matchups, names, True, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
-            away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
-            evaluated = _merge_orientations(home_eval, away_eval)
+            if _analysis_time_remaining(started) > 1.0:
+                away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
+                evaluated = _merge_orientations(home_eval, away_eval)
+            else:
+                evaluated = home_eval
+                warnings.append(
+                    'Heim/Auswärts-Durchschnitt wegen Zeitbudget nur mit Heim-Orientierung berechnet.',
+                )
             matchup_p = home_matchups
             orientation_note = 'home-and-away-averaged' if own_on_letters is None else ('opponent-A-D' if opponent_on_letters else 'opponent-1-4')
         else:
@@ -2891,6 +2928,22 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
             'Die Analyse wurde wegen Zeitlimit abgebrochen (große Datenmenge). '
             'Bitte erneut versuchen oder weniger bekannte Gegner angeben.',
         )
+        return {
+            'ok': True,
+            'phase': phase,
+            'recommendations': [],
+            'warnings': warnings,
+            'opponent_team': opponent_team,
+            'data_quality': {
+                'opponent_pool_size': len(opponent_pool),
+                'opponent_set_source': source,
+                'reference_date': ref_date.isoformat() if hasattr(ref_date, 'isoformat') else str(ref_date),
+            },
+        }
+
+    if not evaluated:
+        phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
+        warnings.append('Keine Aufstellung konnte innerhalb des Zeitbudgets bewertet werden.')
         return {
             'ok': True,
             'phase': phase,
@@ -2959,19 +3012,22 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         )
     recommendation['advantage_vs_strength_lineup_pp'] = advantage_vs_strength_pp
     recommendation['strength_lineup_player_ids'] = strength_order
-    try:
-        recommendation['lineup_spread_pp'] = _compute_lineup_configuration_spread_pp(
-            own, scenarios, profiles, matchups, names,
-            use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
-            stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
-            own_on_letters=own_on_letters, own_is_home=own_is_home,
-            started=started,
-        )
-    except RuntimeError as exc:
-        if 'safety budget' not in str(exc).lower():
-            raise
+    if _analysis_time_remaining(started) >= LINEUP_SPREAD_BUDGET_SECONDS:
+        try:
+            recommendation['lineup_spread_pp'] = _compute_lineup_configuration_spread_pp(
+                own, scenarios, profiles, matchups, names,
+                use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
+                stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
+                own_on_letters=own_on_letters, own_is_home=own_is_home,
+                started=started,
+            )
+        except RuntimeError as exc:
+            if 'safety budget' not in str(exc).lower():
+                raise
+            recommendation['lineup_spread_pp'] = None
+            warnings.append('Konfigurations-Spread konnte wegen Zeitlimit nicht berechnet werden.')
+    else:
         recommendation['lineup_spread_pp'] = None
-        warnings.append('Konfigurations-Spread konnte wegen Zeitlimit nicht berechnet werden.')
     # The lineup ranking remains unchanged. For the result card, however,
     # use the same scenario-aggregated 14-game vector shown by the
     # explanation instead of aggregating separately from marginal matchups.
@@ -3003,6 +3059,10 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     ]
     opponent_predictions.sort(key=lambda item: (-item['probability'], item['player_ids']))
     elapsed = time.monotonic() - started
+    if elapsed > MAX_ANALYSIS_SECONDS:
+        warnings.append(
+            f'Analyse mit reduziertem Detail abgeschlossen ({elapsed:.1f}s Zeitbudget).',
+        )
     info_summary = _build_info_summary(
         own, scenarios, profiles, names, matchups, recommendation, evaluated, explanation,
         opponent_team, ref_date, opponent_pool, source, orientation_note,
@@ -3017,6 +3077,8 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         'warnings': warnings,
         'known_opponent_ids': actual or [],
         'known_opponent_count': len(actual or []),
+        'analysis_elapsed_seconds': round(elapsed, 3),
+        'analysis_time_budget_seconds': MAX_ANALYSIS_SECONDS,
         'own_is_home': own_is_home,
         'opponent_direction_known': opponent_on_letters is not None,
         'opponent_on_letters': opponent_on_letters,
