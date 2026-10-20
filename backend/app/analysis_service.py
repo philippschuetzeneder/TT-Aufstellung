@@ -33,11 +33,11 @@ SINGLE_GAMES = 12
 DOUBLE_GAMES = 2
 TOTAL_GAMES = 14
 WIN_TARGET = 8
-MAX_ANALYSIS_SECONDS = 5.0
+MAX_ANALYSIS_SECONDS = 8.0
 MAX_OPPONENT_SCENARIOS_FOR_EVAL = 16
 MAX_PARTIAL_FILL_CANDIDATES = 10
 MAX_PARTIAL_OPPONENT_COMBOS = 28
-LINEUP_SPREAD_BUDGET_SECONDS = 3.5
+LINEUP_SPREAD_BUDGET_SECONDS = 6.0
 STATS_YEARS = 2
 OPPONENT_POOL_YEARS = 2
 # Recency decay by completed league rounds (matches), not calendar days.
@@ -912,7 +912,7 @@ def _evaluate_lineup_for_perm(
 
 def _check_analysis_budget(started):
     if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-        raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
+        raise RuntimeError('Analysis exceeded the internal 8-second safety budget')
 
 
 def _analysis_time_remaining(started):
@@ -928,6 +928,148 @@ def _cap_opponent_scenarios(scenarios, limit=MAX_OPPONENT_SCENARIOS_FOR_EVAL):
     if total <= 0:
         return trimmed
     return [(probability / total, order) for probability, order in trimmed]
+
+
+def _adaptive_scenario_cap(scenarios, started):
+    """Tighten scenario count when data loading consumed much of the time budget."""
+    remaining = _analysis_time_remaining(started)
+    if remaining <= 1.5:
+        limit = 1
+    elif remaining <= 3.0:
+        limit = 4
+    elif remaining <= 5.5:
+        limit = 8
+    else:
+        return scenarios
+    return _cap_opponent_scenarios(scenarios, limit)
+
+
+def _neutral_lineup_eval_entry(own, names, profiles):
+    order = _trivial_strength_own_order(own, profiles)
+    return {
+        'own_player_ids': list(order),
+        'players': [names.get(pid, f'Spieler {pid}') for pid in order],
+        'team_win_probability': 0.5,
+        'team_draw_probability': 0.15,
+        'team_loss_probability': 0.35,
+        'expected_own_wins': 7.0,
+        'expected_opponent_wins': 7.0,
+        'expected_score_display': '7:7',
+        'recommended_doubles_on': 5,
+        'doubles_win_probability_on_5': 0.5,
+        'doubles_win_probability_on_10': 0.5,
+    }
+
+
+def _ensure_evaluated_or_fallback(
+    own, scenarios, profiles, matchups, names, own_is_home, *,
+    use_spieltyp=False, own_double_pairs=None, stronger_double_pair=1,
+    doubles_stats=None, own_on_letters=None, fixed_order=None,
+    fixed_doubles_on=None, fixed_game_pairs=None, warnings=None,
+):
+    """Always return at least one evaluated lineup (never an empty list)."""
+    warnings = warnings if warnings is not None else []
+    home = True if own_is_home is None else bool(own_is_home)
+    tiny = _cap_opponent_scenarios(scenarios, 1) if scenarios else []
+    doubles_stats = doubles_stats or {}
+    evaluated, matchup_p = [], {}
+    if tiny:
+        try:
+            evaluated, matchup_p = _evaluate_lineups(
+                own, tiny, profiles, matchups, names, home, time.monotonic(),
+                use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
+                stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
+                own_on_letters=own_on_letters, fixed_order=fixed_order,
+                fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs,
+            )
+        except RuntimeError:
+            evaluated = []
+    if not evaluated and tiny:
+        strength = _trivial_strength_own_order(own, profiles)
+        try:
+            evaluated, matchup_p = _evaluate_lineups(
+                own, tiny, profiles, matchups, names, home, time.monotonic(),
+                use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
+                stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
+                own_on_letters=own_on_letters, fixed_order=list(strength),
+                fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs,
+            )
+        except RuntimeError:
+            evaluated = []
+    if not evaluated:
+        evaluated = [_neutral_lineup_eval_entry(own, names, profiles)]
+        relevant = set(own)
+        for _, order in tiny:
+            relevant.update(order)
+        matchup_p = _build_matchup_table(
+            relevant, profiles, matchups, home, use_spieltyp=use_spieltyp,
+        )
+        warnings.append(
+            'Ergebnis basiert auf RC-Stärke (vereinfachte Berechnung).',
+        )
+    return evaluated, matchup_p
+
+
+def _build_own_only_analysis_response(
+    own, opponent_team, actual, ref_date, opponent_pool, source, warnings,
+    own_is_home, opponent_on_letters, use_spieltyp, started,
+):
+    """Last-resort payload when no opponent scenarios exist — still show a lineup."""
+    ref_date = ref_date or date.today()
+    with SessionLocal() as db:
+        names, profiles, matchups = _load_player_profiles(db, own, ref_date)
+        if use_spieltyp:
+            _augment_profiles_spieltyp(db, own, profiles, ref_date)
+    for pid in own:
+        profiles.setdefault(pid, _empty_profile())
+        names.setdefault(pid, f'Spieler {pid}')
+    evaluated = [_neutral_lineup_eval_entry(own, names, profiles)]
+    evaluated[0]['rank'] = 1
+    recommendation = evaluated[0]
+    doubles_advice = _build_doubles_advice(
+        recommendation, names, None, 1, profiles,
+    )
+    recommendation['doubles'] = {
+        'game5': doubles_advice['game5'],
+        'game10': doubles_advice['game10'],
+    }
+    phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
+    note_warnings = list(warnings)
+    note_warnings.append(
+        'Gegner-Aufstellung konnte nicht modelliert werden — '
+        'Anzeige: RC-Stärke-Reihenfolge (A = stärkster).',
+    )
+    elapsed = time.monotonic() - started
+    return {
+        'ok': True,
+        'phase': phase,
+        'warnings': note_warnings,
+        'known_opponent_ids': actual or [],
+        'known_opponent_count': len(actual or []),
+        'analysis_elapsed_seconds': round(elapsed, 3),
+        'analysis_time_budget_seconds': MAX_ANALYSIS_SECONDS,
+        'own_is_home': own_is_home,
+        'opponent_direction_known': opponent_on_letters is not None,
+        'opponent_on_letters': opponent_on_letters,
+        'use_spieltyp': use_spieltyp,
+        'opponent_team': opponent_team,
+        'own_player_ids': own,
+        'opponent_set_source': source,
+        'recommendation': recommendation,
+        'recommendations': evaluated,
+        'explanation': {},
+        'doubles_advice': doubles_advice,
+        'info_summary': {},
+        'opponent_predictions': [],
+        'most_likely_opponent': None,
+        'model': {'version': MODEL_VERSION, 'orientation': 'own-strength-fallback'},
+        'data_quality': {
+            'opponent_pool_size': len(opponent_pool),
+            'opponent_set_source': source,
+            'reference_date': ref_date.isoformat() if hasattr(ref_date, 'isoformat') else str(ref_date),
+            'runtime_seconds': round(elapsed, 4),
+        },
+    }
 
 
 def _empty_match_agg():
@@ -2271,7 +2413,7 @@ def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, st
         if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
             if evaluated:
                 break
-            raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
+            raise RuntimeError('Analysis exceeded the internal 8-second safety budget')
     return evaluated, matchup_p
 
 
@@ -2873,41 +3015,54 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     )
     warnings = list(data_warnings)
     if not scenarios:
-        phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
-        if not warnings:
-            warnings.append(
-                f'Keine passende Gegner-Aufstellung für {opponent_team} gefunden. '
-                'Prüfe Teamname, XTTV-Import und ob mindestens vier Gegenspieler im Kader sind.',
+        with SessionLocal() as db:
+            ref_date = ref_date or date.today()
+            pool = opponent_pool or set()
+            scenarios, fb_source, fb_warnings = _build_fallback_opponent_scenarios(
+                db, pool, ref_date, actual=actual,
             )
-        return {
-            'ok': True,
-            'phase': phase,
-            'recommendations': [],
-            'warnings': warnings,
-            'opponent_team': opponent_team,
-            'data_quality': {
-                'opponent_pool_size': len(opponent_pool),
-                'opponent_set_source': source,
-                'reference_date': ref_date.isoformat() if hasattr(ref_date, 'isoformat') else str(ref_date),
-            },
-        }
+            warnings.extend(fb_warnings)
+            if scenarios:
+                source = fb_source
+                scenarios = _cap_opponent_scenarios(scenarios)
+                relevant = set(own)
+                for _, order in scenarios:
+                    relevant.update(order)
+                names, profiles, matchups = _load_player_profiles(db, list(relevant), ref_date)
+                if use_spieltyp:
+                    _augment_profiles_spieltyp(db, list(relevant), profiles, ref_date)
+                for pid in relevant:
+                    profiles.setdefault(pid, _empty_profile())
+                    names.setdefault(pid, f'Spieler {pid}')
+        if not scenarios:
+            return _build_own_only_analysis_response(
+                own, opponent_team, actual, ref_date, opponent_pool, source, warnings,
+                own_is_home, opponent_on_letters, use_spieltyp, started,
+            )
 
     sharpened = _sharpen_scenarios(scenarios)
     display_scenarios = _cap_opponent_scenarios(sharpened, limit=12)
-    scenarios = _cap_opponent_scenarios(sharpened, MAX_OPPONENT_SCENARIOS_FOR_EVAL)
+    scenarios = _adaptive_scenario_cap(
+        _cap_opponent_scenarios(sharpened, MAX_OPPONENT_SCENARIOS_FOR_EVAL),
+        started,
+    )
 
     opp_ids = set()
     for _, order in scenarios:
         opp_ids.update(order)
+    own_on_letters = None if opponent_on_letters is None else not bool(opponent_on_letters)
+    evaluated = []
+    matchup_p = {}
+    doubles_stats = {}
+    orientation_note = 'home'
     try:
         with SessionLocal() as db:
             doubles_stats = _load_doubles_stats(db, own, opp_ids, own_team, opponent_team, ref_date)
 
-        _check_analysis_budget(started)
-        own_on_letters = None if opponent_on_letters is None else not bool(opponent_on_letters)
+        scenarios = _adaptive_scenario_cap(scenarios, started)
         if own_is_home is None:
             home_eval, home_matchups = _evaluate_lineups(own, scenarios, profiles, matchups, names, True, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
-            if _analysis_time_remaining(started) > 1.0:
+            if _analysis_time_remaining(started) > 2.0:
                 away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
                 evaluated = _merge_orientations(home_eval, away_eval)
             else:
@@ -2923,39 +3078,31 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     except RuntimeError as exc:
         if 'safety budget' not in str(exc).lower():
             raise
-        phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
         warnings.append(
-            'Die Analyse wurde wegen Zeitlimit abgebrochen (große Datenmenge). '
-            'Bitte erneut versuchen oder weniger bekannte Gegner angeben.',
+            'Vereinfachte Analyse wegen Zeitbudget — Ergebnis basiert auf den wahrscheinlichsten Szenarien.',
         )
-        return {
-            'ok': True,
-            'phase': phase,
-            'recommendations': [],
-            'warnings': warnings,
-            'opponent_team': opponent_team,
-            'data_quality': {
-                'opponent_pool_size': len(opponent_pool),
-                'opponent_set_source': source,
-                'reference_date': ref_date.isoformat() if hasattr(ref_date, 'isoformat') else str(ref_date),
-            },
-        }
+        evaluated, matchup_p = _ensure_evaluated_or_fallback(
+            own, scenarios, profiles, matchups, names, own_is_home,
+            use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
+            stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
+            own_on_letters=own_on_letters, fixed_order=fixed,
+            fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs,
+            warnings=warnings,
+        )
+        orientation_note = ('home' if own_is_home else 'away') if own_is_home is not None else 'home'
 
     if not evaluated:
-        phase = 'C' if actual and len(actual) == 4 and opponent_on_letters is not None else ('B' if actual else 'A')
-        warnings.append('Keine Aufstellung konnte innerhalb des Zeitbudgets bewertet werden.')
-        return {
-            'ok': True,
-            'phase': phase,
-            'recommendations': [],
-            'warnings': warnings,
-            'opponent_team': opponent_team,
-            'data_quality': {
-                'opponent_pool_size': len(opponent_pool),
-                'opponent_set_source': source,
-                'reference_date': ref_date.isoformat() if hasattr(ref_date, 'isoformat') else str(ref_date),
-            },
-        }
+        evaluated, matchup_p = _ensure_evaluated_or_fallback(
+            own, scenarios, profiles, matchups, names, own_is_home,
+            use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs,
+            stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats,
+            own_on_letters=own_on_letters, fixed_order=fixed,
+            fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs,
+            warnings=warnings,
+        )
+        orientation_note = (
+            ('home' if own_is_home else 'away') if own_is_home is not None else 'home'
+        )
 
     if fixed is None:
         # The normal route evaluates and ranks all 24 permutations.

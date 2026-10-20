@@ -52,4 +52,5 @@ def test_analyze_lineup_completes_under_budget_with_many_uniform_scenarios(monke
     elapsed = time.monotonic() - started
     assert result["ok"] is True
     assert result.get("recommendations")
+    assert result.get("recommendation")
     assert elapsed < MAX_ANALYSIS_SECONDS + 0.5

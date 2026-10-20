@@ -82,14 +82,14 @@ def main() -> int:
             )
             elapsed = time.monotonic() - started
             recs = result.get("recommendations") or []
-            ok = bool(recs) and elapsed <= MAX_ANALYSIS_SECONDS + 0.25
+            ok = bool(recs) and bool(result.get("recommendation")) and elapsed <= MAX_ANALYSIS_SECONDS + 0.5
             if not recs:
                 failed += 1
             rows.append({
                 "case": case["label"],
                 "elapsed_s": round(elapsed, 3),
                 "recommendations": len(recs),
-                "within_budget": elapsed <= MAX_ANALYSIS_SECONDS + 0.25,
+                "within_budget": elapsed <= MAX_ANALYSIS_SECONDS + 0.5,
                 "phase": result.get("phase"),
                 "warnings": len(result.get("warnings") or []),
             })

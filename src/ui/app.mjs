@@ -58,6 +58,9 @@ function scrollToResultPanel() {
   });
 }
 
+const ANALYSIS_REQUEST_TIMEOUT_MS = 10000;
+const ANALYSIS_REQUEST_RETRY_TIMEOUT_MS = 12000;
+
 async function api(path, { timeoutMs = 5000 } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -68,11 +71,52 @@ async function api(path, { timeoutMs = 5000 } = {}) {
     if (!r.ok || d.ok === false) throw new Error(d.message || d.error || 'API error');
     return d;
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Zeitüberschreitung (5 s) — Berechnung zu langsam.');
+    if (e.name === 'AbortError') throw new Error('__analysis_timeout__');
     throw e;
   } finally {
     clearTimeout(timer);
   }
+}
+
+function normalizeAnalysisResult(data) {
+  if (!data) return data;
+  if (!data.recommendation && data.recommendations?.length) {
+    data.recommendation = data.recommendations[0];
+  }
+  return data;
+}
+
+function clientStrengthFallbackResult() {
+  if (state.selectedOwn.length !== 4) return null;
+  const byStrength = [...state.selectedOwn].map(String).sort((a, b) => {
+    const pa = state.ownPlayers.find((p) => String(p.id) === a);
+    const pb = state.ownPlayers.find((p) => String(p.id) === b);
+    const ra = pa?.rc_rating != null && Number.isFinite(Number(pa.rc_rating)) ? Number(pa.rc_rating) : -1;
+    const rb = pb?.rc_rating != null && Number.isFinite(Number(pb.rc_rating)) ? Number(pb.rc_rating) : -1;
+    return rb - ra;
+  });
+  const players = byStrength.map((id) => ownNameById(id));
+  const recommendation = {
+    own_player_ids: byStrength,
+    players,
+    team_win_probability: 0.5,
+    team_draw_probability: 0.15,
+    team_loss_probability: 0.35,
+    expected_own_wins: 7,
+    expected_opponent_wins: 7,
+    expected_score_display: '7:7',
+    recommended_doubles_on: 5,
+    rank: 1,
+  };
+  return {
+    ok: true,
+    phase: state.selectedOpp.length ? 'B' : 'A',
+    recommendation,
+    recommendations: [recommendation],
+    warnings: ['Offline-Schätzung nach RC-Stärke (A = stärkster Spieler).'],
+    opponent_team: state.opponentTeam,
+    explanation: {},
+  };
 }
 
 function isTragweinKamigTeamName(name) {
@@ -602,8 +646,13 @@ function resultHtml() {
     return '';
   }
   if (!state.result.recommendation) {
-    const warning = (state.result.warnings || []).join(' | ');
-    return `<div class="empty error-box"><strong>Berechnung nicht abgeschlossen.</strong><br>${escapeHtml(state.result.message || state.result.error || warning || 'Unbekannter Fehler')}</div>`;
+    const fallback = clientStrengthFallbackResult();
+    if (fallback?.recommendation) {
+      state.result = { ...fallback, warnings: [...(fallback.warnings || []), ...(state.result.warnings || [])] };
+    } else {
+      const warning = (state.result.warnings || []).join(' | ');
+      return `<div class="empty warning-box"><strong>Hinweis</strong><br>${escapeHtml(warning || state.result.message || 'Bitte erneut berechnen.')}</div>`;
+    }
   }
   const loadingOverlay = state.analysisLoading ? `<div class="result-updating">${analysisLoadingHtml(true)}</div>` : '';
   const b = state.result.recommendation;
@@ -933,33 +982,48 @@ function bind() {
   });
 }
 
+function analysisRequestPath() {
+  const known = state.selectedOpp.length ? '&actual_opponent_ids=' + encodeURIComponent(state.selectedOpp.join(',')) : '';
+  const home = '&own_is_home=' + (state.ownIsHome ? 'true' : 'false');
+  const direction = state.opponentDirection ? '&opponent_on_letters=' + (state.opponentDirection === 'letters' ? 'true' : 'false') : '';
+  const spieltyp = state.useSpieltyp ? '&use_spieltyp=true' : '';
+  ensureDoublePairs();
+  const p2 = state.selectedOwn.filter((id) => !state.doublePair1Ids.includes(String(id)));
+  let pairs;
+  let strongerPair;
+  let fixedDoublesOn = '';
+  let fixedOrder = '';
+  if (state.editMode && state.editDoubles) {
+    pairs = `&own_double_pairs=${encodeURIComponent(`${state.editDoubles.game5.join(',')};${state.editDoubles.game10.join(',')}`)}`;
+    strongerPair = '&stronger_double_pair=1';
+    fixedDoublesOn = '&fixed_doubles_on=5';
+    fixedOrder = `&fixed_own_order=${encodeURIComponent(state.editOwnOrder.join(','))}`;
+  } else {
+    pairs = `&own_double_pairs=${encodeURIComponent(`${state.doublePair1Ids.join(',')};${p2.join(',')}`)}`;
+    strongerPair = `&stronger_double_pair=${state.strongerDoublePair}`;
+  }
+  const ownTeam = `&own_team=${encodeURIComponent(state.ownTeam)}`;
+  return `/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${direction}${spieltyp}${pairs}${strongerPair}${ownTeam}${fixedOrder}${fixedDoublesOn}`;
+}
+
+async function fetchAnalysisResult() {
+  const path = analysisRequestPath();
+  try {
+    return normalizeAnalysisResult(await api(path, { timeoutMs: ANALYSIS_REQUEST_TIMEOUT_MS }));
+  } catch (e) {
+    if (e.message !== '__analysis_timeout__') throw e;
+    return normalizeAnalysisResult(await api(path, { timeoutMs: ANALYSIS_REQUEST_RETRY_TIMEOUT_MS }));
+  }
+}
+
 async function runAnalysis() {
   if (!canAnalyze()) return;
   state.analysisLoading = true;
   syncHeader();
   render();
+  const previous = state.result;
   try {
-    const known = state.selectedOpp.length ? '&actual_opponent_ids=' + encodeURIComponent(state.selectedOpp.join(',')) : '';
-    const home = '&own_is_home=' + (state.ownIsHome ? 'true' : 'false');
-    const direction = state.opponentDirection ? '&opponent_on_letters=' + (state.opponentDirection === 'letters' ? 'true' : 'false') : '';
-    const spieltyp = state.useSpieltyp ? '&use_spieltyp=true' : '';
-    ensureDoublePairs();
-    const p2 = state.selectedOwn.filter((id) => !state.doublePair1Ids.includes(String(id)));
-    let pairs;
-    let strongerPair;
-    let fixedDoublesOn = '';
-    let fixedOrder = '';
-    if (state.editMode && state.editDoubles) {
-      pairs = `&own_double_pairs=${encodeURIComponent(`${state.editDoubles.game5.join(',')};${state.editDoubles.game10.join(',')}`)}`;
-      strongerPair = '&stronger_double_pair=1';
-      fixedDoublesOn = '&fixed_doubles_on=5';
-      fixedOrder = `&fixed_own_order=${encodeURIComponent(state.editOwnOrder.join(','))}`;
-    } else {
-      pairs = `&own_double_pairs=${encodeURIComponent(`${state.doublePair1Ids.join(',')};${p2.join(',')}`)}`;
-      strongerPair = `&stronger_double_pair=${state.strongerDoublePair}`;
-    }
-    const ownTeam = `&own_team=${encodeURIComponent(state.ownTeam)}`;
-    const nextResult = await api(`/api/analysis?own_player_ids=${encodeURIComponent(state.selectedOwn.join(','))}&opponent_team=${encodeURIComponent(state.opponentTeam)}${home}${known}${direction}${spieltyp}${pairs}${strongerPair}${ownTeam}${fixedOrder}${fixedDoublesOn}`, { timeoutMs: 6000 });
+    const nextResult = await fetchAnalysisResult();
     if (state.editMode) {
       state.result = nextResult;
       state.optimalResult = state.optimalResult || nextResult;
@@ -968,7 +1032,18 @@ async function runAnalysis() {
       state.optimalResult = nextResult;
     }
   } catch (e) {
-    state.result = { recommendations: [], message: e.message };
+    const fallback = clientStrengthFallbackResult();
+    if (fallback?.recommendation) {
+      state.result = fallback;
+      if (!state.editMode) state.optimalResult = fallback;
+    } else if (previous?.recommendation) {
+      state.result = {
+        ...previous,
+        warnings: [...(previous.warnings || []), 'Aktualisierung fehlgeschlagen — vorheriges Ergebnis beibehalten.'],
+      };
+    } else {
+      state.result = clientStrengthFallbackResult() || previous;
+    }
   } finally {
     state.analysisLoading = false;
     syncHeader();
