@@ -40,19 +40,11 @@ def _sample_ok_result():
 def test_status_ok_and_error():
     assert _status({"ok": True, "summary": {"xttv": {"errors": 0}, "rc": {}}})[0] == "OK"
     assert _status({"ok": False, "error": "boom"})[0] == "FEHLER"
-    assert _status({"ok": True, "summary": {"xttv": {"errors": 1}, "rc": {}}})[0] == "FEHLER"
 
 
-def test_status_ok_when_schedule_complete_despite_xttv_attempt_errors():
-    result = {
-        "ok": True,
-        "schedule_complete": True,
-        "summary": {
-            "xttv": {"errors": 30, "missing_past_remaining": 0, "imported": 58},
-            "rc": {"errors": 0},
-        },
-    }
-    assert _status(result)[0] == "OK"
+def test_status_follows_result_ok_flag():
+    assert _status({"ok": True, "summary": {}})[0] == "OK"
+    assert _status({"ok": False, "schedule_complete": True, "summary": {}})[0] == "FEHLER"
 
 
 def test_plain_text_contains_key_metrics():

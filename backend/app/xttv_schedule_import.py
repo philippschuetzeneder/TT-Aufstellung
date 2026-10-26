@@ -461,3 +461,20 @@ def drain_schedule_backlog(
         },
         "last_batch": last_batch,
     }
+
+
+def measure_schedule_import_gaps(*, schedule_scope: str = "current") -> dict:
+    """Re-scan XTTV schedules vs DB — authoritative gap counts after a refresh."""
+    discovery = collect_schedule_meids(sjids=sjids_for_scope(schedule_scope))
+    meid_dates: dict[int, date] = discovery.get("meid_dates") or {}
+    missing = [m for m in discovery["meids"] if not _is_imported(m)]
+    eligible = schedule_import_candidates(missing, meid_dates)
+    return {
+        "leagues_checked": discovery["leagues_checked"],
+        "meids_on_schedules": discovery["meids_total"],
+        "missing_remaining": len(missing),
+        "missing_past_remaining": count_missing_past_meids(missing, meid_dates),
+        "missing_future_on_schedule": max(0, len(missing) - len(eligible)),
+        "by_season": discovery.get("by_season") or {},
+        "sjids": discovery.get("sjids") or [],
+    }

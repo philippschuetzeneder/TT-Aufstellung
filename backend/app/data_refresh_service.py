@@ -21,7 +21,7 @@ from .models import PlayerRatingSnapshot, XttvPlayer
 from .rc_import import fetch_player_history, import_rc_player, import_rc_player_updates
 from .rc_matching import apply_matches_all
 from .xttv_db_import import import_new_reports
-from .xttv_schedule_import import drain_schedule_backlog
+from .xttv_schedule_import import drain_schedule_backlog, measure_schedule_import_gaps
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
@@ -127,6 +127,26 @@ def external_ids_from_imported_meids(meids: list[int | str]) -> list[str]:
                 FROM match_players mp
                 JOIN xttv_matches m ON m.id = mp.match_id
                 WHERE m.external_id IN :ids
+                """
+            ).bindparams(bindparam("ids", expanding=True)),
+            {"ids": ids},
+        ).scalars().all()
+    return sorted({str(x) for x in rows if x})
+
+
+def external_ids_without_rc_mapping(external_ids: list[str]) -> list[str]:
+    """Pass-Nr. in scope with no RC player mapping yet."""
+    ids = sorted({str(x) for x in external_ids if x})
+    if not ids:
+        return []
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT external_player_id::text
+                FROM xttv_players
+                WHERE external_player_id::text IN :ids
+                  AND rc_player_id IS NULL
                 """
             ).bindparams(bindparam("ids", expanding=True)),
             {"ids": ids},
@@ -317,6 +337,9 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
         summary["rc_preflight"] = {"ok": rc_ok, "detail": rc_note}
         match_result = apply_matches_all(batch_size=200, import_history=True, only_unmapped=True)
         rc_mapped = int(match_result.get("applied", 0) or 0)
+        if new_meids:
+            extra_map = apply_matches_all(batch_size=200, import_history=True, only_unmapped=True)
+            rc_mapped += int(extra_map.get("applied", 0) or 0)
         stale_after_match = external_ids_needing_rc_after_match()
         from_new_reports = external_ids_from_imported_meids(new_meids)
         player_ids = sorted(set(stale_after_match) | set(from_new_reports))
@@ -352,11 +375,42 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
             }
         else:
             rc_history = _import_rc_for_players(player_ids)
+            if int(rc_history.get("errors") or 0) > 0:
+                retry_ids = sorted(
+                    set(external_ids_needing_rc_after_match()) | set(from_new_reports),
+                )
+                if retry_ids:
+                    retry = _import_rc_for_players(retry_ids)
+                    rc_history["imported"] = int(rc_history.get("imported") or 0) + int(
+                        retry.get("imported") or 0,
+                    )
+                    rc_history["errors"] = int(retry.get("errors") or 0)
+                    rc_history["targets"] = max(
+                        int(rc_history.get("targets") or 0),
+                        int(retry.get("targets") or 0),
+                    )
             summary["rc"] = {
                 "newly_mapped": rc_mapped,
                 "stale_after_match": len(stale_after_match),
                 **rc_history,
             }
+
+        gap_final = measure_schedule_import_gaps(schedule_scope=schedule_scope)
+        missing_remaining = int(gap_final.get("missing_remaining") or 0)
+        missing_past_remaining = int(gap_final.get("missing_past_remaining") or 0)
+        summary["xttv"]["discovery_final"] = gap_final
+        summary["xttv"]["missing_remaining"] = missing_remaining
+        summary["xttv"]["missing_past_remaining"] = missing_past_remaining
+
+        lineup_scope = sorted(
+            set(from_new_reports) | set(external_ids_needing_rc_after_match()),
+        )
+        unmapped_lineup = external_ids_without_rc_mapping(lineup_scope)
+        stale_remaining = external_ids_needing_rc_after_match()
+        summary["rc_verify"] = {
+            "stale_after_match_remaining": len(stale_remaining),
+            "unmapped_lineup_players": len(unmapped_lineup),
+        }
 
         data_changed = bool(new_meids) or rc_history.get("imported", 0) > 0 or rc_mapped > 0
         if data_changed:
@@ -374,11 +428,25 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
             "elapsed_seconds": round(time.monotonic() - started, 1),
         }
 
+    rc_block = summary.get("rc") or {}
+    rc_verify = summary.get("rc_verify") or {}
+    rc_connectivity_skip = bool(rc_block.get("skipped")) and rc_block.get("reason") == "connectivity"
+    rc_errors = int(rc_block.get("errors") or 0)
+    rc_stale_left = int(rc_verify.get("stale_after_match_remaining") or 0)
+    rc_unmapped = int(rc_verify.get("unmapped_lineup_players") or 0)
+
     schedule_complete = missing_past_remaining == 0
+    rc_complete = (
+        not rc_connectivity_skip
+        and rc_errors == 0
+        and rc_stale_left == 0
+        and rc_unmapped == 0
+    )
     result = {
-        "ok": schedule_complete,
+        "ok": schedule_complete and rc_complete,
         "data_changed": data_changed,
         "schedule_complete": schedule_complete,
+        "rc_complete": rc_complete,
         "elapsed_seconds": round(time.monotonic() - started, 1),
         "summary": summary,
         "message": (
@@ -389,11 +457,22 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
             else "Keine neuen Spielberichte gefunden."
         ),
     }
+    warnings: list[str] = []
     if not schedule_complete:
-        result["warning"] = (
+        warnings.append(
             f"Spielplan unvollständig: {missing_past_remaining} vergangene Spiele mit MEID "
-            f"fehlen noch in der DB (gesamt offen: {missing_remaining})."
+            f"fehlen noch in der DB (gesamt offen: {missing_remaining}).",
         )
+    if rc_connectivity_skip:
+        warnings.append("RC nicht erreichbar — keine RC-Updates in diesem Lauf.")
+    elif rc_errors:
+        warnings.append(f"RC-Import: {rc_errors} Fehler.")
+    elif rc_stale_left:
+        warnings.append(f"RC noch veraltet für {rc_stale_left} Spieler nach dem Lauf.")
+    elif rc_unmapped:
+        warnings.append(f"{rc_unmapped} Spieler in Aufstellungen ohne RC-Zuordnung.")
+    if warnings:
+        result["warning"] = " ".join(warnings)
         if not new_meids:
             result["message"] = result["warning"]
 

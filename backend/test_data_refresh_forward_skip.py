@@ -20,8 +20,18 @@ def test_run_data_refresh_skips_forward_while_schedule_backlog(monkeypatch):
         forward_called["n"] += 1
         return {"imported": 99, "imported_meids": [999999]}
 
+    def _gaps(**kwargs):
+        return {
+            "missing_remaining": 3,
+            "missing_past_remaining": 1,
+            "missing_future_on_schedule": 2,
+            "meids_on_schedules": 100,
+            "leagues_checked": 59,
+        }
+
     monkeypatch.setattr("app.data_refresh_service.drain_schedule_backlog", fake_drain)
     monkeypatch.setattr("app.data_refresh_service.import_new_reports", fake_forward)
+    monkeypatch.setattr("app.data_refresh_service.measure_schedule_import_gaps", _gaps)
     monkeypatch.setattr("app.data_refresh_service.check_rc_connectivity", lambda **k: (True, "ok"))
     monkeypatch.setattr("app.data_refresh_service.apply_matches_all", lambda **k: {"applied": 0})
     monkeypatch.setattr(
@@ -32,6 +42,7 @@ def test_run_data_refresh_skips_forward_while_schedule_backlog(monkeypatch):
         "app.data_refresh_service.external_ids_from_imported_meids",
         lambda meids: ["17885"],
     )
+    monkeypatch.setattr("app.data_refresh_service.external_ids_without_rc_mapping", lambda ids: [])
     monkeypatch.setattr("app.data_refresh_service._import_rc_for_players", lambda ids: {
         "imported": len(ids), "errors": 0, "targets": len(ids),
     })
@@ -71,8 +82,18 @@ def test_run_data_refresh_runs_forward_when_only_future_schedule_gaps(monkeypatc
         forward_called["n"] += 1
         return {"imported": 0, "imported_meids": [], "checked": 0, "errors": 0}
 
+    def _gaps(**kwargs):
+        return {
+            "missing_remaining": 5,
+            "missing_past_remaining": 0,
+            "missing_future_on_schedule": 5,
+            "meids_on_schedules": 100,
+            "leagues_checked": 59,
+        }
+
     monkeypatch.setattr("app.data_refresh_service.drain_schedule_backlog", fake_drain)
     monkeypatch.setattr("app.data_refresh_service.import_new_reports", fake_forward)
+    monkeypatch.setattr("app.data_refresh_service.measure_schedule_import_gaps", _gaps)
     monkeypatch.setattr("app.data_refresh_service.check_rc_connectivity", lambda **k: (True, "ok"))
     monkeypatch.setattr("app.data_refresh_service.apply_matches_all", lambda **k: {"applied": 0})
     monkeypatch.setattr(
@@ -80,6 +101,10 @@ def test_run_data_refresh_runs_forward_when_only_future_schedule_gaps(monkeypatc
         lambda **k: [],
     )
     monkeypatch.setattr("app.data_refresh_service.external_ids_from_imported_meids", lambda meids: [])
+    monkeypatch.setattr("app.data_refresh_service.external_ids_without_rc_mapping", lambda ids: [])
+    monkeypatch.setattr("app.data_refresh_service._import_rc_for_players", lambda ids: {
+        "imported": 0, "errors": 0, "targets": 0,
+    })
     monkeypatch.setattr("app.data_refresh_service.clear_analysis_runtime_caches", lambda: None)
     monkeypatch.setattr(
         "app.data_refresh_service.refresh_analysis_cache",
@@ -90,3 +115,4 @@ def test_run_data_refresh_runs_forward_when_only_future_schedule_gaps(monkeypatc
     assert forward_called["n"] == 1
     assert result["ok"] is True
     assert result["schedule_complete"] is True
+    assert result["rc_complete"] is True

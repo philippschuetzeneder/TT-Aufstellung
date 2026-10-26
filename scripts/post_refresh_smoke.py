@@ -36,16 +36,22 @@ def main() -> int:
     past_left = count_missing_past_meids(missing, meid_dates)
     future_left = len(missing) - len(schedule_import_candidates(missing, meid_dates))
 
+    from app.data_refresh_service import external_ids_needing_rc_after_match
+
+    stale_rc = external_ids_needing_rc_after_match()
     report = {
-        "ok": past_left == 0,
+        "ok": past_left == 0 and len(stale_rc) == 0,
         "missing_past_remaining": past_left,
         "missing_future_on_schedule": future_left,
         "missing_total_on_schedule": len(missing),
         "meids_on_schedules": discovery["meids_total"],
+        "rc_stale_after_match": len(stale_rc),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if past_left:
         errors.append(f"{past_left} vergangene Spielplan-MEIDs fehlen noch in der DB")
+    if stale_rc:
+        errors.append(f"{len(stale_rc)} Spieler mit RC älter als letztes Spiel")
     if errors:
         for e in errors:
             print(e, file=sys.stderr)

@@ -101,6 +101,10 @@ PY
       FAILED=true
       FAIL_MSG="Refresh meldet ok=false"
       echo "[weekly-data-refresh] $FAIL_MSG"
+    elif ! "${COMPOSE[@]}" exec -T app python scripts/post_refresh_smoke.py; then
+      FAILED=true
+      FAIL_MSG="Post-Refresh Smoke: Spielplan-Backlog oder RC-Lücken"
+      echo "[weekly-data-refresh] $FAIL_MSG"
     elif python3 - "$RESULT_FILE" <<'PY'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
