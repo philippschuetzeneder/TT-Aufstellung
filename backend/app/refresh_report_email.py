@@ -53,8 +53,16 @@ def _status(result: dict[str, Any]) -> tuple[str, str, str]:
     summary = result.get("summary") or {}
     xttv = summary.get("xttv") or {}
     rc = summary.get("rc") or {}
-    errors = int(xttv.get("errors") or 0) + int(rc.get("errors") or 0)
-    if errors:
+    rc_errors = int(rc.get("errors") or 0)
+    if rc_errors:
+        return "FEHLER", "#c62828", "bad"
+    if result.get("schedule_complete") and int(xttv.get("imported") or 0) >= 0:
+        # XTTV "errors" include not-yet-published reports; not fatal if past backlog is clear.
+        missing_past = int(xttv.get("missing_past_remaining") or 0)
+        if missing_past == 0:
+            return "OK", "#2e7d32", "good"
+    xttv_errors = int(xttv.get("errors") or 0)
+    if xttv_errors:
         return "FEHLER", "#c62828", "bad"
     return "OK", "#2e7d32", "good"
 

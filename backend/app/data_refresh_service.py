@@ -20,8 +20,8 @@ from .db import SessionLocal, create_all
 from .models import PlayerRatingSnapshot, XttvPlayer
 from .rc_import import fetch_player_history, import_rc_player, import_rc_player_updates
 from .rc_matching import apply_matches_all
-from .xttv_db_import import MAX_IMPORT, import_new_reports
-from .xttv_schedule_import import import_missing_schedule_reports
+from .xttv_db_import import import_new_reports
+from .xttv_schedule_import import drain_schedule_backlog
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
@@ -112,6 +112,26 @@ def external_ids_needing_rc_after_match(*, seasons: frozenset[str] | None = None
             {"seasons": season_list},
         ).scalars().all()
     return [str(x) for x in rows if x]
+
+
+def external_ids_from_imported_meids(meids: list[int | str]) -> list[str]:
+    """All lineup players from newly imported XTTV match reports."""
+    ids = [str(m) for m in meids if m]
+    if not ids:
+        return []
+    with SessionLocal() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT DISTINCT mp.external_player_id::text
+                FROM match_players mp
+                JOIN xttv_matches m ON m.id = mp.match_id
+                WHERE m.external_id IN :ids
+                """
+            ).bindparams(bindparam("ids", expanding=True)),
+            {"ids": ids},
+        ).scalars().all()
+    return sorted({str(x) for x in rows if x})
 
 
 def check_rc_connectivity(*, probe_player_id: int = 55291) -> tuple[bool, str]:
@@ -211,6 +231,14 @@ def _schedule_scope() -> str:
     return raw if raw in {"all", "current"} else "current"
 
 
+def _forward_import_limit() -> int:
+    """0 / unset = no cap on forward MEID scan during weekly refresh."""
+    raw = os.environ.get("DATA_REFRESH_FORWARD_LIMIT", "0").strip().lower()
+    if raw in {"", "0", "all", "unlimited", "none"}:
+        return 0
+    return max(int(raw), 1) if raw.isdigit() else 0
+
+
 def run_data_refresh(*, restart_server: bool = False) -> dict:
     """Schedule gaps (current season by default) + forward MEID scan; RC if needed."""
     paused, pause_reason = _refresh_paused()
@@ -226,12 +254,32 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
     create_all()
     started = time.monotonic()
     summary: dict = {}
+    missing_remaining = 0
+    missing_past_remaining = 0
+    schedule: dict = {}
+    forward: dict = {}
+    new_meids: list = []
+    data_changed = False
 
     try:
         schedule_scope = _schedule_scope()
-        schedule = import_missing_schedule_reports(limit=MAX_IMPORT, schedule_scope=schedule_scope)
-        forward_budget = max(0, MAX_IMPORT - int(schedule.get("imported") or 0))
-        forward = import_new_reports(limit=forward_budget or MAX_IMPORT)
+        schedule = drain_schedule_backlog(schedule_scope=schedule_scope)
+        discovery = schedule.get("discovery") or {}
+        missing_remaining = int(discovery.get("missing_remaining") or 0)
+        missing_past_remaining = int(discovery.get("missing_past_remaining") or 0)
+
+        if missing_past_remaining > 0:
+            forward = {
+                "ok": True,
+                "skipped": True,
+                "reason": "schedule_past_backlog",
+                "missing_remaining": missing_remaining,
+                "missing_past_remaining": missing_past_remaining,
+                "imported": 0,
+                "imported_meids": [],
+            }
+        else:
+            forward = import_new_reports(limit=_forward_import_limit())
 
         imported_meids = list(schedule.get("imported_meids") or []) + list(
             forward.get("imported_meids") or []
@@ -246,14 +294,18 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
             "imported": xttv["imported"],
             "imported_meids": imported_meids,
             "schedule_imported": schedule.get("imported", 0),
+            "schedule_rounds": schedule.get("rounds", 0),
             "forward_imported": forward.get("imported", 0),
+            "forward_skipped": bool(forward.get("skipped")),
             "checked": int(schedule.get("checked") or 0) + int(forward.get("checked") or 0),
             "errors": int(schedule.get("errors") or 0) + int(forward.get("errors") or 0),
             "last_known_meid": forward.get("last_known_meid"),
             "max_imported_meid": forward.get("max_imported_meid"),
             "range": forward.get("range"),
-            "discovery": schedule.get("discovery"),
+            "discovery": discovery,
             "schedule_scope": schedule_scope,
+            "missing_remaining": missing_remaining,
+            "missing_past_remaining": missing_past_remaining,
             "stopped_after_empty_streak": bool(forward.get("stopped_after_empty_streak")),
             "scan_frontier_after": forward.get("scan_frontier_after"),
         }
@@ -266,10 +318,13 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
         match_result = apply_matches_all(batch_size=200, import_history=True, only_unmapped=True)
         rc_mapped = int(match_result.get("applied", 0) or 0)
         stale_after_match = external_ids_needing_rc_after_match()
-        player_ids = stale_after_match
+        from_new_reports = external_ids_from_imported_meids(new_meids)
+        player_ids = sorted(set(stale_after_match) | set(from_new_reports))
         summary["rc_plan"] = {
             "stale_after_match": len(stale_after_match),
+            "from_new_reports": len(from_new_reports),
             "new_meids_this_run": len(new_meids),
+            "targets_union": len(player_ids),
         }
         if not rc_ok:
             proxy = os.environ.get("RC_HTTPS_PROXY", "").strip()
@@ -319,18 +374,28 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
             "elapsed_seconds": round(time.monotonic() - started, 1),
         }
 
+    schedule_complete = missing_past_remaining == 0
     result = {
-        "ok": True,
+        "ok": schedule_complete,
         "data_changed": data_changed,
+        "schedule_complete": schedule_complete,
         "elapsed_seconds": round(time.monotonic() - started, 1),
         "summary": summary,
         "message": (
             f"{xttv['imported']} neue Spielberichte importiert "
-            f"(Schedule: {schedule.get('imported', 0)}, Forward-Scan: {forward.get('imported', 0)})."
+            f"(Spielplan-Drain: {schedule.get('imported', 0)} in {schedule.get('rounds', 0)} Runden, "
+            f"Forward: {forward.get('imported', 0)})."
             if new_meids
             else "Keine neuen Spielberichte gefunden."
         ),
     }
+    if not schedule_complete:
+        result["warning"] = (
+            f"Spielplan unvollständig: {missing_past_remaining} vergangene Spiele mit MEID "
+            f"fehlen noch in der DB (gesamt offen: {missing_remaining})."
+        )
+        if not new_meids:
+            result["message"] = result["warning"]
 
     if restart_server and data_changed:
         result["restart_scheduled"] = True

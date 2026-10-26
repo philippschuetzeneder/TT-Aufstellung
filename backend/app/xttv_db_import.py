@@ -452,7 +452,10 @@ def import_new_reports(
     Other valid pages outside the import filter do not count toward the miss streak.
     """
     create_all()
-    limit = min(max(int(limit), 1), MAX_IMPORT)
+    if limit is None or int(limit) <= 0:
+        import_cap = 1_000_000
+    else:
+        import_cap = min(max(int(limit), 1), MAX_IMPORT)
     last_known = _max_imported_meid()
     scan_frontier = _resolve_scan_frontier(last_known)
 
@@ -472,7 +475,7 @@ def import_new_reports(
     frontier_candidate = start - 1
 
     while empty_streak < empty_streak_stop:
-        if len(imported_ids) >= limit:
+        if len(imported_ids) >= import_cap:
             break
         if _is_imported(meid):
             frontier_candidate = meid
@@ -488,7 +491,7 @@ def import_new_reports(
         else:
             empty_streak = 0
             import_succeeded = _try_import_classified(
-                cls, imported_ids, imported_details, import_failures, limit,
+                cls, imported_ids, imported_details, import_failures, import_cap,
             )
         if cls.get("status") == "error":
             errors += 1

@@ -17,10 +17,10 @@ def test_target_seasons_from_rollover():
 
 
 def test_refresh_paused_when_env_set(monkeypatch):
-    monkeypatch.setenv("DATA_REFRESH_NOT_BEFORE", "2026-10-05")
+    monkeypatch.setenv("DATA_REFRESH_NOT_BEFORE", "2099-01-01")
     paused, reason = _refresh_paused()
     assert paused is True
-    assert "2026-10-05" in (reason or "")
+    assert "2099-01-01" in (reason or "")
 
 
 def test_run_data_refresh_skips_during_pause(monkeypatch):

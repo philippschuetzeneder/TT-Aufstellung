@@ -25,8 +25,9 @@ mkdir -p "$LOG_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="${LOG_DIR}/weekly-data-refresh-${STAMP}.log"
 RESULT_FILE="$(mktemp)"
+RESULT_RAW="$(mktemp)"
 PAYLOAD_FILE="$(mktemp)"
-trap 'rm -f "$RESULT_FILE" "$PAYLOAD_FILE"' EXIT
+trap 'rm -f "$RESULT_FILE" "$RESULT_RAW" "$PAYLOAD_FILE"' EXIT
 
 send_report() {
   PAYLOAD_B64="$(base64 -w0 "$PAYLOAD_FILE")"
@@ -67,19 +68,25 @@ print(json.dumps(run_data_refresh(restart_server=False), ensure_ascii=False, def
     echo "[weekly-data-refresh] $FAIL_MSG"
   else
     echo "$RESULT"
-    if ! printf '%s' "$RESULT" | python3 - "$RESULT_FILE" <<'PY'
+    printf '%s' "$RESULT" > "$RESULT_RAW"
+    if ! python3 - "$RESULT_FILE" "$RESULT_RAW" <<'PY'
 import json, sys
 from pathlib import Path
-raw = sys.stdin.read()
+raw = Path(sys.argv[2]).read_text(encoding="utf-8")
 json_line = None
 for line in raw.splitlines():
     s = line.strip()
     if s.startswith("{"):
         json_line = s
 if not json_line:
+    start = raw.rfind("{")
+    if start >= 0:
+        json_line = raw[start:].strip()
+if not json_line:
     print("[weekly-data-refresh] Keine JSON-Zeile in run_data_refresh-Ausgabe", file=sys.stderr)
     raise SystemExit(2)
 Path(sys.argv[1]).write_text(json_line, encoding="utf-8")
+json.loads(json_line)
 PY
     then
       FAILED=true

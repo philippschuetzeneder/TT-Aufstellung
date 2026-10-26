@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 import time
 import urllib.request
+from datetime import date
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -48,17 +50,104 @@ def _fetch_html(url: str, *, timeout: int = 90) -> str:
         )
 
 
-def parse_meids_from_html(html: str) -> list[int]:
-    """Extract unique MEIDs from any XTTV HTML (schedule or index)."""
+_SCHEDULE_DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+
+
+def _parse_first_date(text: str) -> date | None:
+    match = _SCHEDULE_DATE_RE.search(text or "")
+    if not match:
+        return None
+    day, month, year = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _schedule_block_for_meid_anchor(anchor) -> str:
+    """XTTV spielplan: dates live on li.gameSummary; nested result lines also link meid."""
+    node = anchor
+    for _ in range(12):
+        if node is None:
+            break
+        classes = node.get("class") or []
+        if node.name == "li" and "gameSummary" in classes:
+            date_span = node.find(class_="spieldatum_datum")
+            if date_span:
+                return date_span.get_text(" ", strip=True)
+            return node.get_text(" ", strip=True)
+        if node.name == "tr" and "resultDetailLine" not in classes:
+            return node.get_text(" ", strip=True)
+        node = node.parent
+    if anchor.parent:
+        return anchor.parent.get_text(" ", strip=True)
+    return ""
+
+
+def parse_schedule_entries(html: str) -> list[tuple[int, date | None]]:
+    """MEIDs from schedule/spielplan rows with best-effort match date from row text."""
+    soup = BeautifulSoup(html, "html.parser")
+    entries: list[tuple[int, date | None]] = []
     seen: set[int] = set()
-    ordered: list[int] = []
-    for meid_raw in re.findall(r"meid=(\d+)", html, re.I):
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if "meid" not in href.lower():
+            continue
+        params = parse_qs(urlparse(urljoin(BASE, href)).query)
+        meid_raw = params.get("meid", [None])[0]
+        if not meid_raw or not str(meid_raw).isdigit():
+            continue
         meid = int(meid_raw)
         if meid in seen:
             continue
         seen.add(meid)
-        ordered.append(meid)
-    return ordered
+        context = _schedule_block_for_meid_anchor(anchor)
+        entries.append((meid, _parse_first_date(context)))
+    return entries
+
+
+def parse_meids_from_html(html: str) -> list[int]:
+    """Extract unique MEIDs from any XTTV HTML (schedule or index)."""
+    return [meid for meid, _ in parse_schedule_entries(html)]
+
+
+def schedule_import_candidates(
+    missing: list[int],
+    meid_dates: dict[int, date],
+    *,
+    today: date | None = None,
+) -> list[int]:
+    """MEIDs worth importing: played matches (incl. today) and undated schedule links.
+
+    Future-dated fixtures stay on the XTTV plan but have no Spielbericht yet — skip them.
+    """
+    ref = today or date.today()
+    out: list[int] = []
+    for meid in missing:
+        meid = int(meid)
+        match_day = meid_dates.get(meid)
+        if match_day is None or match_day <= ref:
+            out.append(meid)
+    return out
+
+
+def prioritize_missing_meids(
+    missing: list[int],
+    meid_dates: dict[int, date],
+    *,
+    today: date | None = None,
+) -> list[int]:
+    """Newest played match first; undated MEIDs after that (higher MEID first)."""
+    ref = today or date.today()
+    candidates = schedule_import_candidates(missing, meid_dates, today=ref)
+
+    def sort_key(meid: int) -> tuple:
+        match_day = meid_dates.get(meid)
+        if match_day is None:
+            return (1, -meid)
+        return (0, -match_day.toordinal(), meid)
+
+    return sorted({int(m) for m in candidates}, key=sort_key)
 
 
 def league_index(sjid: int) -> list[tuple[int, str]]:
@@ -83,13 +172,17 @@ def league_index(sjid: int) -> list[tuple[int, str]]:
     return sorted(out, key=lambda x: x[1])
 
 
-def schedule_meids_for_lid(lid: int, sjid: int, *, limit: int = 500) -> list[int]:
+def schedule_entries_for_lid(lid: int, sjid: int, *, limit: int = 500) -> list[tuple[int, date | None]]:
     url = (
         f"{BASE}index.php?oid=191&sjid={sjid}&do=spiele&showMenu=Y&lid={lid}"
         f"&zeit=all&limit={limit}"
     )
     html = _fetch_html(url)
-    return parse_meids_from_html(html)
+    return parse_schedule_entries(html)
+
+
+def schedule_meids_for_lid(lid: int, sjid: int, *, limit: int = 500) -> list[int]:
+    return [meid for meid, _ in schedule_entries_for_lid(lid, sjid, limit=limit)]
 
 
 def sjids_for_scope(scope: str) -> list[int] | None:
@@ -116,6 +209,7 @@ def collect_schedule_meids(*, sjids: list[int] | None = None) -> dict:
 
     by_season: dict[int, dict] = {}
     all_meids: set[int] = set()
+    meid_dates: dict[int, date] = {}
     leagues_checked = 0
 
     for sjid in sjids:
@@ -131,8 +225,13 @@ def collect_schedule_meids(*, sjids: list[int] | None = None) -> dict:
         total_leagues = len(leagues)
         for idx, (lid, label) in enumerate(leagues, start=1):
             try:
-                meids = schedule_meids_for_lid(lid, sjid)
-                season_meids.update(meids)
+                entries = schedule_entries_for_lid(lid, sjid)
+                for meid, match_day in entries:
+                    season_meids.add(meid)
+                    if match_day is not None and (
+                        meid not in meid_dates or match_day > meid_dates[meid]
+                    ):
+                        meid_dates[meid] = match_day
                 leagues_checked += 1
             except Exception as exc:
                 logger.warning("XTTV schedule lid=%s sjid=%s failed: %s", lid, sjid, exc)
@@ -157,8 +256,44 @@ def collect_schedule_meids(*, sjids: list[int] | None = None) -> dict:
         "leagues_checked": leagues_checked,
         "meids_total": len(all_meids),
         "meids": sorted(all_meids),
+        "meid_dates": meid_dates,
         "by_season": by_season,
     }
+
+
+# Weekly refresh: import every eligible schedule MEID (no 200 cap). Manual/UI may still pass a limit.
+_SCHEDULE_IMPORT_UNLIMITED = 1_000_000
+
+
+def _schedule_batch_size() -> int:
+    """0 / unset = no per-round cap (import all eligible missing MEIDs)."""
+    raw = os.environ.get("DATA_REFRESH_BATCH_SIZE", "0").strip().lower()
+    if raw in {"", "0", "all", "unlimited", "none"}:
+        return _SCHEDULE_IMPORT_UNLIMITED
+    if raw.isdigit():
+        return max(int(raw), 1)
+    return _SCHEDULE_IMPORT_UNLIMITED
+
+
+def _schedule_max_rounds() -> int:
+    """0 / unset = keep draining until no eligible backlog or no progress."""
+    raw = os.environ.get("DATA_REFRESH_SCHEDULE_MAX_ROUNDS", "0").strip().lower()
+    if raw in {"", "0", "all", "unlimited", "none"}:
+        return 10_000
+    return max(1, int(raw)) if raw.isdigit() else 10_000
+
+
+def count_missing_past_meids(
+    missing: list[int],
+    meid_dates: dict[int, date],
+    *,
+    today: date | None = None,
+) -> int:
+    ref = today or date.today()
+    return sum(
+        1 for meid in missing
+        if (d := meid_dates.get(meid)) is not None and d <= ref
+    )
 
 
 def import_meid_batch(
@@ -166,8 +301,8 @@ def import_meid_batch(
     *,
     limit: int,
 ) -> dict:
-    """Try to import up to ``limit`` MEIDs from ``missing`` (newest-first list)."""
-    limit = min(max(int(limit), 0), MAX_IMPORT)
+    """Try to import MEIDs from ``missing`` (newest played first). ``limit`` may be large for weekly runs."""
+    limit = max(int(limit), 0) or _SCHEDULE_IMPORT_UNLIMITED
     imported_ids: list[int] = []
     imported_details: list[dict] = []
     import_failures: list[dict] = []
@@ -211,15 +346,14 @@ def import_missing_schedule_reports(
     *,
     limit: int = MAX_IMPORT,
     schedule_scope: str = "current",
+    discovery: dict | None = None,
 ) -> dict:
-    """Import Spielberichte for schedule MEIDs that are not yet in the DB."""
+    """Import one batch of schedule MEIDs not yet in the DB (date-prioritized)."""
     create_all()
-    discovery = collect_schedule_meids(sjids=sjids_for_scope(schedule_scope))
-    schedule_meids = discovery["meids"]
-    missing = sorted(
-        (m for m in schedule_meids if not _is_imported(m)),
-        reverse=True,
-    )
+    discovery = discovery or collect_schedule_meids(sjids=sjids_for_scope(schedule_scope))
+    meid_dates = discovery.get("meid_dates") or {}
+    missing_all = [m for m in discovery["meids"] if not _is_imported(m)]
+    missing = prioritize_missing_meids(missing_all, meid_dates)
     batch = import_meid_batch(missing, limit=limit)
 
     return {
@@ -230,6 +364,7 @@ def import_missing_schedule_reports(
             "leagues_checked": discovery["leagues_checked"],
             "meids_on_schedules": discovery["meids_total"],
             "missing_in_db": len(missing),
+            "missing_past": count_missing_past_meids(missing, meid_dates),
             "by_season": discovery["by_season"],
             "sjids": discovery["sjids"],
         },
@@ -240,42 +375,52 @@ def import_missing_schedule_reports(
 def drain_schedule_backlog(
     *,
     schedule_scope: str = "all",
-    batch_size: int = MAX_IMPORT,
-    max_rounds: int = 50,
+    batch_size: int | None = None,
+    max_rounds: int | None = None,
 ) -> dict:
-    """Repeat schedule imports until no new reports or rounds exhausted (one discovery pass)."""
+    """Repeat date-prioritized schedule imports until backlog cleared or no progress."""
     create_all()
+    batch_size = batch_size if batch_size is not None else _schedule_batch_size()
+    max_rounds = max_rounds if max_rounds is not None else _schedule_max_rounds()
     print(
         f"[xttv-schedule] Index/Spielpläne laden (scope={schedule_scope}) …",
         file=sys.stderr,
         flush=True,
     )
     discovery = collect_schedule_meids(sjids=sjids_for_scope(schedule_scope))
-    missing = sorted(
-        (m for m in discovery["meids"] if not _is_imported(m)),
-        reverse=True,
-    )
+    meid_dates: dict[int, date] = discovery.get("meid_dates") or {}
+    missing_all = [m for m in discovery["meids"] if not _is_imported(m)]
+    missing_past_start = count_missing_past_meids(missing_all, meid_dates)
+    missing_future = len(missing_all) - len(schedule_import_candidates(missing_all, meid_dates))
     print(
         f"[xttv-schedule] {discovery['meids_total']} MEIDs auf Plänen, "
-        f"{len(missing)} fehlen in DB — Import startet …",
+        f"{len(missing_all)} fehlen ({missing_past_start} vergangen, "
+        f"{missing_future} zukünftig ohne Bericht) — Import …",
         file=sys.stderr,
         flush=True,
     )
     total_imported: list[int] = []
     rounds = 0
     total_errors = 0
+    total_checked = 0
     last_batch: dict = {}
+    missing = list(missing_all)
 
-    while missing and rounds < max_rounds:
+    while rounds < max_rounds:
+        eligible = schedule_import_candidates(missing, meid_dates)
+        if not eligible:
+            break
         rounds += 1
+        ordered = prioritize_missing_meids(eligible, meid_dates)
         print(
-            f"[xttv-schedule] Runde {rounds}: noch {len(missing)} Kandidaten …",
+            f"[xttv-schedule] Runde {rounds}: {len(ordered)} importierbare MEIDs …",
             file=sys.stderr,
             flush=True,
         )
-        batch = import_meid_batch(missing, limit=batch_size)
+        batch = import_meid_batch(ordered, limit=batch_size)
         last_batch = batch
         total_errors += int(batch.get("errors") or 0)
+        total_checked += int(batch.get("checked") or 0)
         print(
             f"[xttv-schedule] Runde {rounds}: +{batch.get('imported', 0)} importiert, "
             f"geprüft {batch.get('checked', 0)}",
@@ -286,8 +431,12 @@ def drain_schedule_backlog(
             break
         total_imported.extend(batch["imported_meids"])
         imported_set = set(total_imported)
-        missing = [m for m in missing if m not in imported_set and not _is_imported(m)]
+        missing = [
+            m for m in missing
+            if m not in imported_set and not _is_imported(m)
+        ]
 
+    missing_past_remaining = count_missing_past_meids(missing, meid_dates)
     return {
         "ok": True,
         "mode": "schedule_drain",
@@ -295,12 +444,20 @@ def drain_schedule_backlog(
         "rounds": rounds,
         "imported": len(total_imported),
         "imported_meids": total_imported,
+        "checked": total_checked,
         "errors": total_errors,
         "discovery": {
             "leagues_checked": discovery["leagues_checked"],
             "meids_on_schedules": discovery["meids_total"],
             "missing_remaining": len(missing),
+            "missing_future_on_schedule": max(
+                0,
+                len(missing) - len(schedule_import_candidates(missing, meid_dates)),
+            ),
+            "missing_past_remaining": missing_past_remaining,
+            "missing_past_at_start": missing_past_start,
             "by_season": discovery["by_season"],
+            "sjids": discovery["sjids"],
         },
         "last_batch": last_batch,
     }
