@@ -9,8 +9,8 @@ from sqlalchemy import text
 
 from app.db import SessionLocal
 from app.xttv_schedule_import import (
+    classify_past_schedule_gaps,
     collect_schedule_meids,
-    count_missing_past_meids,
     schedule_import_candidates,
     sjids_for_scope,
 )
@@ -33,7 +33,8 @@ def main() -> int:
             if ext_id and str(ext_id).isdigit():
                 imported.add(int(ext_id))
     missing = [m for m in discovery["meids"] if m not in imported]
-    past_left = count_missing_past_meids(missing, meid_dates)
+    gaps = classify_past_schedule_gaps(missing, meid_dates)
+    past_left = int(gaps["missing_past_remaining"])
     future_left = len(missing) - len(schedule_import_candidates(missing, meid_dates))
 
     from app.data_refresh_service import external_ids_needing_rc_after_match
@@ -42,6 +43,7 @@ def main() -> int:
     report = {
         "ok": past_left == 0 and len(stale_rc) == 0,
         "missing_past_remaining": past_left,
+        "skipped_nonconform": int(gaps["skipped_nonconform"]),
         "missing_future_on_schedule": future_left,
         "missing_total_on_schedule": len(missing),
         "meids_on_schedules": discovery["meids_total"],

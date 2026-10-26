@@ -55,7 +55,29 @@ def test_prioritize_missing_meids_newest_past_first_excludes_future():
     assert ordered == [462244, 462248, 460000]
 
 
-def test_count_missing_past_meids():
+def test_classify_past_schedule_gaps_ignores_nonconform(monkeypatch):
+    from app import xttv_schedule_import as mod
+
+    def classify(meid, check_db=False):
+        if meid == 461346:
+            return {"status": "parse_error", "importable": False, "miss": False}
+        if meid == 467535:
+            return {"status": "valid_outside_filter", "importable": False, "miss": False}
+        return {"status": "importable", "importable": True, "miss": False, "meid": meid}
+
+    monkeypatch.setattr(mod, "_classify_meid", classify)
+    gaps = mod.classify_past_schedule_gaps(
+        [461346, 467535, 462244],
+        {
+            461346: date(2026, 10, 23),
+            467535: date(2026, 9, 25),
+            462244: date(2026, 10, 23),
+        },
+        today=date(2026, 10, 26),
+    )
+    assert gaps["skipped_nonconform"] == 2
+    assert gaps["missing_past_meids"] == [462244]
+    assert gaps["missing_past_remaining"] == 1
     meid_dates = {1: date(2026, 10, 1), 2: date(2026, 11, 1)}
     assert count_missing_past_meids([1, 2], meid_dates, today=date(2026, 10, 26)) == 1
 

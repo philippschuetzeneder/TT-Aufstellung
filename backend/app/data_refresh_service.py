@@ -460,8 +460,8 @@ def run_data_refresh(*, restart_server: bool = False) -> dict:
     warnings: list[str] = []
     if not schedule_complete:
         warnings.append(
-            f"Spielplan unvollständig: {missing_past_remaining} vergangene Spiele mit MEID "
-            f"fehlen noch in der DB (gesamt offen: {missing_remaining}).",
+            f"Spielplan unvollständig: {missing_past_remaining} importierbare vergangene Spiele "
+            f"fehlen noch in der DB (Spielplan-Einträge gesamt offen: {missing_remaining}).",
         )
     if rc_connectivity_skip:
         warnings.append("RC nicht erreichbar — keine RC-Updates in diesem Lauf.")

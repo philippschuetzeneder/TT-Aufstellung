@@ -296,6 +296,51 @@ def count_missing_past_meids(
     )
 
 
+# Reports that exist on XTTV but are not OÖ 4er-Mannschaft matches we store.
+_NONCONFORM_STATUSES = frozenset({"valid_outside_filter", "invalid_report", "parse_error"})
+
+
+def _is_nonconform_skip(cls: dict) -> bool:
+    return cls.get("status") in _NONCONFORM_STATUSES
+
+
+def past_meids(
+    missing: list[int],
+    meid_dates: dict[int, date],
+    *,
+    today: date | None = None,
+) -> list[int]:
+    ref = today or date.today()
+    return [
+        int(meid)
+        for meid in missing
+        if (d := meid_dates.get(int(meid))) is not None and d <= ref
+    ]
+
+
+def classify_past_schedule_gaps(
+    missing: list[int],
+    meid_dates: dict[int, date],
+    *,
+    today: date | None = None,
+) -> dict:
+    """Split dated past MEIDs into real import gaps vs correctly skipped non-OÖ reports."""
+    blocking: list[int] = []
+    nonconform: list[int] = []
+    for meid in past_meids(missing, meid_dates, today=today):
+        cls = _classify_meid(meid, check_db=False)
+        if _is_nonconform_skip(cls):
+            nonconform.append(meid)
+        else:
+            blocking.append(meid)
+    return {
+        "missing_past_remaining": len(blocking),
+        "missing_past_meids": blocking,
+        "skipped_nonconform": len(nonconform),
+        "skipped_nonconform_meids": nonconform,
+    }
+
+
 def import_meid_batch(
     missing: list[int],
     *,
@@ -307,6 +352,7 @@ def import_meid_batch(
     imported_details: list[dict] = []
     import_failures: list[dict] = []
     checked = errors = skipped_not_ready = 0
+    skipped_nonconform: list[int] = []
 
     for meid in missing:
         if len(imported_ids) >= limit:
@@ -314,6 +360,10 @@ def import_meid_batch(
         checked += 1
         cls = _classify_meid(meid, check_db=True)
         if cls.get("status") == "already_imported":
+            continue
+        if _is_nonconform_skip(cls):
+            skipped_nonconform.append(int(meid))
+            time.sleep(REQUEST_DELAY)
             continue
         if cls.get("miss") and cls.get("reason") == "not_yet":
             skipped_not_ready += 1
@@ -324,8 +374,6 @@ def import_meid_batch(
             cls, imported_ids, imported_details, import_failures, limit,
         )
         if cls.get("status") == "error":
-            errors += 1
-        if cls.get("status") in {"parse_error", "invalid_report"}:
             errors += 1
         if not import_succeeded and cls.get("importable"):
             errors += 1
@@ -339,6 +387,7 @@ def import_meid_batch(
         "import_failures": import_failures,
         "errors": errors,
         "skipped_not_ready": skipped_not_ready,
+        "skipped_nonconform_meids": skipped_nonconform,
     }
 
 
@@ -404,6 +453,7 @@ def drain_schedule_backlog(
     total_errors = 0
     total_checked = 0
     last_batch: dict = {}
+    skipped_nonconform: set[int] = set()
     missing = list(missing_all)
 
     while rounds < max_rounds:
@@ -419,6 +469,7 @@ def drain_schedule_backlog(
         )
         batch = import_meid_batch(ordered, limit=batch_size)
         last_batch = batch
+        skipped_nonconform.update(int(m) for m in batch.get("skipped_nonconform_meids") or [])
         total_errors += int(batch.get("errors") or 0)
         total_checked += int(batch.get("checked") or 0)
         print(
@@ -436,7 +487,9 @@ def drain_schedule_backlog(
             if m not in imported_set and not _is_imported(m)
         ]
 
-    missing_past_remaining = count_missing_past_meids(missing, meid_dates)
+    missing_past_remaining = sum(
+        1 for meid in past_meids(missing, meid_dates) if meid not in skipped_nonconform
+    )
     return {
         "ok": True,
         "mode": "schedule_drain",
@@ -455,6 +508,7 @@ def drain_schedule_backlog(
                 len(missing) - len(schedule_import_candidates(missing, meid_dates)),
             ),
             "missing_past_remaining": missing_past_remaining,
+            "skipped_nonconform": len(skipped_nonconform),
             "missing_past_at_start": missing_past_start,
             "by_season": discovery["by_season"],
             "sjids": discovery["sjids"],
@@ -469,11 +523,14 @@ def measure_schedule_import_gaps(*, schedule_scope: str = "current") -> dict:
     meid_dates: dict[int, date] = discovery.get("meid_dates") or {}
     missing = [m for m in discovery["meids"] if not _is_imported(m)]
     eligible = schedule_import_candidates(missing, meid_dates)
+    gaps = classify_past_schedule_gaps(missing, meid_dates)
     return {
         "leagues_checked": discovery["leagues_checked"],
         "meids_on_schedules": discovery["meids_total"],
         "missing_remaining": len(missing),
-        "missing_past_remaining": count_missing_past_meids(missing, meid_dates),
+        "missing_past_remaining": gaps["missing_past_remaining"],
+        "missing_past_meids": gaps["missing_past_meids"],
+        "skipped_nonconform": gaps["skipped_nonconform"],
         "missing_future_on_schedule": max(0, len(missing) - len(eligible)),
         "by_season": discovery.get("by_season") or {},
         "sjids": discovery.get("sjids") or [],
