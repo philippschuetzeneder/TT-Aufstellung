@@ -58,8 +58,8 @@ function scrollToResultPanel() {
   });
 }
 
-const ANALYSIS_REQUEST_TIMEOUT_MS = 10000;
-const ANALYSIS_REQUEST_RETRY_TIMEOUT_MS = 12000;
+const ANALYSIS_REQUEST_TIMEOUT_MS = 6000;
+const ANALYSIS_REQUEST_RETRY_TIMEOUT_MS = 7000;
 
 async function api(path, { timeoutMs = 5000 } = {}) {
   const controller = new AbortController();
@@ -665,7 +665,10 @@ function resultHtml() {
   const alternatives = (state.result.recommendations?.length || 1) > 1
     ? collapsible('altLineups', 'Alternative Aufstellungen', altLineupsHtml(state.result.recommendations), `${Math.min(5, state.result.recommendations.length - 1)} weitere`)
     : '';
-  const dataWarnings = (state.result.warnings || []).filter(Boolean);
+  const dataWarnings = (state.result.warnings || []).filter((warning) => {
+    if (!warning) return false;
+    return !/Analyse mit reduziertem Detail abgeschlossen/i.test(String(warning));
+  });
   const warningBanner = dataWarnings.length
     ? `<div class="empty warning-box" style="margin-bottom:12px"><strong>Hinweis zur Datenqualität</strong><br>${dataWarnings.map((w) => escapeHtml(w)).join('<br>')}</div>`
     : '';

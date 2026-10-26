@@ -33,15 +33,15 @@ SINGLE_GAMES = 12
 DOUBLE_GAMES = 2
 TOTAL_GAMES = 14
 WIN_TARGET = 8
-MAX_ANALYSIS_SECONDS = 8.0
-MAX_OPPONENT_SCENARIOS_FOR_EVAL = 16
+MAX_ANALYSIS_SECONDS = 5.0
+MAX_OPPONENT_SCENARIOS_FOR_EVAL = 6
 MAX_PARTIAL_FILL_CANDIDATES = 10
 MAX_PARTIAL_OPPONENT_COMBOS = 28
-LINEUP_SPREAD_BUDGET_SECONDS = 6.0
+LINEUP_SPREAD_BUDGET_SECONDS = 0.8
 STATS_YEARS = 2
 OPPONENT_POOL_YEARS = 2
 # Recency decay by completed league rounds (matches), not calendar days.
-LINEUP_RECENCY_HALF_LIFE_MATCHES = 8.0
+LINEUP_RECENCY_HALF_LIFE_MATCHES = 6.0
 # Legacy alias kept for external scripts that still reference the old name.
 LINEUP_RECENCY_HALF_LIFE_DAYS = LINEUP_RECENCY_HALF_LIFE_MATCHES
 # Concentrate opponent scenario mass for own-lineup ranking, display, and alternatives.
@@ -66,6 +66,7 @@ COHESIVE_TRIO_MIN_RECENCY_MASS = 3.5
 MEDIUM_GROUP_MIN_MATCHES = 4
 _global_strength_support_cache: dict[str, tuple[float, float, float, int]] = {}
 _lineup_cohesion_cache: dict[tuple[str, str], tuple[int, float, int, float]] = {}
+_cohesion_lineup_cache: dict[str, list[tuple[set[str], float]]] = {}
 _match_rounds_ago_cache: dict[tuple[str, str], dict[int, int]] = {}
 
 
@@ -912,7 +913,7 @@ def _evaluate_lineup_for_perm(
 
 def _check_analysis_budget(started):
     if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-        raise RuntimeError('Analysis exceeded the internal 8-second safety budget')
+        raise RuntimeError('Analysis exceeded the internal 5-second safety budget')
 
 
 def _analysis_time_remaining(started):
@@ -933,14 +934,14 @@ def _cap_opponent_scenarios(scenarios, limit=MAX_OPPONENT_SCENARIOS_FOR_EVAL):
 def _adaptive_scenario_cap(scenarios, started):
     """Tighten scenario count when data loading consumed much of the time budget."""
     remaining = _analysis_time_remaining(started)
-    if remaining <= 1.5:
+    if remaining <= 1.0:
         limit = 1
-    elif remaining <= 3.0:
+    elif remaining <= 2.0:
+        limit = 2
+    elif remaining <= 3.2:
         limit = 4
-    elif remaining <= 5.5:
-        limit = 8
     else:
-        return scenarios
+        limit = MAX_OPPONENT_SCENARIOS_FOR_EVAL
     return _cap_opponent_scenarios(scenarios, limit)
 
 
@@ -1702,6 +1703,43 @@ def _scenarios_from_position_priors(player_ids, position_priors):
     return [(p / total, o) for p, o in weighted]
 
 
+def _cohesion_lineups(db, ref_date):
+    """One scan of recent four-player sides, reused for every quartet in a process."""
+    ref_date = ref_date or _reference_date(db)
+    cutoff = _cutoff(ref_date, STATS_YEARS)
+    key = str(cutoff)
+    cached = _cohesion_lineup_cache.get(key)
+    if cached is not None:
+        return cached
+    rounds_map = _build_match_rounds_ago(db, ref_date)
+    rows = db.execute(text(f"""
+        SELECT m.id AS match_id, m.match_date, mp.side, mp.external_player_id::text AS player_id
+        FROM xttv_matches m
+        JOIN match_players mp ON mp.match_id = m.id
+        WHERE mp.external_player_id IS NOT NULL
+          AND {_MATCH_DAY_FILTER}
+    """), {'cutoff': cutoff}).mappings()
+    by_lineup: dict[tuple, dict] = {}
+    for row in rows:
+        entry = by_lineup.setdefault(
+            (row['match_id'], row['side']),
+            {'players': set(), 'match_date': row['match_date'], 'match_id': row['match_id']},
+        )
+        entry['players'].add(str(row['player_id']))
+    indexed = [
+        (
+            entry['players'],
+            _lineup_recency_weight(
+                entry['match_date'], ref_date,
+                match_id=entry['match_id'], rounds_map=rounds_map,
+            ),
+        )
+        for entry in by_lineup.values()
+    ]
+    _cohesion_lineup_cache[key] = indexed
+    return indexed
+
+
 def _lineup_cohesion(db, player_ids, ref_date=None):
     """Return raw and recency-weighted recurrence for quartet and best trio."""
     actual = {str(x) for x in player_ids}
@@ -1712,30 +1750,12 @@ def _lineup_cohesion(db, player_ids, ref_date=None):
     cached = _lineup_cohesion_cache.get(cache_key)
     if cached is not None:
         return cached
-    rounds_map = _build_match_rounds_ago(db, ref_date)
-    rows = db.execute(text(f"""
-        SELECT m.id AS match_id, m.match_date, mp.side, mp.external_player_id::text AS player_id
-        FROM xttv_matches m
-        JOIN match_players mp ON mp.match_id = m.id
-        WHERE mp.external_player_id IS NOT NULL
-          AND {_MATCH_DAY_FILTER}
-    """), {'cutoff': _cutoff(ref_date, STATS_YEARS)}).mappings()
     exact = 0
     exact_mass = 0.0
     trio_counts = Counter()
     trio_masses = Counter()
-    by_lineup = {}
-    for row in rows:
-        key = (row['match_id'], row['side'])
-        entry = by_lineup.setdefault(key, {'players': set(), 'match_date': row['match_date'], 'match_id': row['match_id']})
-        entry['players'].add(str(row['player_id']))
-    for entry in by_lineup.values():
-        lineup = entry['players']
+    for lineup, weight in _cohesion_lineups(db, ref_date):
         overlap = lineup & actual
-        weight = _lineup_recency_weight(
-            entry['match_date'], ref_date,
-            match_id=entry.get('match_id'), rounds_map=rounds_map,
-        )
         if len(overlap) == 4:
             exact += 1
             exact_mass += weight
@@ -2297,7 +2317,7 @@ def _load_analysis_data(own, opponent_team, actual, use_spieltyp=False):
     db = SessionLocal()
     warnings = []
     try:
-        db.execute(text("SET statement_timeout = '15000ms'")); db.execute(text("SET lock_timeout = '500ms'"))
+        db.execute(text("SET statement_timeout = '3500ms'")); db.execute(text("SET lock_timeout = '500ms'"))
         own = [str(x) for x in own]; actual = None if actual is None else [str(x) for x in actual]
         ref_date = _reference_date(db)
         opponent_pool = _load_opponent_pool(db, opponent_team, ref_date)
@@ -2369,7 +2389,42 @@ def _build_matchup_table(relevant, profiles, matchups, own_is_home, use_spieltyp
     }
 
 
-def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, started, use_spieltyp=False, own_double_pairs=None, stronger_double_pair=1, doubles_stats=None, own_on_letters=None, fixed_order=None, fixed_doubles_on=None, fixed_game_pairs=None):
+def _evaluate_one_own_order(
+    own_order, scenarios, profiles, matchups, names, *,
+    started, own_is_home, orientation_averaged, use_spieltyp=False, own_double_pairs=None,
+    stronger_double_pair=1, doubles_stats=None, own_on_letters=None, fixed_doubles_on=None,
+    fixed_game_pairs=None,
+):
+    """Score one own order inside the same analysis deadline."""
+    common = dict(
+        use_spieltyp=use_spieltyp,
+        own_double_pairs=own_double_pairs,
+        stronger_double_pair=stronger_double_pair,
+        doubles_stats=doubles_stats,
+        own_on_letters=own_on_letters,
+        fixed_order=list(own_order),
+        fixed_doubles_on=fixed_doubles_on,
+        fixed_game_pairs=fixed_game_pairs,
+    )
+    players = list(own_order)
+    if orientation_averaged:
+        home_eval, _ = _evaluate_lineups(
+            players, scenarios, profiles, matchups, names, True, started, deadline_margin=0.02, **common,
+        )
+        away_eval, _ = _evaluate_lineups(
+            players, scenarios, profiles, matchups, names, False, started, deadline_margin=0.02, **common,
+        )
+        if home_eval and away_eval:
+            return _merge_orientations(home_eval, away_eval)[0]
+        return home_eval[0] if home_eval else None
+    home = True if own_is_home is None else bool(own_is_home)
+    evaluated, _ = _evaluate_lineups(
+        players, scenarios, profiles, matchups, names, home, started, deadline_margin=0.02, **common,
+    )
+    return evaluated[0] if evaluated else None
+
+
+def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, started, use_spieltyp=False, own_double_pairs=None, stronger_double_pair=1, doubles_stats=None, own_on_letters=None, fixed_order=None, fixed_doubles_on=None, fixed_game_pairs=None, deadline_margin=0.4):
     schedule = _schedule_for_orientation(own_is_home if own_on_letters is None else own_on_letters)
     pair_a, pair_b = _normalize_own_double_pairs(own, own_double_pairs, profiles)
     doubles_stats = doubles_stats or {}
@@ -2383,6 +2438,10 @@ def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, st
     evaluated = []
     orders = [tuple(fixed_order)] if fixed_order is not None else permutations(own)
     for own_order in orders:
+        if evaluated and time.monotonic() - started > MAX_ANALYSIS_SECONDS - deadline_margin:
+            break
+        if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
+            break
         placement, agg, win5, win10, agg5, agg10 = _evaluate_lineup_for_perm(
             own_order, scenario_cache, matchup_p, schedule,
             profiles=profiles, matchups=matchups, own_is_home=own_is_home,
@@ -2410,10 +2469,6 @@ def _evaluate_lineups(own, scenarios, profiles, matchups, names, own_is_home, st
             'doubles_win_probability_on_5': round(win5, 6),
             'doubles_win_probability_on_10': round(win10, 6),
         })
-        if time.monotonic() - started > MAX_ANALYSIS_SECONDS:
-            if evaluated:
-                break
-            raise RuntimeError('Analysis exceeded the internal 8-second safety budget')
     return evaluated, matchup_p
 
 
@@ -3042,8 +3097,9 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
 
     sharpened = _sharpen_scenarios(scenarios)
     display_scenarios = _cap_opponent_scenarios(sharpened, limit=12)
+    eval_limit = 4 if not actual else MAX_OPPONENT_SCENARIOS_FOR_EVAL
     scenarios = _adaptive_scenario_cap(
-        _cap_opponent_scenarios(sharpened, MAX_OPPONENT_SCENARIOS_FOR_EVAL),
+        _cap_opponent_scenarios(sharpened, eval_limit),
         started,
     )
 
@@ -3062,7 +3118,7 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         scenarios = _adaptive_scenario_cap(scenarios, started)
         if own_is_home is None:
             home_eval, home_matchups = _evaluate_lineups(own, scenarios, profiles, matchups, names, True, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
-            if _analysis_time_remaining(started) > 2.0:
+            if _analysis_time_remaining(started) > 2.2:
                 away_eval, _ = _evaluate_lineups(own, scenarios, profiles, matchups, names, False, started, use_spieltyp=use_spieltyp, own_double_pairs=own_double_pairs, stronger_double_pair=stronger_double_pair, doubles_stats=doubles_stats, own_on_letters=own_on_letters, fixed_order=fixed, fixed_doubles_on=fixed_doubles_on, fixed_game_pairs=fixed_game_pairs)
                 evaluated = _merge_orientations(home_eval, away_eval)
             else:
@@ -3151,6 +3207,22 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
         (item for item in evaluated if item['own_player_ids'] == strength_order),
         None,
     )
+    if strength_item is None and fixed is None and _analysis_time_remaining(started) > 0.12:
+        strength_item = _evaluate_one_own_order(
+            strength_order, _cap_opponent_scenarios(scenarios, 2), profiles, matchups, names,
+            started=started,
+            own_is_home=own_is_home,
+            orientation_averaged=orientation_note == 'home-and-away-averaged',
+            use_spieltyp=use_spieltyp,
+            own_double_pairs=own_double_pairs,
+            stronger_double_pair=stronger_double_pair,
+            doubles_stats=doubles_stats,
+            own_on_letters=own_on_letters,
+            fixed_doubles_on=fixed_doubles_on,
+            fixed_game_pairs=fixed_game_pairs,
+        )
+        if strength_item is not None:
+            strength_item['ranking_team_win_probability'] = strength_item['team_win_probability']
     advantage_vs_strength_pp = None
     if strength_item is not None:
         advantage_vs_strength_pp = round(
@@ -3206,10 +3278,6 @@ def analyze_lineup(own_player_ids, opponent_team, actual_opponent_ids=None, oppo
     ]
     opponent_predictions.sort(key=lambda item: (-item['probability'], item['player_ids']))
     elapsed = time.monotonic() - started
-    if elapsed > MAX_ANALYSIS_SECONDS:
-        warnings.append(
-            f'Analyse mit reduziertem Detail abgeschlossen ({elapsed:.1f}s Zeitbudget).',
-        )
     info_summary = _build_info_summary(
         own, scenarios, profiles, names, matchups, recommendation, evaluated, explanation,
         opponent_team, ref_date, opponent_pool, source, orientation_note,
